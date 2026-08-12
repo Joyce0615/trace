@@ -1,0 +1,45 @@
+{
+  "name": "codebase-learning-studio",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "electron/main.mjs",
+  "description": "A desktop learning environment that turns codebases into guided, versioned courses.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "dev:web": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build",
+    "start": "electron .",
+    "test": "node --test tests/*.test.mjs",
+    "scan:public": "node scripts/public-safety.mjs",
+    "test:public": "node --test tests/public-safety.test.mjs",
+    "test:ui": "node tests/ui-smoke.mjs",
+    "test:electron": "node tests/electron-smoke.mjs"
+  },
+  "dependencies": {
+    "@monaco-editor/react": "4.7.0",
+    "monaco-editor": "0.56.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@types/node": "24.3.0",
+    "@types/react": "19.1.10",
+    "@types/react-dom": "19.1.7",
+    "@vitejs/plugin-react": "6.0.5",
+    "concurrently": "10.0.4",
+    "cross-env": "10.0.0",
+    "electron": "43.3.0",
+    "playwright": "1.62.1",
+    "typescript": "5.9.2",
+    "vite": "8.2.1",
+    "wait-on": "8.0.4"
+  },
+  "overrides": {
+    "dompurify": "3.4.13"
+  }
+}
