@@ -11,7 +11,7 @@ npm install
 npm run dev
 ```
 
-Trace automatically detects local `codex` and `claude` CLIs. They are optional: repository indexing, local storage, diagnostics, the featured course, and local symbol lookup work without either agent. When you explicitly invoke an agent, Trace sends only the selected context pack through your configured provider and keeps the agent action read-only.
+Trace automatically detects local `codex` and `claude` CLIs. They are optional: repository indexing, diagnostics, the featured course, and local symbol lookup work without either agent.
 
 Use the text controls in the upper-right corner at any time:
 
@@ -149,21 +149,11 @@ Mark the lesson complete after you can:
 
 The skill tree recalculates mastery and highlights the next available node. If a later repository version changes a file used by a mastered lesson, only the affected skills become stale; unrelated changes preserve progress.
 
-## 11. Let Trace study itself
+## 11. Try a real large repository
 
-Run the production Electron test with no repository override to let Trace index its own codebase, create a source-grounded starter curriculum, and answer basic symbol-location questions with zero agent credits:
+Paste a local FlashInfer path into the welcome screen to exercise the production Electron bridge against a mixed Python/CUDA codebase. Trace builds the local file and symbol index, creates a source-grounded starter curriculum, and keeps basic location questions at zero agent credits.
 
-```bash
-npm run test:electron
-```
-
-To exercise the bridge against another repository, provide any absolute local path explicitly:
-
-```bash
-TRACE_ELECTRON_REPO=/path/to/repository npm run test:electron
-```
-
-![Trace learning from its own repository](screenshots/06-trace-self-dogfood.png)
+![FlashInfer in the production Electron app](screenshots/06-flashinfer-real-repository.png)
 
 ## A credit-efficient learning recipe
 

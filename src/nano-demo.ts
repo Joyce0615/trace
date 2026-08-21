@@ -41,6 +41,31 @@ const symbols = [
   ["capture_cudagraph", "function", "nanovllm/engine/model_runner.py", 190],
 ].map(([name, kind, filePath, line]) => ({ name: String(name), kind: String(kind), path: String(filePath), line: Number(line) }));
 
+const definitionOf = (name: string) => symbols.find((symbol) => symbol.name === name);
+
+const callEdges = [
+  ["nanovllm/llm.py", 12, "LLM", "generate"],
+  ["nanovllm/engine/llm_engine.py", 49, "step", "schedule"],
+  ["nanovllm/engine/llm_engine.py", 51, "step", "run"],
+  ["nanovllm/engine/llm_engine.py", 54, "step", "postprocess"],
+  ["nanovllm/engine/llm_engine.py", 62, "generate", "step"],
+  ["nanovllm/engine/scheduler.py", 34, "schedule", "allocate"],
+  ["nanovllm/engine/model_runner.py", 184, "run", "capture_cudagraph"],
+].map(([filePath, line, caller, callee]) => {
+  const target = definitionOf(String(callee));
+  return {
+    path: String(filePath),
+    line: Number(line),
+    caller: String(caller),
+    callee: String(callee),
+    targetPath: target?.path ?? null,
+    targetLine: target?.line ?? null,
+    resolved: Boolean(target),
+  };
+});
+
+const references = callEdges.map((edge) => ({ name: edge.callee, path: edge.path, line: edge.line, kind: "call" }));
+
 export const nanoRepository: Repository = {
   id: "featured-nano-vllm",
   name: "nano-vllm",
@@ -53,8 +78,19 @@ export const nanoRepository: Repository = {
   isDirty: false,
   files,
   symbols,
+  references,
+  callEdges,
   entryFiles: ["example.py", "nanovllm/llm.py", "nanovllm/engine/llm_engine.py"],
-  stats: { fileCount: files.length, symbolCount: symbols.length, languages: { python: 12, markdown: 1 } },
+  stats: {
+    fileCount: files.length,
+    symbolCount: symbols.length,
+    referenceCount: references.length,
+    callEdgeCount: callEdges.length,
+    resolvedCallEdgeCount: callEdges.filter((edge) => edge.resolved).length,
+    indexer: "tree-sitter",
+    indexerCounts: { "tree-sitter": 12, regex: 0 },
+    languages: { python: 12, markdown: 1 },
+  },
   indexedAt: new Date().toISOString(),
 };
 

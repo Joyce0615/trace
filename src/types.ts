@@ -23,6 +23,25 @@ export interface CodeSymbol {
   kind: string;
   path: string;
   line: number;
+  endLine?: number;
+  container?: string | null;
+}
+
+export interface CodeReference {
+  name: string;
+  path: string;
+  line: number;
+  kind: string;
+}
+
+export interface CallEdge {
+  path: string;
+  line: number;
+  caller: string | null;
+  callee: string;
+  targetPath?: string | null;
+  targetLine?: number | null;
+  resolved?: boolean;
 }
 
 export interface Repository {
@@ -37,10 +56,17 @@ export interface Repository {
   isDirty: boolean;
   files: RepoFile[];
   symbols: CodeSymbol[];
+  references?: CodeReference[];
+  callEdges?: CallEdge[];
   entryFiles: string[];
   stats: {
     fileCount: number;
     symbolCount: number;
+    referenceCount?: number;
+    callEdgeCount?: number;
+    resolvedCallEdgeCount?: number;
+    indexer?: string;
+    indexerCounts?: Record<string, number>;
     languages: Record<string, number>;
   };
   indexedAt: string;

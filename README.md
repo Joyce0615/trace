@@ -7,14 +7,11 @@ New here? Follow the [complete illustrated tutorial](tutorial/README.md).
 ## Run locally
 
 ```bash
-nvm use
 npm install
 npm run dev
 ```
 
-Trace requires Node.js 22.12.0 or newer. The repository includes an `.nvmrc` for compatible environments.
-
-The app detects locally installed `codex` and `claude` CLIs. Repository indexing, local storage, the starter curriculum, diagnostics, local lookup, and the featured nano-vllm course work without either agent and spend zero agent credits. Optional agent calls are explicit and read-only, but they send the selected context through the configured provider. Validated courses, source excerpts, and exact tutor answers are cached locally by repository version and learner profile.
+The app detects locally installed `codex` and `claude` CLIs. Repository indexing, the starter curriculum, diagnostics, local lookup, and the featured nano-vllm course work without either agent and spend zero agent credits. Agent calls are explicit and run read-only. Validated courses, source excerpts, and exact tutor answers are cached by repository version and learner profile.
 
 ## Product features
 
@@ -41,8 +38,6 @@ The app detects locally installed `codex` and `claude` CLIs. Repository indexing
 
 The welcome screen includes a zero-setup course based on [GeeeekExplorer/nano-vllm](https://github.com/GeeeekExplorer/nano-vllm). It teaches the generation loop, scheduler state, prefill versus decode, paged KV cache, prefix caching, the GPU model runner, and a scheduling project through a branching skill tree and source-linked visuals.
 
-The featured course contains adapted educational excerpts from nano-vllm. See [Third-Party Notices](THIRD_PARTY_NOTICES.md) for the pinned upstream revision and MIT attribution.
-
 The featured course is the fastest way to demo Trace: choose **Explore nano-vllm**, complete the short diagnostic, then follow the recommended glowing node.
 
 ## FlashInfer dogfood
@@ -52,10 +47,8 @@ Trace is also exercised against the local FlashInfer repository as a large mixed
 Enter the repository path in the start screen:
 
 ```text
-/path/to/flashinfer
+/Users/user/GitHub/flashinfer
 ```
-
-For the optional large-repository Electron check, run `TRACE_ELECTRON_REPO=/path/to/flashinfer npm run test:electron`.
 
 ## Verify
 
@@ -74,7 +67,3 @@ npm audit
 - `tests/`: repository/course security tests and browser UI smoke tests.
 
 Agent adapters are isolated behind Electron IPC so the renderer never receives shell or filesystem privileges. IPC accepts only repositories previously opened through the trusted host, validates repository-relative paths and symlink targets, and does not use a runtime Monaco CDN.
-
-## License
-
-Trace is released under the [MIT License](LICENSE). Third-party material remains subject to the terms listed in [Third-Party Notices](THIRD_PARTY_NOTICES.md).

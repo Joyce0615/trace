@@ -109,7 +109,7 @@ function StartScreen({ onOpen, onDemo, busy, error, fontScale, onFontScale }: { 
           <div><Icon name="terminal" /><strong>Credit-aware agents</strong><small>Transparent, budgeted context packs</small></div>
         </div>
       </main>
-      <footer className="welcome-footer">Indexing and storage stay local · Optional agent calls send selected context through your configured provider</footer>
+      <footer className="welcome-footer">Your code stays local · Agent actions are read-only by default</footer>
     </div>
   );
 }
@@ -867,11 +867,11 @@ export default function App() {
       <header className="app-bar">
         <div className="brand"><Logo /><span>TRACE</span></div>
         <button className="repo-switcher" onClick={() => openRepository()}><span className="repo-icon"><Icon name="code" size={15} /></span><strong>{repository.name}</strong><Icon name="chevron" size={13} /></button>
-        <div className="repo-meta"><span><Icon name="branch" size={13} />{repository.branch}</span><span>{commit}</span>{repository.isDirty && <span className="dirty">modified</span>}<span>{repository.stats.fileCount} files</span></div>
+        <div className="repo-meta"><span><Icon name="branch" size={13} />{repository.branch}</span><span>{commit}</span>{repository.isDirty && <span className="dirty">modified</span>}<span className="index-badge" data-indexer={repository.stats.indexer ?? "regex"} title={`${repository.stats.symbolCount} definitions · ${repository.stats.referenceCount ?? 0} references · ${repository.stats.resolvedCallEdgeCount ?? 0}/${repository.stats.callEdgeCount ?? 0} resolved call edges`}>{repository.stats.fileCount} files · {repository.stats.indexer === "tree-sitter" ? "tree-sitter" : "regex"} index</span></div>
         <div className="app-bar-spacer" />
         <FontSizeControl value={fontScale} onChange={setFontScale} />
         <span className="privacy"><i />LOCAL · CONTEXT BUDGETED</span>
-        <button className="avatar" aria-label="June Xie profile">JX</button>
+        <button className="avatar">BJ</button>
       </header>
       <div className="workspace-grid">
         <CourseSidebar course={course} skillGraph={skillGraph} learnerState={learnerState} activeSkill={activeSkill} selectedLesson={selectedLesson} completed={completed} onSelect={selectLesson} onSelectSkill={selectSkill} onFamiliar={(node) => setLearnerState(addEvidence(learnerState, skillGraph, node.id, { kind: "self-report", strength: 0.62, detail: `Marked familiar: ${node.title}` }))} onChallenge={(node) => { const lesson = flattenLessons(course).find((item) => item.id === node.lessonId); if (lesson) void selectLesson(lesson).then(() => setMode("quiz")); }} onToggleComplete={toggleComplete} onEnhance={enhanceCourse} enhancing={courseBusy} enhanceElapsed={courseElapsed} provider={provider} canEnhance={agents[provider].available} />

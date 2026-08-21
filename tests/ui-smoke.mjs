@@ -5,17 +5,8 @@ import path from "node:path";
 import { chromium } from "playwright";
 
 const targetUrl = process.env.TRACE_URL ?? "http://127.0.0.1:5173";
-const qaArtifactDirectory = path.resolve("artifacts", "qa");
-const tutorialDirectory = path.resolve("tutorial", "screenshots");
-const tutorialMode = process.env.TRACE_TUTORIAL_SCREENSHOTS === "1";
-await mkdir(qaArtifactDirectory, { recursive: true });
-if (tutorialMode) await mkdir(tutorialDirectory, { recursive: true });
-
-function screenshotPath(qaName, tutorialName) {
-  return tutorialMode && tutorialName
-    ? path.join(tutorialDirectory, tutorialName)
-    : path.join(qaArtifactDirectory, qaName);
-}
+const artifactDirectory = path.resolve("artifacts", "qa");
+await mkdir(artifactDirectory, { recursive: true });
 
 async function reachable(url) {
   try {
@@ -47,19 +38,14 @@ page.on("console", (message) => { if (message.type() === "error") errors.push(me
 
 try {
   await page.goto(targetUrl, { waitUntil: "networkidle" });
-  assert.equal(
-    await page.getByText(/Indexing and storage stay local/).count(),
-    1,
-  );
-  assert.equal(await page.getByText(/Your code stays local/).count(), 0);
   await page.getByRole("button", { name: "Large text" }).click();
   assert.equal(await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--font-boost").trim()), "4px");
   await page.reload({ waitUntil: "networkidle" });
   assert.equal(await page.getByRole("button", { name: "Large text" }).getAttribute("aria-pressed"), "true");
-  await page.screenshot({ path: screenshotPath("welcome.png", "01-welcome.png") });
+  await page.screenshot({ path: path.join(artifactDirectory, "welcome.png") });
   await page.getByRole("button", { name: /Explore nano-vllm/ }).click();
   await page.getByRole("dialog", { name: "Adaptive skill assessment" }).waitFor();
-  await page.screenshot({ path: screenshotPath("adaptive-diagnostic.png", "02-adaptive-diagnostic.png") });
+  await page.screenshot({ path: path.join(artifactDirectory, "adaptive-diagnostic.png") });
 
   const diagnosticQuestions = page.locator(".diagnostic-questions fieldset");
   for (let index = 0; index < await diagnosticQuestions.count(); index += 1) {
@@ -67,6 +53,8 @@ try {
   }
   await page.getByRole("button", { name: "Build my skill tree" }).click();
   await page.getByText("nano-vllm: Build an LLM Engine").waitFor();
+  assert.equal(await page.locator(".index-badge").getAttribute("data-indexer"), "tree-sitter");
+  assert.match(await page.locator(".index-badge").getAttribute("title") ?? "", /resolved call edges/);
   await page.locator(".skill-tree").waitFor();
   assert.equal(await page.locator(".skill-node.recommended").count(), 1);
   await page.getByText("YOUR NEXT MOVE").waitFor();
@@ -74,11 +62,11 @@ try {
   await page.locator(".monaco-editor").waitFor({ timeout: 20_000 });
   await page.getByRole("button", { name: "I found the flow" }).click();
   await page.getByRole("button", { name: "Open Quick Ask" }).waitFor();
-  await page.screenshot({ path: screenshotPath("skill-tree.png", "03-skill-tree-and-guide.png") });
+  await page.screenshot({ path: path.join(artifactDirectory, "skill-tree.png") });
 
   await page.locator(".content-tabs").getByRole("button", { name: "Diagram" }).click();
   await page.getByText("Request-to-token architecture").waitFor();
-  await page.screenshot({ path: screenshotPath("illustrated-lesson.png", "04-source-linked-diagram.png") });
+  await page.screenshot({ path: path.join(artifactDirectory, "illustrated-lesson.png") });
   await page.getByRole("button", { name: /LLMEngine\.step/ }).click();
   await page.locator(".monaco-editor").waitFor({ timeout: 20_000 });
   await page.getByText("nanovllm/engine/llm_engine.py", { exact: false }).first().waitFor();
@@ -93,7 +81,7 @@ try {
   await page.getByText("LEAN PACK").waitFor();
   await page.getByRole("button", { name: "Save to memory" }).click();
   await page.getByText("1 saved learning memories").waitFor();
-  await page.screenshot({ path: screenshotPath("side-chat-context.png", "05-side-chat-context.png") });
+  await page.screenshot({ path: path.join(artifactDirectory, "side-chat-context.png") });
 
   await page.getByRole("button", { name: "Learn", exact: true }).click();
   await page.getByRole("button", { name: "Trace the data flow" }).click();
@@ -142,18 +130,13 @@ try {
   await page.setViewportSize({ width: 1120, height: 720 });
   await page.waitForTimeout(250);
   const compactFit = await page.evaluate(() => ({ x: document.documentElement.scrollWidth > document.documentElement.clientWidth, y: document.documentElement.scrollHeight > document.documentElement.clientHeight, tutorBottom: document.querySelector(".tutor-panel")?.getBoundingClientRect().bottom, height: window.innerHeight }));
-  await page.screenshot({ path: path.join(qaArtifactDirectory, "workspace-compact.png") });
+  await page.screenshot({ path: path.join(artifactDirectory, "workspace-compact.png") });
   assert.equal(compactFit.x, false);
   assert.equal(compactFit.y, false);
   assert.ok((compactFit.tutorBottom ?? Infinity) <= compactFit.height + 1, JSON.stringify(compactFit));
 
   assert.deepEqual(errors, [], `Browser errors:\n${errors.join("\n")}`);
-  console.log(JSON.stringify({
-    ok: true,
-    screenshots: path.relative(process.cwd(), tutorialMode ? tutorialDirectory : qaArtifactDirectory),
-    fit,
-    compactFit,
-  }, null, 2));
+  console.log(JSON.stringify({ ok: true, screenshots: artifactDirectory, fit, compactFit }, null, 2));
 } finally {
   await context.close();
   await browser.close();

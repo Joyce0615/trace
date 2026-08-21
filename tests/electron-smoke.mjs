@@ -4,18 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import { _electron as electron } from "playwright";
 
-const repositoryPath = process.env.TRACE_ELECTRON_REPO ?? process.cwd();
-const repositoryName = path.basename(repositoryPath);
-const expectedCourseTitle = `${repositoryName} Deep Dive`;
-const lookupQuestion = process.env.TRACE_ELECTRON_REPO
-  ? "How many files are indexed?"
-  : "Where is inspectRepository defined?";
-const qaArtifactDirectory = path.resolve("artifacts", "qa");
-const tutorialDirectory = path.resolve("tutorial", "screenshots");
-const tutorialMode = process.env.TRACE_TUTORIAL_SCREENSHOTS === "1";
+const repositoryPath = process.env.TRACE_ELECTRON_REPO ?? "/Users/user/GitHub/flashinfer";
+const artifactDirectory = path.resolve("artifacts", "qa");
 const userDataDirectory = await mkdtemp(path.join(os.tmpdir(), "trace-electron-"));
-await mkdir(qaArtifactDirectory, { recursive: true });
-if (tutorialMode) await mkdir(tutorialDirectory, { recursive: true });
+await mkdir(artifactDirectory, { recursive: true });
 
 const electronApp = await electron.launch({
   args: [".", `--user-data-dir=${userDataDirectory}`],
@@ -29,21 +21,22 @@ try {
   await page.getByRole("button", { name: "Start learning" }).click();
   await page.getByRole("dialog", { name: "Adaptive skill assessment" }).waitFor({ timeout: 60_000 });
   await page.getByRole("button", { name: "Skip for now" }).click();
-  await page.getByText(expectedCourseTitle).waitFor({ timeout: 30_000 });
+  await page.getByText("flashinfer Deep Dive").waitFor({ timeout: 30_000 });
 
   assert.equal(await page.evaluate(() => Boolean(window.trace)), true);
   assert.ok(await page.locator(".skill-node").count() >= 4);
+  // Item 16: the real repository index must come from tree-sitter with resolved call edges.
+  assert.equal(await page.locator(".index-badge").getAttribute("data-indexer"), "tree-sitter");
+  const indexSummary = await page.locator(".index-badge").getAttribute("title") ?? "";
+  const resolvedEdges = Number(indexSummary.match(/(\d+)\/\d+ resolved call edges/)?.[1] ?? 0);
+  assert.ok(resolvedEdges > 0, `expected resolved call edges, got: ${indexSummary}`);
 
   await page.getByRole("button", { name: "Ask", exact: true }).click();
-  await page.locator(".tutor-input textarea").fill(lookupQuestion);
+  await page.locator(".tutor-input textarea").fill("Where is _log_import_version defined?");
   await page.locator(".tutor-input button").click();
-  if (process.env.TRACE_ELECTRON_REPO) {
-    await page.getByText(new RegExp(`${repositoryName} contains \\d[\\d,]* indexed files\\.`)).waitFor({ timeout: 30_000 });
-  } else {
-    await page.getByText(/inspectRepository is defined at electron\/repository\.mjs:/).waitFor({ timeout: 30_000 });
-  }
+  await page.getByText(/_log_import_version is defined at flashinfer\/__init__\.py:/).waitFor({ timeout: 30_000 });
   await page.getByText(/0 agent credits/).waitFor();
-  await page.screenshot({ path: path.join(qaArtifactDirectory, "electron-self-dogfood-chat.png") });
+  await page.screenshot({ path: path.join(artifactDirectory, "flashinfer-electron-chat.png") });
   await page.getByRole("button", { name: "Learn", exact: true }).click();
   await page.getByText("YOUR NEXT MOVE").waitFor();
   await page.getByRole("button", { name: "Take checkpoint" }).waitFor();
@@ -53,15 +46,8 @@ try {
     y: document.documentElement.scrollHeight > document.documentElement.clientHeight,
   }));
   assert.deepEqual(overflow, { x: false, y: false });
-  const finalScreenshot = tutorialMode
-    ? path.join(tutorialDirectory, "06-trace-self-dogfood.png")
-    : path.join(qaArtifactDirectory, "electron-self-dogfood.png");
-  await page.screenshot({ path: finalScreenshot });
-  console.log(JSON.stringify({
-    ok: true,
-    repository: process.env.TRACE_ELECTRON_REPO ? "configured override" : "project root",
-    screenshot: path.relative(process.cwd(), finalScreenshot),
-  }, null, 2));
+  await page.screenshot({ path: path.join(artifactDirectory, "flashinfer-electron.png") });
+  console.log(JSON.stringify({ ok: true, repositoryPath, screenshot: path.join(artifactDirectory, "flashinfer-electron.png") }, null, 2));
 } finally {
   await electronApp.close();
   await rm(userDataDirectory, { recursive: true, force: true });

@@ -8,7 +8,8 @@ import { promisify } from "node:util";
 import { generateStarterCourse, normalizeAgentCourse } from "../electron/course.mjs";
 import { loadCourse, saveCourse } from "../electron/course-store.mjs";
 import { createPracticeSession, inspectPracticeSession, removePracticeSession } from "../electron/practice.mjs";
-import { fileImportance, inspectRepository, languageFor, readRepositoryFile } from "../electron/repository.mjs";
+import { analyzeFile, fileImportance, inspectRepository, languageFor, readRepositoryFile } from "../electron/repository.mjs";
+import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
 import { answerFromLocalIndex, buildContextPack } from "../electron/context-engine.mjs";
 import { buildSkillGraph, createLearnerState, reconcileLearnerState } from "../electron/skill-graph.mjs";
 import { loadLearnerState, saveLearnerState } from "../electron/learning-store.mjs";
@@ -195,4 +196,83 @@ test("skill graphs persist mastery and only mark skills stale when their source 
   const changedGraph = buildSkillGraph(changedRepository, course);
   const reconciled = reconcileLearnerState(changedRepository, changedGraph, saved);
   assert.equal(reconciled.mastery[graph.nodes[0].id].status, "stale");
+});
+
+test("tree-sitter indexing yields definitions, references, and call edges", async (context) => {
+  const rootPath = await mkdtemp(path.join(os.tmpdir(), "trace-treesitter-"));
+  context.after(() => rm(rootPath, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "engine"));
+  await writeFile(
+    path.join(rootPath, "engine", "runner.py"),
+    [
+      "class Runner:",
+      "    def start(self, request):",
+      "        prepared = normalize(request)",
+      "        return self.execute(prepared)",
+      "",
+      "    def execute(self, payload):",
+      "        return payload",
+      "",
+      "def normalize(request):",
+      "    return request",
+      "",
+    ].join("\n"),
+  );
+  await writeFile(
+    path.join(rootPath, "engine", "index.ts"),
+    [
+      "export interface Job { id: string }",
+      "export class Queue {",
+      "  push(job: Job) { return schedule(job); }",
+      "}",
+      "export function schedule(job: Job) { return job.id; }",
+      "",
+    ].join("\n"),
+  );
+
+  assert.equal(treeSitterSupports("python", "engine/runner.py"), true);
+  assert.equal(treeSitterSupports("markdown", "README.md"), false);
+
+  const pythonAnalysis = await analyzeSource(
+    "engine/runner.py",
+    "python",
+    "class A:\n    def run(self, value):\n        return helper(value)\n\ndef helper(value):\n    return value\n",
+  );
+  assert.equal(pythonAnalysis.indexer, "tree-sitter");
+  assert.deepEqual(
+    pythonAnalysis.definitions.map((definition) => `${definition.kind}:${definition.name}:${definition.line}`),
+    ["class:A:1", "function:run:2", "function:helper:5"],
+  );
+  assert.ok(pythonAnalysis.definitions.every((definition) => definition.endLine >= definition.line));
+  assert.equal(pythonAnalysis.definitions.find((definition) => definition.name === "run").container, "A");
+  assert.deepEqual(
+    pythonAnalysis.callEdges.map((edge) => `${edge.caller}->${edge.callee}@${edge.line}`),
+    ["run->helper@3"],
+  );
+  assert.equal(pythonAnalysis.resolvedCallEdges, 1);
+  assert.deepEqual(pythonAnalysis.references.map((reference) => reference.name), ["helper"]);
+
+  const typescriptAnalysis = await analyzeFile(rootPath, {
+    path: "engine/index.ts",
+    language: "typescript",
+    size: 200,
+  });
+  assert.equal(typescriptAnalysis.indexer, "tree-sitter");
+  assert.ok(typescriptAnalysis.symbols.some((symbol) => symbol.kind === "interface" && symbol.name === "Job"));
+  assert.ok(typescriptAnalysis.symbols.some((symbol) => symbol.kind === "class" && symbol.name === "Queue"));
+  assert.ok(typescriptAnalysis.symbols.some((symbol) => symbol.kind === "method" && symbol.name === "push"));
+  assert.ok(typescriptAnalysis.callEdges.some((edge) => edge.caller === "push" && edge.callee === "schedule"));
+
+  const repository = await inspectRepository(rootPath, path.join(rootPath, "clones"));
+  assert.equal(repository.stats.indexer, "tree-sitter");
+  assert.ok(repository.stats.referenceCount > 0);
+  assert.ok(repository.stats.resolvedCallEdgeCount >= 2);
+  const resolvedPythonEdge = repository.callEdges.find((edge) => edge.callee === "normalize" && edge.resolved);
+  assert.equal(resolvedPythonEdge.caller, "start");
+  assert.equal(resolvedPythonEdge.targetPath, "engine/runner.py");
+  assert.equal(resolvedPythonEdge.targetLine, 9);
+
+  // Languages without a grammar still index through the deterministic regex path.
+  const fallback = await analyzeFile(rootPath, { path: "engine/legacy.txt", language: "plaintext", size: 10 });
+  assert.equal(fallback.indexer, "none");
 });

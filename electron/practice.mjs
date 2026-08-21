@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { access, mkdir, realpath, rm } from "node:fs/promises";
+import { access, mkdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 
@@ -43,7 +43,7 @@ export async function createPracticeSession(repository, lesson, practiceDirector
   await mkdir(practiceDirectory, { recursive: true });
   const id = randomUUID();
   const worktreePath = path.join(practiceDirectory, `${safeName(repository.name)}-${id.slice(0, 8)}`);
-  await run("git", ["-C", rootPath, "worktree", "add", "--detach", worktreePath, head], { timeoutMs: 180_000 });
+  await run("git", ["-C", rootPath, "worktree", "add", "--detach", "--", worktreePath, head], { timeoutMs: 180_000 });
   const session = {
     id,
     repositoryId: repository.id,
@@ -92,17 +92,7 @@ export async function removePracticeSession(id, discardChanges = false) {
   const session = getSession(id);
   const report = await inspectPracticeSession(id);
   if (!report.clean && !discardChanges) return { removed: false, requiresConfirmation: true, report };
-  const removal = await run(
-    "git",
-    ["-C", session.repositoryRoot, "worktree", "remove", ...(discardChanges ? ["--force"] : []), session.worktreePath],
-    { timeoutMs: 120_000, allowFailure: true },
-  );
-  if (removal.code !== 0) {
-    const diagnostic = `${removal.stdout}\n${removal.stderr}`;
-    const removeUnsupported = /usage: git worktree/.test(diagnostic) && !/worktree remove/.test(diagnostic);
-    if (!removeUnsupported) throw new Error(removal.stderr || removal.stdout || "git worktree remove failed");
-    await rm(session.worktreePath, { recursive: true });
-  }
+  await run("git", ["-C", session.repositoryRoot, "worktree", "remove", ...(discardChanges ? ["--force"] : []), "--", session.worktreePath], { timeoutMs: 120_000 });
   await run("git", ["-C", session.repositoryRoot, "worktree", "prune"]);
   sessions.delete(id);
   return { removed: true, requiresConfirmation: false };

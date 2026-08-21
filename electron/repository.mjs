@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { access, lstat, mkdir, readdir, readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { analyzeSource, treeSitterSupports } from "./tree-sitter-index.mjs";
 
 const SKIP_DIRECTORIES = new Set([
   ".git",
@@ -253,26 +254,55 @@ function symbolPatterns(language) {
   return [];
 }
 
-async function extractSymbols(rootPath, file) {
-  if (file.size > 600_000) return [];
+function regexSymbols(file, source) {
   const patterns = symbolPatterns(file.language);
   if (!patterns.length) return [];
-  try {
-    const source = await readFile(path.join(rootPath, file.path), "utf8");
-    const symbols = [];
-    source.split(/\r?\n/).forEach((line, index) => {
-      for (const pattern of patterns) {
-        const match = line.match(pattern.expression);
-        if (match) {
-          symbols.push({ name: match[1], kind: pattern.kind, path: file.path, line: index + 1 });
-          break;
-        }
+  const symbols = [];
+  source.split(/\r?\n/).forEach((line, index) => {
+    for (const pattern of patterns) {
+      const match = line.match(pattern.expression);
+      if (match) {
+        symbols.push({ name: match[1], kind: pattern.kind, path: file.path, line: index + 1 });
+        break;
       }
-    });
-    return symbols.slice(0, 80);
+    }
+  });
+  return symbols.slice(0, 80);
+}
+
+/**
+ * Structural index for one file. Tree-sitter supplies definitions, references,
+ * and call edges; the regex indexer remains the deterministic fallback for
+ * languages without a grammar or when a parse fails.
+ */
+export async function analyzeFile(rootPath, file) {
+  const empty = { symbols: [], references: [], callEdges: [], indexer: "none" };
+  if (file.size > 600_000) return empty;
+  const canParse = treeSitterSupports(file.language, file.path);
+  if (!canParse && !symbolPatterns(file.language).length) return empty;
+  let source;
+  try {
+    source = await readFile(path.join(rootPath, file.path), "utf8");
   } catch {
-    return [];
+    return empty;
   }
+  if (canParse) {
+    const analysis = await analyzeSource(file.path, file.language, source);
+    if (analysis?.definitions.length) {
+      return {
+        symbols: analysis.definitions.slice(0, 80),
+        references: analysis.references,
+        callEdges: analysis.callEdges,
+        indexer: "tree-sitter",
+      };
+    }
+  }
+  const symbols = regexSymbols(file, source);
+  return { symbols, references: [], callEdges: [], indexer: symbols.length ? "regex" : "none" };
+}
+
+async function extractSymbols(rootPath, file) {
+  return (await analyzeFile(rootPath, file)).symbols;
 }
 
 export async function inspectRepository(input, repositoriesDirectory) {
@@ -314,9 +344,10 @@ export async function inspectRepository(input, repositoriesDirectory) {
     if (packageRoots.has(file.path.split("/")[0])) file.importance += 100;
   }
   const sourceFiles = fileRecords
-    .filter((file) => symbolPatterns(file.language).length)
+    .filter((file) => symbolPatterns(file.language).length || treeSitterSupports(file.language, file.path))
     .sort((left, right) => right.importance - left.importance || left.path.localeCompare(right.path));
-  const symbolGroups = await Promise.all(sourceFiles.slice(0, 1_200).map((file) => extractSymbols(location.rootPath, file)));
+  const analyses = await Promise.all(sourceFiles.slice(0, 1_200).map((file) => analyzeFile(location.rootPath, file)));
+  const symbolGroups = analyses.map((analysis) => analysis.symbols);
   const symbols = [];
   for (let symbolIndex = 0; symbolIndex < 80 && symbols.length < 2_500; symbolIndex += 1) {
     for (const group of symbolGroups) {
@@ -324,6 +355,25 @@ export async function inspectRepository(input, repositoriesDirectory) {
       if (symbols.length >= 2_500) break;
     }
   }
+  const references = analyses.flatMap((analysis) => analysis.references).slice(0, 20_000);
+  const definitionIndex = new Map();
+  for (const symbol of symbols) {
+    if (!definitionIndex.has(symbol.name)) definitionIndex.set(symbol.name, []);
+    definitionIndex.get(symbol.name).push(symbol);
+  }
+  const callEdges = analyses
+    .flatMap((analysis) => analysis.callEdges)
+    .slice(0, 20_000)
+    .map((edge) => {
+      const targets = definitionIndex.get(edge.callee) ?? [];
+      const target = targets.find((candidate) => candidate.path === edge.path) ?? targets[0] ?? null;
+      return { ...edge, targetPath: target?.path ?? null, targetLine: target?.line ?? null, resolved: Boolean(target) };
+    });
+  const indexerCounts = analyses.reduce((counts, analysis) => {
+    counts[analysis.indexer] = (counts[analysis.indexer] ?? 0) + 1;
+    return counts;
+  }, {});
+  const indexer = indexerCounts["tree-sitter"] ? "tree-sitter" : indexerCounts.regex ? "regex" : "none";
   const languages = {};
   for (const file of fileRecords) languages[file.language] = (languages[file.language] ?? 0) + 1;
 
@@ -377,10 +427,17 @@ export async function inspectRepository(input, repositoriesDirectory) {
     isDirty: Boolean(statusText),
     files: fileRecords,
     symbols,
+    references,
+    callEdges,
     entryFiles,
     stats: {
       fileCount: fileRecords.length,
       symbolCount: symbols.length,
+      referenceCount: references.length,
+      callEdgeCount: callEdges.length,
+      resolvedCallEdgeCount: callEdges.filter((edge) => edge.resolved).length,
+      indexer,
+      indexerCounts,
       languages,
     },
     indexedAt: new Date().toISOString(),
