@@ -3,3 +3,7 @@ dist/
 .DS_Store
 *.log
 .trace/
+artifacts/
+.env
+.env.*
+!.env.example
