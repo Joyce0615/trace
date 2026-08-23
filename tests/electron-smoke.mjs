@@ -31,6 +31,29 @@ try {
   const resolvedEdges = Number(indexSummary.match(/(\d+)\/\d+ resolved call edges/)?.[1] ?? 0);
   assert.ok(resolvedEdges > 0, `expected resolved call edges, got: ${indexSummary}`);
 
+  // Item 17: real-repository import resolution plus the optional language-server bridge.
+  const languageServers = await page.evaluate(() => window.trace.detectLanguageServers());
+  assert.ok(Object.keys(languageServers).length >= 6, JSON.stringify(languageServers));
+  assert.ok(Object.values(languageServers).every((record) => typeof record.available === "boolean"));
+  const importSummary = await page.evaluate(() => {
+    const repository = document.querySelector(".index-badge")?.getAttribute("title") ?? "";
+    return repository;
+  });
+  assert.ok(importSummary.length > 0);
+  await page.locator(".content-tabs").getByRole("button", { name: "Code" }).click();
+  await page.locator(".monaco-editor").waitFor({ timeout: 30_000 });
+  await page.locator(".explorer-search input").fill("flashinfer/decode.py");
+  await page.locator(".file-row").first().click();
+  await page.locator(".import-section").waitFor({ timeout: 30_000 });
+  const importCounts = await page.locator(".import-section .symbol-heading small").innerText();
+  assert.match(importCounts, /^\d+\/\d+$/);
+  assert.ok(Number(importCounts.split("/")[0]) > 0, `expected resolved imports, got ${importCounts}`);
+  await page.getByRole("button", { name: "Resolve at cursor" }).click();
+  await page.locator(".resolution-detail").waitFor({ timeout: 60_000 });
+  const resolvedBy = (await page.locator(".resolution-source").innerText()).toLowerCase();
+  assert.ok(["static-index"].includes(resolvedBy) || resolvedBy.startsWith("language-server:"), resolvedBy);
+  await page.locator(".explorer-search input").fill("");
+
   await page.getByRole("button", { name: "Ask", exact: true }).click();
   await page.locator(".tutor-input textarea").fill("Where is _log_import_version defined?");
   await page.locator(".tutor-input button").click();

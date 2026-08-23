@@ -2,7 +2,7 @@ import Editor, { type OnMount } from "@monaco-editor/react";
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { browserBridge, demoCourse, demoLearnerState, demoRepository, demoSkillGraph } from "./demo";
 import { addEvidence, completeDiagnostic, personalizeSkillGraph, skillForLesson } from "./learning";
-import type { AgentState, ContextMode, ContextPack, ContextScope, Course, LearnerProfile, LearnerState, LearningMemory, Lesson, LessonContentBlock, PracticeReport, PracticeSession, Repository, RepoFile, SkillGraph, SkillNode } from "./types";
+import type { AgentState, ContextMode, ContextPack, ContextScope, Course, LearnerProfile, LearnerState, LearningMemory, Lesson, LessonContentBlock, PracticeReport, PracticeSession, Repository, RepoFile, SkillGraph, SkillNode, SymbolResolution } from "./types";
 
 type TutorMode = "learn" | "ask" | "quiz" | "practice";
 type WorkspaceMode = "lesson" | "diagram" | "code" | "notes";
@@ -229,13 +229,16 @@ function CourseSidebar({ course, skillGraph, learnerState, activeSkill, selected
   );
 }
 
-function FileExplorer({ repository, lesson, currentFile, query, onQuery, onOpen }: {
+function FileExplorer({ repository, lesson, currentFile, query, onQuery, onOpen, resolution, resolutionBusy, onResolve }: {
   repository: Repository;
   lesson: Lesson;
   currentFile: RepoFile | null;
   query: string;
   onQuery: (value: string) => void;
   onOpen: (file: RepoFile, line?: number) => void;
+  resolution: SymbolResolution | null;
+  resolutionBusy: boolean;
+  onResolve: () => void;
 }) {
   const focusPaths = useMemo(
     () => [...new Set([...lesson.anchors.map((anchor) => anchor.path), ...repository.entryFiles])],
@@ -259,6 +262,10 @@ function FileExplorer({ repository, lesson, currentFile, query, onQuery, onOpen 
       .slice(0, 180);
   }, [focusPaths, query, repository.files]);
   const activeSymbols = repository.symbols.filter((symbol) => symbol.path === currentFile?.path);
+  const activeImports = useMemo(
+    () => (resolution?.path === currentFile?.path ? resolution?.imports ?? [] : (repository.imports ?? []).filter((item) => item.path === currentFile?.path)),
+    [currentFile?.path, repository.imports, resolution],
+  );
 
   return (
     <aside className="file-explorer">
@@ -284,6 +291,37 @@ function FileExplorer({ repository, lesson, currentFile, query, onQuery, onOpen 
             ))}
           </div>
         )}
+        {currentFile && activeImports.length > 0 && (
+          <div className="symbol-section import-section">
+            <div className="symbol-heading">IMPORTS <small>{activeImports.filter((item) => item.resolved).length}/{activeImports.length}</small></div>
+            {activeImports.slice(0, 24).map((item) => (
+              <button
+                key={`${item.line}-${item.specifier}`}
+                className={item.resolved ? "resolved" : "unresolved"}
+                title={item.resolved ? `Resolved to ${item.targetPath}` : `Not resolved inside this repository (${item.specifier})`}
+                disabled={!item.resolved}
+                onClick={() => { const target = repository.files.find((file) => file.path === item.targetPath); if (target) onOpen(target, 1); }}
+              ><span>{item.resolved ? "→" : "·"}</span>{item.specifier}<small>:{item.line}</small></button>
+            ))}
+          </div>
+        )}
+        {currentFile && (
+          <div className="resolution-section">
+            <button className="resolve-button" data-resolution={resolution?.resolvedBy ?? "none"} disabled={resolutionBusy} onClick={onResolve}>
+              <Icon name="target" size={12} />{resolutionBusy ? "Resolving…" : "Resolve at cursor"}
+            </button>
+            {resolution && <div className="resolution-detail">
+              <span className="resolution-source">{resolution.resolvedBy}</span>
+              {resolution.languageServer.available
+                ? <small>{resolution.languageServer.server} · {resolution.languageServer.overloads?.length ?? 0} overloads · {resolution.languageServer.implementations?.length ?? 0} implementations{resolution.languageServer.dynamicDispatch ? " · dynamic dispatch" : ""}</small>
+                : <small>No language server for {resolution.language}; using the static index.</small>}
+              {resolution.languageServer.type && <code className="resolution-type">{resolution.languageServer.type.split("\n").slice(0, 2).join(" ")}</code>}
+              {resolution.definitions.slice(0, 4).map((definition) => (
+                <button key={`${definition.path}-${definition.line}`} className="resolution-anchor" onClick={() => { const target = repository.files.find((file) => file.path === definition.path); if (target) onOpen(target, definition.line); }}>{definition.path}:{definition.line}</button>
+              ))}
+            </div>}
+          </div>
+        )}
       </div>
     </aside>
   );
@@ -305,7 +343,7 @@ function LessonCanvas({ lesson, diagramOnly, onAnchor }: { lesson: Lesson; diagr
   </div>;
 }
 
-function CodeWorkspace({ repository, lesson, currentFile, content, line, workspaceMode, fontBoost, onOpen, onSelection, onWorkspaceMode }: {
+function CodeWorkspace({ repository, lesson, currentFile, content, line, workspaceMode, fontBoost, onOpen, onSelection, onWorkspaceMode, resolution, resolutionBusy, onResolve }: {
   repository: Repository;
   lesson: Lesson;
   currentFile: RepoFile | null;
@@ -316,6 +354,9 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
   onOpen: (file: RepoFile, line?: number) => void;
   onSelection: (selection: CodeSelection | null) => void;
   onWorkspaceMode: (mode: WorkspaceMode) => void;
+  resolution: SymbolResolution | null;
+  resolutionBusy: boolean;
+  onResolve: () => void;
 }) {
   const [query, setQuery] = useState("");
   const [notes, setNotes] = useState(() => localStorage.getItem(`trace:notes:${repository.id}:${lesson.id}`) ?? "");
@@ -370,7 +411,7 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
 
   return (
     <main className="code-workspace panel-border">
-      <FileExplorer repository={repository} lesson={lesson} currentFile={currentFile} query={query} onQuery={setQuery} onOpen={(file, targetLine) => { onWorkspaceMode("code"); onOpen(file, targetLine); }} />
+      <FileExplorer repository={repository} lesson={lesson} currentFile={currentFile} query={query} onQuery={setQuery} onOpen={(file, targetLine) => { onWorkspaceMode("code"); onOpen(file, targetLine); }} resolution={resolution} resolutionBusy={resolutionBusy} onResolve={onResolve} />
       <section className="editor-column">
         <div className="lesson-context">
           <div><span>NOW LEARNING</span><strong>{lesson.title}</strong></div>
@@ -631,6 +672,8 @@ export default function App() {
   const [diagnosticOpen, setDiagnosticOpen] = useState(false);
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("lesson");
   const [guideProgress, setGuideProgress] = useState<Record<string, number>>({});
+  const [resolution, setResolution] = useState<SymbolResolution | null>(null);
+  const [resolutionBusy, setResolutionBusy] = useState(false);
 
   useEffect(() => { bridge.detectAgents().then(setAgents).catch(() => undefined); }, []);
   useEffect(() => {
@@ -653,6 +696,7 @@ export default function App() {
   const loadSource = useCallback(async (repo: Repository, file: RepoFile, targetLine = 1) => {
     setCurrentFile(file);
     setLine(targetLine);
+    setResolution(null);
     setContent("Loading source…");
     try {
       setContent(await bridge.readFile(repo.rootPath, file.path));
@@ -824,6 +868,18 @@ export default function App() {
   }
 
   const openFile = (file: RepoFile, targetLine = 1) => loadSource(repository, file, targetLine);
+  const resolveAtCursor = async () => {
+    if (!currentFile || resolutionBusy) return;
+    setResolutionBusy(true);
+    try {
+      const symbol = repository.symbols.find((candidate) => candidate.path === currentFile.path && candidate.line === line)?.name;
+      setResolution(await bridge.resolveSymbol({ repository, path: currentFile.path, line, column: selection?.startLine === line ? 1 : 1, symbol }));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setResolutionBusy(false);
+    }
+  };
   const commit = repository.head === "unversioned" ? "unversioned" : repository.head.slice(0, 7);
   const activeSkill = skillForLesson(skillGraph, selectedLesson.id);
   const activeEvidence = activeSkill ? learnerState.mastery[activeSkill.id]?.evidence ?? [] : [];
@@ -875,7 +931,7 @@ export default function App() {
       </header>
       <div className="workspace-grid">
         <CourseSidebar course={course} skillGraph={skillGraph} learnerState={learnerState} activeSkill={activeSkill} selectedLesson={selectedLesson} completed={completed} onSelect={selectLesson} onSelectSkill={selectSkill} onFamiliar={(node) => setLearnerState(addEvidence(learnerState, skillGraph, node.id, { kind: "self-report", strength: 0.62, detail: `Marked familiar: ${node.title}` }))} onChallenge={(node) => { const lesson = flattenLessons(course).find((item) => item.id === node.lessonId); if (lesson) void selectLesson(lesson).then(() => setMode("quiz")); }} onToggleComplete={toggleComplete} onEnhance={enhanceCourse} enhancing={courseBusy} enhanceElapsed={courseElapsed} provider={provider} canEnhance={agents[provider].available} />
-        <CodeWorkspace repository={repository} lesson={selectedLesson} currentFile={currentFile} content={content} line={line} workspaceMode={workspaceMode} fontBoost={fontBoosts[fontScale]} onOpen={openFile} onSelection={setSelection} onWorkspaceMode={changeWorkspaceMode} />
+        <CodeWorkspace repository={repository} lesson={selectedLesson} currentFile={currentFile} content={content} line={line} workspaceMode={workspaceMode} fontBoost={fontBoosts[fontScale]} onOpen={openFile} onSelection={setSelection} onWorkspaceMode={changeWorkspaceMode} resolution={resolution} resolutionBusy={resolutionBusy} onResolve={resolveAtCursor} />
         <TutorPanel repository={repository} lesson={selectedLesson} skill={activeSkill} nextSkill={nextSkill} learnerState={learnerState} provider={provider} agents={agents} mode={mode} messages={messages} askMessages={askMessages} busy={agentBusy} currentFile={currentFile} selection={selection} guideStage={guideStage} onGuideStage={updateGuideStage} onWorkspaceMode={changeWorkspaceMode} onNextSkill={selectSkill} onProvider={setProvider} onMode={setMode} onAsk={ask} onSaveMemory={saveMemory} onQuizEvidence={() => updateEvidence("quiz", 0.55, `Submitted quiz answer for ${selectedLesson.title}`)} onDone={() => toggleComplete(selectedLesson)} complete={completed.has(selectedLesson.id)} practiceSession={practiceSession} practiceReport={practiceReport} practiceBusy={practiceBusy} onCreatePractice={createPractice} onInspectPractice={inspectPractice} onOpenPractice={() => { if (practiceSession) void bridge.openPractice(practiceSession.id); }} onRemovePractice={removePractice} />
       </div>
       {diagnosticOpen && <DiagnosticOverlay graph={skillGraph} onComplete={finishDiagnostic} onSkip={() => finishDiagnostic()} />}

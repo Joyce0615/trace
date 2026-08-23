@@ -10,6 +10,7 @@ import { loadCourse, saveCourse } from "../electron/course-store.mjs";
 import { createPracticeSession, inspectPracticeSession, removePracticeSession } from "../electron/practice.mjs";
 import { analyzeFile, fileImportance, inspectRepository, languageFor, readRepositoryFile } from "../electron/repository.mjs";
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
+import { detectLanguageServers, resolveImportsStatically, resolveSymbol, serverForLanguage, shutdownLanguageServers } from "../electron/language-server.mjs";
 import { answerFromLocalIndex, buildContextPack } from "../electron/context-engine.mjs";
 import { buildSkillGraph, createLearnerState, reconcileLearnerState } from "../electron/skill-graph.mjs";
 import { loadLearnerState, saveLearnerState } from "../electron/learning-store.mjs";
@@ -275,4 +276,86 @@ test("tree-sitter indexing yields definitions, references, and call edges", asyn
   // Languages without a grammar still index through the deterministic regex path.
   const fallback = await analyzeFile(rootPath, { path: "engine/legacy.txt", language: "plaintext", size: 10 });
   assert.equal(fallback.indexer, "none");
+});
+
+test("import resolution degrades from language servers to the static index", async (context) => {
+  const rootPath = await mkdtemp(path.join(os.tmpdir(), "trace-lsp-"));
+  context.after(async () => {
+    await shutdownLanguageServers();
+    await rm(rootPath, { recursive: true, force: true });
+  });
+  await mkdir(path.join(rootPath, "pkg", "engine"), { recursive: true });
+  await writeFile(path.join(rootPath, "pkg", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "pkg", "engine", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "pkg", "engine", "core.py"), "def run():\n    return 1\n");
+  await writeFile(
+    path.join(rootPath, "pkg", "engine", "app.py"),
+    "import os\nfrom pkg.engine.core import run\nfrom .core import run as run_again\n\ndef main():\n    return run()\n",
+  );
+  await writeFile(path.join(rootPath, "web", "index.ts"), "").catch(() => undefined);
+  await mkdir(path.join(rootPath, "web"), { recursive: true });
+  await writeFile(path.join(rootPath, "web", "util.ts"), "export const identity = (value: string) => value;\n");
+  await writeFile(path.join(rootPath, "web", "index.ts"), "import { identity } from './util';\nexport const go = () => identity('x');\n");
+
+  const repository = await inspectRepository(rootPath, path.join(rootPath, "clones"));
+  const appImports = repository.imports.filter((item) => item.path === "pkg/engine/app.py");
+  assert.ok(appImports.some((item) => item.specifier === "pkg.engine.core" && item.targetPath === "pkg/engine/core.py"));
+  assert.ok(appImports.some((item) => item.specifier === ".core" && item.targetPath === "pkg/engine/core.py"));
+  // A third-party module is reported but honestly marked unresolved.
+  assert.equal(appImports.find((item) => item.specifier === "os").resolved, false);
+  const webImports = repository.imports.filter((item) => item.path === "web/index.ts");
+  assert.equal(webImports[0].targetPath, "web/util.ts");
+  assert.ok(repository.stats.resolvedImportCount >= 3);
+  assert.ok(repository.stats.importCount > repository.stats.resolvedImportCount);
+
+  // Re-resolution is pure and repeatable.
+  assert.deepEqual(resolveImportsStatically(repository, appImports).map((item) => item.targetPath), appImports.map((item) => item.targetPath));
+
+  const servers = await detectLanguageServers();
+  assert.ok(Object.keys(servers).length >= 6);
+  assert.ok(Object.values(servers).every((record) => typeof record.available === "boolean"));
+
+  // A language with no installed server must degrade instead of throwing.
+  const missing = await resolveSymbol(rootPath, { path: "pkg/engine/app.py", line: 6, column: 12, language: "cobol" }, { detected: servers });
+  assert.equal(missing.available, false);
+  assert.match(missing.reason, /No language server is installed/);
+  assert.equal(serverForLanguage("cobol", servers), null);
+});
+
+test("language server client resolves definitions and types when a server is installed", async (context) => {
+  const servers = await detectLanguageServers();
+  const server = serverForLanguage("c", servers) ?? serverForLanguage("typescript", servers) ?? serverForLanguage("python", servers);
+  if (!server) {
+    // Recorded blocker: no language server binary is available on this machine.
+    context.skip("No supported language server binary is installed.");
+    return;
+  }
+  const rootPath = await mkdtemp(path.join(os.tmpdir(), "trace-lsp-live-"));
+  context.after(async () => {
+    await shutdownLanguageServers();
+    await rm(rootPath, { recursive: true, force: true });
+  });
+  const language = server.languages[0];
+  const fixtures = {
+    c: { file: "main.c", source: "int helper(int value) { return value + 1; }\n\nint main(void) {\n  return helper(41);\n}\n", line: 4, column: 10 },
+    typescript: { file: "main.ts", source: "export function helper(value: number) { return value + 1; }\nexport const go = () => helper(41);\n", line: 2, column: 26 },
+    python: { file: "main.py", source: "def helper(value):\n    return value + 1\n\n\ndef go():\n    return helper(41)\n", line: 6, column: 12 },
+  };
+  const fixture = fixtures[language];
+  await writeFile(path.join(rootPath, fixture.file), fixture.source);
+
+  const resolved = await resolveSymbol(
+    rootPath,
+    { path: fixture.file, line: fixture.line, column: fixture.column, language },
+    { detected: servers, timeoutMs: 45_000 },
+  );
+  assert.equal(resolved.available, true, `resolution failed: ${resolved.reason}`);
+  assert.equal(resolved.server, server.id);
+  assert.ok(resolved.definitions.length >= 1, JSON.stringify(resolved));
+  assert.equal(resolved.definitions[0].path, fixture.file);
+  assert.equal(resolved.definitions[0].line, 1);
+  assert.ok(Array.isArray(resolved.overloads));
+  assert.ok(Array.isArray(resolved.implementations));
+  assert.equal(typeof resolved.dynamicDispatch, "boolean");
+  assert.match(resolved.type ?? "", /helper/);
 });

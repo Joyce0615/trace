@@ -66,6 +66,29 @@ const callEdges = [
 
 const references = callEdges.map((edge) => ({ name: edge.callee, path: edge.path, line: edge.line, kind: "call" }));
 
+const filePaths = new Set(files.map((file) => file.path));
+const imports = [
+  ["example.py", 1, "nanovllm", "nanovllm/__init__.py"],
+  ["example.py", 2, "nanovllm.sampling_params", "nanovllm/sampling_params.py"],
+  ["nanovllm/llm.py", 1, "nanovllm.engine.llm_engine", "nanovllm/engine/llm_engine.py"],
+  ["nanovllm/engine/llm_engine.py", 3, "nanovllm.config", "nanovllm/config.py"],
+  ["nanovllm/engine/llm_engine.py", 4, "nanovllm.engine.scheduler", "nanovllm/engine/scheduler.py"],
+  ["nanovllm/engine/llm_engine.py", 5, "nanovllm.engine.model_runner", "nanovllm/engine/model_runner.py"],
+  ["nanovllm/engine/llm_engine.py", 6, "torch", null],
+  ["nanovllm/engine/scheduler.py", 2, "nanovllm.engine.block_manager", "nanovllm/engine/block_manager.py"],
+  ["nanovllm/engine/scheduler.py", 3, "nanovllm.engine.sequence", "nanovllm/engine/sequence.py"],
+  ["nanovllm/engine/model_runner.py", 2, "nanovllm.models.qwen3", "nanovllm/models/qwen3.py"],
+  ["nanovllm/engine/model_runner.py", 3, "nanovllm.layers.sampler", "nanovllm/layers/sampler.py"],
+].map(([filePath, line, specifier, targetPath]) => ({
+  path: String(filePath),
+  line: Number(line),
+  specifier: String(specifier),
+  statement: `import ${specifier}`,
+  targetPath: targetPath && filePaths.has(String(targetPath)) ? String(targetPath) : null,
+  resolved: Boolean(targetPath && filePaths.has(String(targetPath))),
+  resolvedBy: targetPath && filePaths.has(String(targetPath)) ? "static-index" : null,
+}));
+
 export const nanoRepository: Repository = {
   id: "featured-nano-vllm",
   name: "nano-vllm",
@@ -80,6 +103,7 @@ export const nanoRepository: Repository = {
   symbols,
   references,
   callEdges,
+  imports,
   entryFiles: ["example.py", "nanovllm/llm.py", "nanovllm/engine/llm_engine.py"],
   stats: {
     fileCount: files.length,
@@ -87,6 +111,8 @@ export const nanoRepository: Repository = {
     referenceCount: references.length,
     callEdgeCount: callEdges.length,
     resolvedCallEdgeCount: callEdges.filter((edge) => edge.resolved).length,
+    importCount: imports.length,
+    resolvedImportCount: imports.filter((item) => item.resolved).length,
     indexer: "tree-sitter",
     indexerCounts: { "tree-sitter": 12, regex: 0 },
     languages: { python: 12, markdown: 1 },

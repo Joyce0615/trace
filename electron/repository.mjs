@@ -3,6 +3,7 @@ import { access, lstat, mkdir, readdir, readFile, realpath, stat } from "node:fs
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { analyzeSource, treeSitterSupports } from "./tree-sitter-index.mjs";
+import { resolveImportsStatically } from "./language-server.mjs";
 
 const SKIP_DIRECTORIES = new Set([
   ".git",
@@ -276,7 +277,7 @@ function regexSymbols(file, source) {
  * languages without a grammar or when a parse fails.
  */
 export async function analyzeFile(rootPath, file) {
-  const empty = { symbols: [], references: [], callEdges: [], indexer: "none" };
+  const empty = { symbols: [], references: [], callEdges: [], imports: [], indexer: "none" };
   if (file.size > 600_000) return empty;
   const canParse = treeSitterSupports(file.language, file.path);
   if (!canParse && !symbolPatterns(file.language).length) return empty;
@@ -288,17 +289,18 @@ export async function analyzeFile(rootPath, file) {
   }
   if (canParse) {
     const analysis = await analyzeSource(file.path, file.language, source);
-    if (analysis?.definitions.length) {
+    if (analysis?.definitions.length || analysis?.imports.length) {
       return {
         symbols: analysis.definitions.slice(0, 80),
         references: analysis.references,
         callEdges: analysis.callEdges,
+        imports: analysis.imports,
         indexer: "tree-sitter",
       };
     }
   }
   const symbols = regexSymbols(file, source);
-  return { symbols, references: [], callEdges: [], indexer: symbols.length ? "regex" : "none" };
+  return { symbols, references: [], callEdges: [], imports: [], indexer: symbols.length ? "regex" : "none" };
 }
 
 async function extractSymbols(rootPath, file) {
@@ -374,6 +376,8 @@ export async function inspectRepository(input, repositoriesDirectory) {
     return counts;
   }, {});
   const indexer = indexerCounts["tree-sitter"] ? "tree-sitter" : indexerCounts.regex ? "regex" : "none";
+  const rawImports = analyses.flatMap((analysis) => analysis.imports ?? []).slice(0, 20_000);
+  const imports = resolveImportsStatically({ files: fileRecords }, rawImports);
   const languages = {};
   for (const file of fileRecords) languages[file.language] = (languages[file.language] ?? 0) + 1;
 
@@ -429,6 +433,7 @@ export async function inspectRepository(input, repositoriesDirectory) {
     symbols,
     references,
     callEdges,
+    imports,
     entryFiles,
     stats: {
       fileCount: fileRecords.length,
@@ -436,6 +441,8 @@ export async function inspectRepository(input, repositoriesDirectory) {
       referenceCount: references.length,
       callEdgeCount: callEdges.length,
       resolvedCallEdgeCount: callEdges.filter((edge) => edge.resolved).length,
+      importCount: imports.length,
+      resolvedImportCount: imports.filter((item) => item.resolved).length,
       indexer,
       indexerCounts,
       languages,

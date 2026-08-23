@@ -31,6 +31,26 @@ export const browserBridge: TraceBridge = {
   async openRepository() { return { repository: nanoRepository, course: nanoCourse, skillGraph: nanoSkillGraph, learnerState: savedLearning }; },
   async readFile(_rootPath, filePath) { return nanoSourceByPath[filePath] ?? `# Preview unavailable for ${filePath}`; },
   async detectAgents() { return { codex: { available: true, version: "demo" }, claude: { available: true, version: "demo" } }; },
+  async detectLanguageServers() {
+    return { pyright: { id: "pyright", command: "pyright-langserver", available: false, binary: null, languages: ["python"] } };
+  },
+  async resolveSymbol(request) {
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const imports = (nanoRepository.imports ?? []).filter((item) => item.path === request.path);
+    const definitions = nanoRepository.symbols
+      .filter((symbol) => symbol.path === request.path && (symbol.line === request.line || symbol.name === request.symbol))
+      .map((symbol) => ({ path: symbol.path, line: symbol.line, column: 1 }));
+    return {
+      path: request.path,
+      line: request.line,
+      column: request.column ?? 1,
+      language: nanoRepository.files.find((file) => file.path === request.path)?.language ?? "plaintext",
+      imports,
+      definitions,
+      resolvedBy: "static-index",
+      languageServer: { available: false, server: null, reason: "No language server is installed for the browser demo." },
+    };
+  },
   async askAgent(request) {
     await new Promise((resolve) => setTimeout(resolve, 550));
     const pack = demoPack(request);

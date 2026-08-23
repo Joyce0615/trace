@@ -163,6 +163,36 @@ const CALL_QUERIES = {
   vue: "",
 };
 
+const IMPORT_QUERIES = {
+  python: `
+    (import_statement) @import
+    (import_from_statement) @import
+  `,
+  javascript: `
+    (import_statement source: (string) @module)
+    (call_expression function: (identifier) @require (arguments (string) @module))
+  `,
+  typescript: `
+    (import_statement source: (string) @module)
+    (call_expression function: (identifier) @require (arguments (string) @module))
+  `,
+  tsx: `
+    (import_statement source: (string) @module)
+  `,
+  go: `(import_spec path: (interpreted_string_literal) @module)`,
+  rust: `(use_declaration) @import`,
+  c: `(preproc_include path: (_) @module)`,
+  cpp: `(preproc_include path: (_) @module)`,
+  java: `(import_declaration) @import`,
+  ruby: `(call method: (identifier) @require (argument_list (string) @module))`,
+  php: `(namespace_use_declaration) @import`,
+  c_sharp: `(using_directive) @import`,
+  kotlin: `(import_header) @import`,
+  swift: `(import_declaration) @import`,
+  bash: `(command name: (command_name) @require) @import`,
+  vue: "",
+};
+
 // Nodes that introduce a named scope, used to attribute call edges to a caller.
 const SCOPE_NODE_TYPES = new Set([
   "function_definition",
@@ -305,6 +335,7 @@ export async function analyzeSource(filePath, language, source, options = {}) {
   const definitions = [];
   const references = [];
   const callEdges = [];
+  const imports = [];
   try {
     const definitionQuery = compiledQuery(grammarLanguage, grammar, "definitions", DEFINITION_QUERIES[grammar]);
     if (definitionQuery) {
@@ -337,6 +368,22 @@ export async function analyzeSource(filePath, language, source, options = {}) {
         }
       }
     }
+    const importQuery = compiledQuery(grammarLanguage, grammar, "imports", IMPORT_QUERIES[grammar]);
+    if (importQuery) {
+      for (const capture of importQuery.captures(tree.rootNode)) {
+        if (imports.length >= 200) break;
+        const node = capture.node;
+        if (!node?.text) continue;
+        if (capture.name === "require") continue;
+        const specifiers = capture.name === "module"
+          ? [stripQuotes(node.text)]
+          : moduleSpecifiersFrom(node.text);
+        for (const specifier of specifiers) {
+          if (!specifier || specifier.length > 200) continue;
+          imports.push({ path: filePath, line: node.startPosition.row + 1, specifier, statement: node.text.slice(0, 200) });
+        }
+      }
+    }
   } finally {
     tree.delete?.();
     parser.delete?.();
@@ -348,9 +395,42 @@ export async function analyzeSource(filePath, language, source, options = {}) {
     grammar,
     definitions,
     references,
+    imports: dedupeImports(imports),
     callEdges: callEdges.filter((edge) => edge.callee),
     resolvedCallEdges: callEdges.filter((edge) => definitionNames.has(edge.callee)).length,
   };
+}
+
+function stripQuotes(value) {
+  return value.trim().replace(/^[<"'`]/, "").replace(/[>"'`]$/, "").trim();
+}
+
+/** Extract module specifiers from a whole import statement when the grammar has no `source` field. */
+function moduleSpecifiersFrom(statement) {
+  const text = statement.trim();
+  const quoted = text.match(/["'<]([^"'>]+)["'>]/);
+  if (quoted) return [quoted[1]];
+  const fromModule = text.match(/^from\s+([.\w]+)\s+import\b/);
+  if (fromModule) return [fromModule[1]];
+  const plainImport = text.match(/^(?:import|use|using)\s+([\w.:/*{}\s,]+)/);
+  if (plainImport) {
+    return plainImport[1]
+      .split(",")
+      .map((part) => part.trim().split(/\s+as\s+/)[0].trim().replace(/[;{}]/g, ""))
+      .filter(Boolean)
+      .slice(0, 8);
+  }
+  return [];
+}
+
+function dedupeImports(imports) {
+  const seen = new Set();
+  return imports.filter((item) => {
+    const key = `${item.line}:${item.specifier}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 export function resetTreeSitterCaches() {

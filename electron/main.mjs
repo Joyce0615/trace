@@ -9,6 +9,7 @@ import { createPracticeSession, getPracticeSessionPath, inspectPracticeSession, 
 import { answerFromLocalIndex, buildContextPack, loadCachedResponse, responseCacheKey, saveCachedResponse } from "./context-engine.mjs";
 import { loadLearnerState, saveLearnerState } from "./learning-store.mjs";
 import { buildSkillGraph, reconcileLearnerState } from "./skill-graph.mjs";
+import { detectLanguageServers, resolveImportsStatically, resolveSymbol, shutdownLanguageServers } from "./language-server.mjs";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const openedRepositories = new Map();
@@ -77,6 +78,36 @@ ipcMain.handle("repository:read-file", async (_event, request) => {
 });
 
 ipcMain.handle("agents:detect", () => detectAgents());
+
+ipcMain.handle("index:language-servers", () => detectLanguageServers());
+
+ipcMain.handle("index:resolve", async (_event, request) => {
+  if (!request?.repository?.id || typeof request.path !== "string") throw new Error("Invalid resolution request.");
+  const repository = openedRepository(request.repository);
+  const file = repository.files.find((candidate) => candidate.path === request.path);
+  if (!file) throw new Error("That file is not part of the indexed repository.");
+  const staticImports = resolveImportsStatically(
+    repository,
+    (repository.imports ?? []).filter((item) => item.path === request.path),
+  );
+  const line = Number.isFinite(request.line) ? Math.max(1, Math.floor(request.line)) : 1;
+  const column = Number.isFinite(request.column) ? Math.max(1, Math.floor(request.column)) : 1;
+  const resolution = await resolveSymbol(repository.rootPath, { path: request.path, line, column, language: file.language });
+  const staticDefinitions = repository.symbols
+    .filter((symbol) => symbol.name === request.symbol)
+    .map((symbol) => ({ path: symbol.path, line: symbol.line, column: 1 }));
+  return {
+    path: request.path,
+    line,
+    column,
+    language: file.language,
+    imports: staticImports,
+    languageServer: resolution,
+    // The static index always answers, so resolution degrades instead of failing.
+    definitions: resolution.available && resolution.definitions.length ? resolution.definitions : staticDefinitions,
+    resolvedBy: resolution.available && resolution.definitions.length ? `language-server:${resolution.server}` : "static-index",
+  };
+});
 
 ipcMain.handle("agents:ask", async (_event, request) => {
   if (!request || !["codex", "claude"].includes(request.provider)) throw new Error("Choose Codex or Claude first.");
@@ -151,3 +182,5 @@ app.whenReady().then(() => {
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
+
+app.on("before-quit", () => { void shutdownLanguageServers(); });

@@ -181,6 +181,19 @@ button { color: inherit; }
 .symbol-section button:hover { color: #c8d0dc; }
 .symbol-section button > span { width: 14px; color: var(--purple); font-family: Georgia, serif; }
 .symbol-section button small { margin-left: auto; color: #465161; }
+.import-section button.resolved > span { color: var(--green); }
+.import-section button.unresolved { color: #4d5666; cursor: default; }
+.import-section button.unresolved > span { color: #3d4553; }
+.resolution-section { margin-top: 12px; border-top: 1px solid var(--line-soft); padding: 9px 7px 14px; }
+.resolve-button { width: 100%; display: flex; align-items: center; justify-content: center; gap: 6px; padding: 6px; border: 1px solid var(--line); border-radius: 6px; background: #131924; color: #9aa5b5; font-size: calc(9px + var(--font-boost)); cursor: pointer; }
+.resolve-button:hover:not(:disabled) { border-color: #3b4757; color: #ccd4e0; }
+.resolve-button:disabled { opacity: .55; cursor: progress; }
+.resolution-detail { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
+.resolution-source { color: var(--green); font-size: calc(8px + var(--font-boost)); letter-spacing: .08em; text-transform: uppercase; }
+.resolution-detail small { color: #596373; font-size: calc(8px + var(--font-boost)); line-height: 1.45; }
+.resolution-type { display: block; color: #8fd8ff; font-size: calc(8px + var(--font-boost)); word-break: break-word; }
+.resolution-anchor { width: 100%; padding: 4px 5px; border: 0; border-radius: 5px; background: #10151e; color: #8b95a6; font-family: "SFMono-Regular", Menlo, monospace; font-size: calc(8px + var(--font-boost)); text-align: left; cursor: pointer; }
+.resolution-anchor:hover { color: #d3dae4; }
 .editor-column { min-width: 0; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
 .lesson-context { min-height: 82px; display: grid; grid-template-columns: minmax(160px, .7fr) minmax(220px, 1fr) auto; gap: 20px; align-items: center; padding: 13px 18px; background: #11171f; border-bottom: 1px solid var(--line); }
 .lesson-context > div:first-child span { display: block; margin-bottom: 5px; color: var(--green); font-size: calc(7px + var(--font-boost)); letter-spacing: .16em; font-weight: 750; }

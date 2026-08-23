@@ -5,6 +5,8 @@ contextBridge.exposeInMainWorld("trace", {
   openRepository: (source) => ipcRenderer.invoke("repository:open", source),
   readFile: (rootPath, filePath) => ipcRenderer.invoke("repository:read-file", { rootPath, filePath }),
   detectAgents: () => ipcRenderer.invoke("agents:detect"),
+  detectLanguageServers: () => ipcRenderer.invoke("index:language-servers"),
+  resolveSymbol: (request) => ipcRenderer.invoke("index:resolve", request),
   askAgent: (request) => ipcRenderer.invoke("agents:ask", request),
   enhanceCourse: (request) => ipcRenderer.invoke("course:enhance", request),
   loadLearning: (request) => ipcRenderer.invoke("learning:load", request),

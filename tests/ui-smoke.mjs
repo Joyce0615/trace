@@ -71,6 +71,16 @@ try {
   await page.locator(".monaco-editor").waitFor({ timeout: 20_000 });
   await page.getByText("nanovllm/engine/llm_engine.py", { exact: false }).first().waitFor();
 
+  // Item 17: imports and language-server resolution, degrading to the static index.
+  await page.locator(".import-section").waitFor();
+  assert.equal(await page.locator(".import-section .symbol-heading small").innerText(), "3/4");
+  await page.locator(".import-section button.resolved", { hasText: "nanovllm.engine.scheduler" }).click();
+  await page.getByText("nanovllm/engine/scheduler.py", { exact: false }).first().waitFor();
+  await page.getByRole("button", { name: "Resolve at cursor" }).click();
+  await page.locator(".resolution-detail").waitFor();
+  assert.equal((await page.locator(".resolution-source").innerText()).toLowerCase(), "static-index");
+  await page.getByText(/No language server for python/).waitFor();
+
   await page.getByRole("button", { name: "Ask", exact: true }).click();
   await page.getByText("Ask without losing your place.").waitFor();
   await page.locator(".tutor-input textarea").fill("Where is Scheduler defined?");

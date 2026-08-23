@@ -44,6 +44,16 @@ export interface CallEdge {
   resolved?: boolean;
 }
 
+export interface ImportEdge {
+  path: string;
+  line: number;
+  specifier: string;
+  statement?: string;
+  targetPath?: string | null;
+  resolved?: boolean;
+  resolvedBy?: string | null;
+}
+
 export interface Repository {
   id: string;
   name: string;
@@ -58,6 +68,7 @@ export interface Repository {
   symbols: CodeSymbol[];
   references?: CodeReference[];
   callEdges?: CallEdge[];
+  imports?: ImportEdge[];
   entryFiles: string[];
   stats: {
     fileCount: number;
@@ -65,6 +76,8 @@ export interface Repository {
     referenceCount?: number;
     callEdgeCount?: number;
     resolvedCallEdgeCount?: number;
+    importCount?: number;
+    resolvedImportCount?: number;
     indexer?: string;
     indexerCounts?: Record<string, number>;
     languages: Record<string, number>;
@@ -236,6 +249,35 @@ export interface AgentAnswer {
   responseCacheHit: boolean;
 }
 
+export interface LanguageServerRecord {
+  id: string;
+  command: string;
+  available: boolean;
+  binary: string | null;
+  languages: string[];
+}
+
+export interface SymbolResolution {
+  path: string;
+  line: number;
+  column: number;
+  language: string;
+  imports: ImportEdge[];
+  definitions: Array<{ path: string; line: number; column: number }>;
+  resolvedBy: string;
+  languageServer: {
+    available: boolean;
+    server: string | null;
+    reason?: string;
+    definitions?: Array<{ path: string; line: number; column: number }>;
+    overloads?: Array<{ path: string; line: number; column: number }>;
+    typeDefinitions?: Array<{ path: string; line: number; column: number }>;
+    implementations?: Array<{ path: string; line: number; column: number }>;
+    dynamicDispatch?: boolean;
+    type?: string | null;
+  };
+}
+
 export interface AgentState {
   codex: { available: boolean; version: string | null };
   claude: { available: boolean; version: string | null };
@@ -267,6 +309,8 @@ export interface TraceBridge {
   openRepository(request: string | { source: string; profile?: LearnerProfile }): Promise<{ repository: Repository; course: Course; skillGraph: SkillGraph; learnerState: LearnerState }>;
   readFile(rootPath: string, filePath: string): Promise<string>;
   detectAgents(): Promise<AgentState>;
+  detectLanguageServers(): Promise<Record<string, LanguageServerRecord>>;
+  resolveSymbol(request: { repository: Repository; path: string; line: number; column?: number; symbol?: string }): Promise<SymbolResolution>;
   askAgent(request: {
     provider: "codex" | "claude";
     rootPath: string;
