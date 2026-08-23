@@ -2,7 +2,7 @@ import Editor, { type OnMount } from "@monaco-editor/react";
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { browserBridge, demoCourse, demoLearnerState, demoRepository, demoSkillGraph } from "./demo";
 import { addEvidence, completeDiagnostic, personalizeSkillGraph, skillForLesson } from "./learning";
-import type { AgentState, ContextMode, ContextPack, ContextScope, Course, LearnerProfile, LearnerState, LearningMemory, Lesson, LessonContentBlock, PracticeReport, PracticeSession, Repository, RepoFile, SkillGraph, SkillNode, SymbolResolution } from "./types";
+import type { AgentState, ContextMode, ContextPack, ContextScope, Course, KnowledgeGraphSummary, LearnerProfile, LearnerState, LearningMemory, Lesson, LessonContentBlock, PracticeReport, PracticeSession, Repository, RepoFile, SkillGraph, SkillNode, SymbolResolution } from "./types";
 
 type TutorMode = "learn" | "ask" | "quiz" | "practice";
 type WorkspaceMode = "lesson" | "diagram" | "code" | "notes";
@@ -162,9 +162,10 @@ function SkillTree({ graph, state, activeSkill, onSelect, onFamiliar, onChalleng
   </div>;
 }
 
-function CourseSidebar({ course, skillGraph, learnerState, activeSkill, selectedLesson, completed, onSelect, onSelectSkill, onFamiliar, onChallenge, onToggleComplete, onEnhance, enhancing, enhanceElapsed, provider, canEnhance }: {
+function CourseSidebar({ course, skillGraph, knowledgeGraph, learnerState, activeSkill, selectedLesson, completed, onSelect, onSelectSkill, onFamiliar, onChallenge, onToggleComplete, onEnhance, enhancing, enhanceElapsed, provider, canEnhance }: {
   course: Course;
   skillGraph: SkillGraph;
+  knowledgeGraph: KnowledgeGraphSummary | null;
   learnerState: LearnerState;
   activeSkill?: SkillNode;
   selectedLesson: Lesson;
@@ -196,6 +197,13 @@ function CourseSidebar({ course, skillGraph, learnerState, activeSkill, selected
         <div className="progress-ring" style={{ "--progress": `${percent * 3.6}deg` } as React.CSSProperties}><span>{percent}%</span></div>
         <div><strong>{mastered} / {skillGraph.nodes.length} skills lit</strong><small>{percent ? "Your next branch is ready" : "Start with the highlighted node"}</small></div>
       </div>
+      {knowledgeGraph && <div className="knowledge-graph-card" data-graph-version={knowledgeGraph.version}>
+        <span>KNOWLEDGE GRAPH</span>
+        <strong>{knowledgeGraph.stats.nodeCount.toLocaleString()} nodes · {knowledgeGraph.stats.edgeCount.toLocaleString()} edges</strong>
+        <small data-reused={knowledgeGraph.stats.reusedPartitions} data-rebuilt={knowledgeGraph.stats.rebuiltPartitions}>
+          v{(knowledgeGraph.version ?? "unversioned").slice(0, 8)} · {knowledgeGraph.stats.reusedPartitions} reused / {knowledgeGraph.stats.rebuiltPartitions} rebuilt
+        </small>
+      </div>}
       <div className="sidebar-view-switch"><button className={view === "tree" ? "active" : ""} onClick={() => setView("tree")}>Skill Map</button><button className={view === "outline" ? "active" : ""} onClick={() => setView("outline")}>Outline</button></div>
       {view === "tree" ? <div className="module-list skill-list"><SkillTree graph={skillGraph} state={learnerState} activeSkill={activeSkill} onSelect={onSelectSkill} onFamiliar={onFamiliar} onChallenge={onChallenge} /></div> : <div className="module-list">
         {course.modules.map((module) => (
@@ -672,6 +680,7 @@ export default function App() {
   const [diagnosticOpen, setDiagnosticOpen] = useState(false);
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("lesson");
   const [guideProgress, setGuideProgress] = useState<Record<string, number>>({});
+  const [knowledgeGraph, setKnowledgeGraph] = useState<KnowledgeGraphSummary | null>(null);
   const [resolution, setResolution] = useState<SymbolResolution | null>(null);
   const [resolutionBusy, setResolutionBusy] = useState(false);
 
@@ -692,6 +701,10 @@ export default function App() {
     const timer = window.setTimeout(() => { void bridge.saveLearning(learnerState).catch(() => undefined); }, 250);
     return () => window.clearTimeout(timer);
   }, [learnerState]);
+  // Read-only inspection surface for automated smoke tests and support diagnostics.
+  useEffect(() => {
+    window.traceWorkspace = repository ? { repository, course, skillGraph, learnerState, knowledgeGraph } : undefined;
+  }, [course, knowledgeGraph, learnerState, repository, skillGraph]);
 
   const loadSource = useCallback(async (repo: Repository, file: RepoFile, targetLine = 1) => {
     setCurrentFile(file);
@@ -705,7 +718,8 @@ export default function App() {
     }
   }, []);
 
-  const activateWorkspace = useCallback(async (repo: Repository, nextCourse: Course, nextGraph: SkillGraph, nextState: LearnerState) => {
+  const activateWorkspace = useCallback(async (repo: Repository, nextCourse: Course, nextGraph: SkillGraph, nextState: LearnerState, nextKnowledgeGraph?: KnowledgeGraphSummary | null) => {
+    if (nextKnowledgeGraph !== undefined) setKnowledgeGraph(nextKnowledgeGraph);
     const recommended = nextGraph.nodes.find((node) => nextState.mastery[node.id]?.status === "recommended");
     const firstLesson = flattenLessons(nextCourse).find((lesson) => lesson.id === recommended?.lessonId) ?? flattenLessons(nextCourse)[0];
     setRepository(repo);
@@ -733,7 +747,7 @@ export default function App() {
       if (!resolved) return;
       setBusy(true);
       const workspace = await bridge.openRepository({ source: resolved, profile: profile ?? course?.profile });
-      await activateWorkspace(workspace.repository, workspace.course, workspace.skillGraph, workspace.learnerState);
+      await activateWorkspace(workspace.repository, workspace.course, workspace.skillGraph, workspace.learnerState, workspace.knowledgeGraph ?? null);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -864,7 +878,7 @@ export default function App() {
   };
 
   if (!repository || !course || !selectedLesson || !skillGraph || !learnerState) {
-    return <StartScreen onOpen={openRepository} onDemo={(profile) => activateWorkspace(demoRepository, { ...demoCourse, profile, level: profile.level }, personalizeSkillGraph(demoSkillGraph, profile.goal), { ...structuredClone(demoLearnerState), diagnosticCompleted: false })} busy={busy} error={error} fontScale={fontScale} onFontScale={setFontScale} />;
+    return <StartScreen onOpen={openRepository} onDemo={(profile) => { void bridge.graphSummary({ repository: demoRepository }).then(setKnowledgeGraph).catch(() => setKnowledgeGraph(null)); return activateWorkspace(demoRepository, { ...demoCourse, profile, level: profile.level }, personalizeSkillGraph(demoSkillGraph, profile.goal), { ...structuredClone(demoLearnerState), diagnosticCompleted: false }); }} busy={busy} error={error} fontScale={fontScale} onFontScale={setFontScale} />;
   }
 
   const openFile = (file: RepoFile, targetLine = 1) => loadSource(repository, file, targetLine);
@@ -930,7 +944,7 @@ export default function App() {
         <button className="avatar">BJ</button>
       </header>
       <div className="workspace-grid">
-        <CourseSidebar course={course} skillGraph={skillGraph} learnerState={learnerState} activeSkill={activeSkill} selectedLesson={selectedLesson} completed={completed} onSelect={selectLesson} onSelectSkill={selectSkill} onFamiliar={(node) => setLearnerState(addEvidence(learnerState, skillGraph, node.id, { kind: "self-report", strength: 0.62, detail: `Marked familiar: ${node.title}` }))} onChallenge={(node) => { const lesson = flattenLessons(course).find((item) => item.id === node.lessonId); if (lesson) void selectLesson(lesson).then(() => setMode("quiz")); }} onToggleComplete={toggleComplete} onEnhance={enhanceCourse} enhancing={courseBusy} enhanceElapsed={courseElapsed} provider={provider} canEnhance={agents[provider].available} />
+        <CourseSidebar course={course} skillGraph={skillGraph} knowledgeGraph={knowledgeGraph} learnerState={learnerState} activeSkill={activeSkill} selectedLesson={selectedLesson} completed={completed} onSelect={selectLesson} onSelectSkill={selectSkill} onFamiliar={(node) => setLearnerState(addEvidence(learnerState, skillGraph, node.id, { kind: "self-report", strength: 0.62, detail: `Marked familiar: ${node.title}` }))} onChallenge={(node) => { const lesson = flattenLessons(course).find((item) => item.id === node.lessonId); if (lesson) void selectLesson(lesson).then(() => setMode("quiz")); }} onToggleComplete={toggleComplete} onEnhance={enhanceCourse} enhancing={courseBusy} enhanceElapsed={courseElapsed} provider={provider} canEnhance={agents[provider].available} />
         <CodeWorkspace repository={repository} lesson={selectedLesson} currentFile={currentFile} content={content} line={line} workspaceMode={workspaceMode} fontBoost={fontBoosts[fontScale]} onOpen={openFile} onSelection={setSelection} onWorkspaceMode={changeWorkspaceMode} resolution={resolution} resolutionBusy={resolutionBusy} onResolve={resolveAtCursor} />
         <TutorPanel repository={repository} lesson={selectedLesson} skill={activeSkill} nextSkill={nextSkill} learnerState={learnerState} provider={provider} agents={agents} mode={mode} messages={messages} askMessages={askMessages} busy={agentBusy} currentFile={currentFile} selection={selection} guideStage={guideStage} onGuideStage={updateGuideStage} onWorkspaceMode={changeWorkspaceMode} onNextSkill={selectSkill} onProvider={setProvider} onMode={setMode} onAsk={ask} onSaveMemory={saveMemory} onQuizEvidence={() => updateEvidence("quiz", 0.55, `Submitted quiz answer for ${selectedLesson.title}`)} onDone={() => toggleComplete(selectedLesson)} complete={completed.has(selectedLesson.id)} practiceSession={practiceSession} practiceReport={practiceReport} practiceBusy={practiceBusy} onCreatePractice={createPractice} onInspectPractice={inspectPractice} onOpenPractice={() => { if (practiceSession) void bridge.openPractice(practiceSession.id); }} onRemovePractice={removePractice} />
       </div>

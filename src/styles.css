@@ -175,6 +175,10 @@ button { color: inherit; }
 .language-dot { width: 19px; flex: none; font-family: "SFMono-Regular", Menlo, monospace; font-size: calc(7px + var(--font-boost)); color: #6f7c8f; }
 .lang-typescript { color: #6bbcff; }.lang-python { color: #e7c75f; }.lang-javascript { color: #e8da65; }.lang-markdown { color: #9aabbe; }.lang-rust { color: #d9956d; }
 .more-files { padding: 8px 12px; color: #4d5868; font-size: calc(8px + var(--font-boost)); }
+.knowledge-graph-card { margin: 0 20px 12px; padding: 9px 11px; border: 1px solid var(--line-soft); border-radius: 8px; background: #10151e; display: flex; flex-direction: column; gap: 3px; }
+.knowledge-graph-card > span { color: #5d6879; font-size: calc(7px + var(--font-boost)); letter-spacing: .16em; font-weight: 750; }
+.knowledge-graph-card > strong { color: #b7c0cd; font-size: calc(10px + var(--font-boost)); font-weight: 620; }
+.knowledge-graph-card > small { color: #5c6675; font-family: "SFMono-Regular", Menlo, monospace; font-size: calc(8px + var(--font-boost)); }
 .symbol-section { margin-top: 14px; border-top: 1px solid var(--line-soft); padding: 9px 7px; }
 .symbol-heading { display: flex; justify-content: space-between; padding: 0 4px 7px; color: #566172; font-size: calc(8px + var(--font-boost)); letter-spacing: .13em; }
 .symbol-section button { width: 100%; display: flex; align-items: center; gap: 7px; padding: 5px; border: 0; background: transparent; color: #7e899a; font-size: calc(9px + var(--font-boost)); cursor: pointer; text-align: left; }

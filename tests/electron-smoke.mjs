@@ -31,6 +31,19 @@ try {
   const resolvedEdges = Number(indexSummary.match(/(\d+)\/\d+ resolved call edges/)?.[1] ?? 0);
   assert.ok(resolvedEdges > 0, `expected resolved call edges, got: ${indexSummary}`);
 
+  // Item 18: the knowledge graph is built for the real repository and reported by version.
+  await page.locator(".knowledge-graph-card").waitFor({ timeout: 30_000 });
+  const graphVersion = await page.locator(".knowledge-graph-card").getAttribute("data-graph-version");
+  assert.ok((graphVersion ?? "").length >= 8, `unexpected graph version: ${graphVersion}`);
+  const graphSummary = await page.evaluate(() => window.trace.graphSummary({ repository: window.traceWorkspace.repository }));
+  assert.equal(graphSummary.format, "kg-v1");
+  assert.equal(graphSummary.version, graphVersion);
+  assert.ok(graphSummary.stats.nodeCount > 1_000, JSON.stringify(graphSummary.stats));
+  assert.ok(graphSummary.stats.resolvedCallEdges > 0);
+  assert.equal(graphSummary.stats.danglingEdges, 0);
+  const hood = await page.evaluate(() => window.trace.graphNeighborhood({ repository: window.traceWorkspace.repository, nodeId: `repository:${window.traceWorkspace.repository.id}`, depth: 1 }));
+  assert.ok(hood.nodes.length > 1 && hood.edges.length > 1, JSON.stringify({ nodes: hood.nodes.length, edges: hood.edges.length }));
+
   // Item 17: real-repository import resolution plus the optional language-server bridge.
   const languageServers = await page.evaluate(() => window.trace.detectLanguageServers());
   assert.ok(Object.keys(languageServers).length >= 6, JSON.stringify(languageServers));

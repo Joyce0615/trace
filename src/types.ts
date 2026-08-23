@@ -249,6 +249,51 @@ export interface AgentAnswer {
   responseCacheHit: boolean;
 }
 
+export interface KnowledgeGraphNode {
+  id: string;
+  kind: "repository" | "directory" | "file" | "symbol" | "external" | "unresolved";
+  key: string;
+  label: string;
+  language?: string;
+  symbolKind?: string;
+  path?: string;
+  line?: number;
+  container?: string | null;
+  importance?: number;
+  size?: number;
+}
+
+export interface KnowledgeGraphEdge {
+  from: string;
+  to: string;
+  kind: "contains" | "defines" | "imports" | "calls";
+  specifier?: string;
+  callee?: string;
+  line?: number;
+  resolved?: boolean;
+}
+
+export interface KnowledgeGraphSummary {
+  format: string;
+  repositoryId: string;
+  version?: string;
+  previousVersion: string | null;
+  generatedAt: string;
+  stats: {
+    nodeCount: number;
+    edgeCount: number;
+    fileCount: number;
+    reusedPartitions: number;
+    rebuiltPartitions: number;
+    invalidatedByDependency: number;
+    removedPartitions: number;
+    danglingEdges: number;
+    resolvedCallEdges: number;
+    resolvedImportEdges: number;
+    byKind: Record<string, number>;
+  };
+}
+
 export interface LanguageServerRecord {
   id: string;
   command: string;
@@ -306,7 +351,9 @@ export interface PracticeReport {
 
 export interface TraceBridge {
   chooseRepository(): Promise<string | null>;
-  openRepository(request: string | { source: string; profile?: LearnerProfile }): Promise<{ repository: Repository; course: Course; skillGraph: SkillGraph; learnerState: LearnerState }>;
+  openRepository(request: string | { source: string; profile?: LearnerProfile }): Promise<{ repository: Repository; course: Course; skillGraph: SkillGraph; learnerState: LearnerState; knowledgeGraph?: KnowledgeGraphSummary }>;
+  graphSummary(request: { repository: Repository }): Promise<KnowledgeGraphSummary>;
+  graphNeighborhood(request: { repository: Repository; nodeId: string; depth?: number; edgeKinds?: string[] }): Promise<{ nodes: KnowledgeGraphNode[]; edges: KnowledgeGraphEdge[] }>;
   readFile(rootPath: string, filePath: string): Promise<string>;
   detectAgents(): Promise<AgentState>;
   detectLanguageServers(): Promise<Record<string, LanguageServerRecord>>;
@@ -338,8 +385,18 @@ export interface TraceBridge {
   removePractice(request: { sessionId: string; discardChanges: boolean }): Promise<{ removed: boolean; requiresConfirmation: boolean; report?: PracticeReport }>;
 }
 
+export interface TraceWorkspaceSnapshot {
+  repository: Repository;
+  course: Course | null;
+  skillGraph: SkillGraph | null;
+  learnerState: LearnerState | null;
+  knowledgeGraph: KnowledgeGraphSummary | null;
+}
+
 declare global {
   interface Window {
     trace?: TraceBridge;
+    /** Read-only workspace snapshot used by smoke tests and support diagnostics. */
+    traceWorkspace?: TraceWorkspaceSnapshot;
   }
 }

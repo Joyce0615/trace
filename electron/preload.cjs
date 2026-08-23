@@ -7,6 +7,8 @@ contextBridge.exposeInMainWorld("trace", {
   detectAgents: () => ipcRenderer.invoke("agents:detect"),
   detectLanguageServers: () => ipcRenderer.invoke("index:language-servers"),
   resolveSymbol: (request) => ipcRenderer.invoke("index:resolve", request),
+  graphSummary: (request) => ipcRenderer.invoke("graph:summary", request),
+  graphNeighborhood: (request) => ipcRenderer.invoke("graph:neighborhood", request),
   askAgent: (request) => ipcRenderer.invoke("agents:ask", request),
   enhanceCourse: (request) => ipcRenderer.invoke("course:enhance", request),
   loadLearning: (request) => ipcRenderer.invoke("learning:load", request),

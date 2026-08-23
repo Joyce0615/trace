@@ -1,4 +1,4 @@
-import type { ContextPack, ContextSection, LearnerState, TraceBridge } from "./types";
+import type { ContextPack, ContextSection, KnowledgeGraphEdge, KnowledgeGraphNode, KnowledgeGraphSummary, LearnerState, TraceBridge } from "./types";
 import { nanoCourse, nanoLearnerState, nanoRepository, nanoSkillGraph, nanoSourceByPath } from "./nano-demo";
 
 export const demoRepository = nanoRepository;
@@ -7,6 +7,40 @@ export const demoSkillGraph = nanoSkillGraph;
 export const demoLearnerState = nanoLearnerState;
 
 let savedLearning: LearnerState = structuredClone(nanoLearnerState);
+
+const demoGraphNodes: KnowledgeGraphNode[] = [
+  { id: `repository:${nanoRepository.id}`, kind: "repository", key: nanoRepository.id, label: nanoRepository.name },
+  ...nanoRepository.files.map((file) => ({ id: `file:${file.path}`, kind: "file" as const, key: file.path, label: file.name, language: file.language })),
+  ...nanoRepository.symbols.map((symbol) => ({ id: `symbol:${symbol.path}#${symbol.name}@${symbol.line}`, kind: "symbol" as const, key: `${symbol.path}#${symbol.name}`, label: symbol.name, symbolKind: symbol.kind, path: symbol.path, line: symbol.line })),
+];
+
+const demoGraphEdges: KnowledgeGraphEdge[] = [
+  ...nanoRepository.files.map((file) => ({ from: `repository:${nanoRepository.id}`, to: `file:${file.path}`, kind: "contains" as const })),
+  ...nanoRepository.symbols.map((symbol) => ({ from: `file:${symbol.path}`, to: `symbol:${symbol.path}#${symbol.name}@${symbol.line}`, kind: "defines" as const })),
+  ...(nanoRepository.imports ?? []).map((item) => ({ from: `file:${item.path}`, to: item.targetPath ? `file:${item.targetPath}` : `external:${item.specifier}`, kind: "imports" as const, specifier: item.specifier, line: item.line, resolved: Boolean(item.targetPath) })),
+  ...(nanoRepository.callEdges ?? []).map((edge) => ({ from: `symbol:${edge.path}#${edge.caller}`, to: edge.resolved ? `symbol:${edge.targetPath}#${edge.callee}@${edge.targetLine}` : `unresolved:${edge.callee}`, kind: "calls" as const, callee: edge.callee, line: edge.line, resolved: Boolean(edge.resolved) })),
+];
+
+const demoKnowledgeGraph: KnowledgeGraphSummary = {
+  format: "kg-v1",
+  repositoryId: nanoRepository.id,
+  version: nanoRepository.versionId,
+  previousVersion: null,
+  generatedAt: new Date().toISOString(),
+  stats: {
+    nodeCount: demoGraphNodes.length,
+    edgeCount: demoGraphEdges.length,
+    fileCount: nanoRepository.files.length,
+    reusedPartitions: 0,
+    rebuiltPartitions: nanoRepository.files.length,
+    invalidatedByDependency: 0,
+    removedPartitions: 0,
+    danglingEdges: 0,
+    resolvedCallEdges: (nanoRepository.callEdges ?? []).filter((edge) => edge.resolved).length,
+    resolvedImportEdges: (nanoRepository.imports ?? []).filter((item) => item.resolved).length,
+    byKind: { repository: 1, file: nanoRepository.files.length, symbol: nanoRepository.symbols.length },
+  },
+};
 
 function demoPack(request: Parameters<TraceBridge["askAgent"]>[0]): ContextPack {
   const context = request.context;
@@ -28,7 +62,13 @@ function demoPack(request: Parameters<TraceBridge["askAgent"]>[0]): ContextPack 
 
 export const browserBridge: TraceBridge = {
   async chooseRepository() { return null; },
-  async openRepository() { return { repository: nanoRepository, course: nanoCourse, skillGraph: nanoSkillGraph, learnerState: savedLearning }; },
+  async openRepository() { return { repository: nanoRepository, course: nanoCourse, skillGraph: nanoSkillGraph, learnerState: savedLearning, knowledgeGraph: demoKnowledgeGraph }; },
+  async graphSummary() { return demoKnowledgeGraph; },
+  async graphNeighborhood(request) {
+    const nodes = demoGraphNodes.filter((node) => node.id === request.nodeId || demoGraphEdges.some((edge) => (edge.from === request.nodeId && edge.to === node.id) || (edge.to === request.nodeId && edge.from === node.id)));
+    const edges = demoGraphEdges.filter((edge) => edge.from === request.nodeId || edge.to === request.nodeId);
+    return { nodes, edges };
+  },
   async readFile(_rootPath, filePath) { return nanoSourceByPath[filePath] ?? `# Preview unavailable for ${filePath}`; },
   async detectAgents() { return { codex: { available: true, version: "demo" }, claude: { available: true, version: "demo" } }; },
   async detectLanguageServers() {

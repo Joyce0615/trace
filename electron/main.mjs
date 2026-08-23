@@ -10,9 +10,11 @@ import { answerFromLocalIndex, buildContextPack, loadCachedResponse, responseCac
 import { loadLearnerState, saveLearnerState } from "./learning-store.mjs";
 import { buildSkillGraph, reconcileLearnerState } from "./skill-graph.mjs";
 import { detectLanguageServers, resolveImportsStatically, resolveSymbol, shutdownLanguageServers } from "./language-server.mjs";
+import { buildKnowledgeGraph, loadKnowledgeGraph, neighborhood, saveKnowledgeGraph } from "./knowledge-graph.mjs";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const openedRepositories = new Map();
+const knowledgeGraphs = new Map();
 
 function openedRepository(candidate) {
   const repository = candidate?.id ? openedRepositories.get(candidate.id) : null;
@@ -66,7 +68,43 @@ ipcMain.handle("repository:open", async (_event, source) => {
   const skillGraph = buildSkillGraph(repository, course);
   const savedState = await loadLearnerState(path.join(app.getPath("userData"), "learning"), repository.id);
   const learnerState = reconcileLearnerState(repository, skillGraph, savedState);
-  return { repository, course, skillGraph, learnerState };
+  const graphDirectory = path.join(app.getPath("userData"), "knowledge-graphs");
+  const previousGraph = await loadKnowledgeGraph(graphDirectory, repository.id);
+  const knowledgeGraph = buildKnowledgeGraph(repository, { previous: previousGraph });
+  knowledgeGraphs.set(repository.id, knowledgeGraph);
+  await saveKnowledgeGraph(graphDirectory, knowledgeGraph);
+  return { repository, course, skillGraph, learnerState, knowledgeGraph: summarizeGraph(knowledgeGraph) };
+});
+
+// The renderer receives graph statistics eagerly and requests neighborhoods on demand,
+// so a large graph never crosses the IPC boundary in one payload.
+function summarizeGraph(graph) {
+  return {
+    format: graph.format,
+    repositoryId: graph.repositoryId,
+    version: graph.version,
+    previousVersion: graph.previousVersion,
+    generatedAt: graph.generatedAt,
+    stats: graph.stats,
+  };
+}
+
+ipcMain.handle("graph:summary", (_event, request) => {
+  const repository = openedRepository(request?.repository);
+  const graph = knowledgeGraphs.get(repository.id);
+  if (!graph) throw new Error("The knowledge graph is not built for this repository.");
+  return summarizeGraph(graph);
+});
+
+ipcMain.handle("graph:neighborhood", (_event, request) => {
+  const repository = openedRepository(request?.repository);
+  const graph = knowledgeGraphs.get(repository.id);
+  if (!graph) throw new Error("The knowledge graph is not built for this repository.");
+  if (typeof request.nodeId !== "string" || request.nodeId.length > 512) throw new Error("Invalid graph node id.");
+  const depth = Number.isFinite(request.depth) ? Math.min(3, Math.max(1, Math.floor(request.depth))) : 1;
+  const kinds = Array.isArray(request.edgeKinds) ? request.edgeKinds.filter((kind) => typeof kind === "string").slice(0, 6) : null;
+  const result = neighborhood(graph, request.nodeId, depth, kinds?.length ? kinds : null);
+  return { ...result, nodes: result.nodes.slice(0, 400), edges: result.edges.slice(0, 800) };
 });
 
 ipcMain.handle("repository:read-file", async (_event, request) => {

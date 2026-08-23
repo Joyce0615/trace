@@ -54,6 +54,10 @@ try {
   await page.getByRole("button", { name: "Build my skill tree" }).click();
   await page.getByText("nano-vllm: Build an LLM Engine").waitFor();
   assert.equal(await page.locator(".index-badge").getAttribute("data-indexer"), "tree-sitter");
+  // Item 18: the versioned knowledge graph summary is surfaced in the sidebar.
+  await page.locator(".knowledge-graph-card").waitFor();
+  assert.equal(await page.locator(".knowledge-graph-card").getAttribute("data-graph-version"), "nano-vllm-featured-v1");
+  assert.match(await page.locator(".knowledge-graph-card strong").innerText(), /^\d+ nodes · \d+ edges$/);
   assert.match(await page.locator(".index-badge").getAttribute("title") ?? "", /resolved call edges/);
   await page.locator(".skill-tree").waitFor();
   assert.equal(await page.locator(".skill-node.recommended").count(), 1);

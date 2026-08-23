@@ -8,7 +8,8 @@ import { promisify } from "node:util";
 import { generateStarterCourse, normalizeAgentCourse } from "../electron/course.mjs";
 import { loadCourse, saveCourse } from "../electron/course-store.mjs";
 import { createPracticeSession, inspectPracticeSession, removePracticeSession } from "../electron/practice.mjs";
-import { analyzeFile, fileImportance, inspectRepository, languageFor, readRepositoryFile } from "../electron/repository.mjs";
+import { analysisCacheStats, analyzeFile, fileImportance, inspectRepository, languageFor, readRepositoryFile, resetAnalysisCache } from "../electron/repository.mjs";
+import { buildKnowledgeGraph, loadKnowledgeGraph, neighborhood, saveKnowledgeGraph } from "../electron/knowledge-graph.mjs";
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
 import { detectLanguageServers, resolveImportsStatically, resolveSymbol, serverForLanguage, shutdownLanguageServers } from "../electron/language-server.mjs";
 import { answerFromLocalIndex, buildContextPack } from "../electron/context-engine.mjs";
@@ -358,4 +359,80 @@ test("language server client resolves definitions and types when a server is ins
   assert.ok(Array.isArray(resolved.implementations));
   assert.equal(typeof resolved.dynamicDispatch, "boolean");
   assert.match(resolved.type ?? "", /helper/);
+});
+
+test("the knowledge graph is versioned and rebuilds incrementally", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-graph-"));
+  const rootPath = path.join(workspace, "repo");
+  const graphDirectory = path.join(workspace, "graphs");
+  await mkdir(rootPath, { recursive: true });
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "app"), { recursive: true });
+  await writeFile(path.join(rootPath, "app", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "app", "core.py"), "def helper(value):\n    return value\n");
+  await writeFile(path.join(rootPath, "app", "runner.py"), "from app.core import helper\n\n\ndef run(value):\n    return helper(value)\n");
+  await writeFile(path.join(rootPath, "app", "stable.py"), "def untouched():\n    return 7\n");
+  await execFileAsync("git", ["init", rootPath]);
+  await execFileAsync("git", ["-C", rootPath, "config", "user.email", "trace@example.com"]);
+  await execFileAsync("git", ["-C", rootPath, "config", "user.name", "Trace Test"]);
+  await execFileAsync("git", ["-C", rootPath, "add", "."]);
+  await execFileAsync("git", ["-C", rootPath, "commit", "-m", "initial"]);
+
+  resetAnalysisCache();
+  const first = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const firstGraph = buildKnowledgeGraph(first);
+  assert.equal(firstGraph.format, "kg-v1");
+  assert.equal(firstGraph.version, first.versionId);
+  assert.equal(firstGraph.previousVersion, null);
+  assert.equal(firstGraph.stats.reusedPartitions, 0);
+  assert.equal(firstGraph.stats.rebuiltPartitions, first.files.length);
+  assert.ok(firstGraph.nodes.some((node) => node.id === "file:app/runner.py"));
+  assert.ok(firstGraph.nodes.some((node) => node.kind === "symbol" && node.label === "helper"));
+  assert.ok(firstGraph.edges.some((edge) => edge.kind === "imports" && edge.from === "file:app/runner.py" && edge.to === "file:app/core.py" && edge.resolved));
+  assert.ok(firstGraph.edges.some((edge) => edge.kind === "calls" && edge.callee === "helper" && edge.resolved));
+  assert.equal(firstGraph.stats.danglingEdges, 0);
+
+  await saveKnowledgeGraph(graphDirectory, firstGraph);
+  const reloaded = await loadKnowledgeGraph(graphDirectory, first.id);
+  assert.equal(reloaded.version, firstGraph.version);
+  assert.equal(await loadKnowledgeGraph(graphDirectory, "some-other-repository"), null);
+
+  // Rebuilding with no source change reuses every partition and re-parses nothing.
+  const hitsBefore = analysisCacheStats().hits;
+  const unchanged = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  assert.ok(analysisCacheStats().hits > hitsBefore, "expected the per-blob analysis cache to serve unchanged files");
+  const unchangedGraph = buildKnowledgeGraph(unchanged, { previous: reloaded });
+  assert.equal(unchangedGraph.version, firstGraph.version);
+  assert.equal(unchangedGraph.stats.rebuiltPartitions, 0);
+  assert.equal(unchangedGraph.stats.reusedPartitions, unchanged.files.length);
+
+  // Changing one file invalidates that file and its dependents only.
+  await writeFile(path.join(rootPath, "app", "core.py"), "def helper(value):\n    return value + 1\n\n\ndef extra():\n    return 2\n");
+  const changed = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  assert.notEqual(changed.versionId, first.versionId);
+  const changedGraph = buildKnowledgeGraph(changed, { previous: unchangedGraph });
+  assert.equal(changedGraph.previousVersion, firstGraph.version);
+  assert.equal(changedGraph.version, changed.versionId);
+  assert.ok(changedGraph.stats.rebuiltPartitions >= 2, JSON.stringify(changedGraph.stats));
+  assert.ok(changedGraph.stats.rebuiltPartitions < changed.files.length, "unrelated files must be reused");
+  assert.equal(changedGraph.stats.invalidatedByDependency >= 1, true);
+  assert.equal(changedGraph.partitions.find((partition) => partition.path === "app/stable.py").digest,
+    firstGraph.partitions.find((partition) => partition.path === "app/stable.py").digest);
+  assert.notEqual(changedGraph.partitions.find((partition) => partition.path === "app/core.py").digest,
+    firstGraph.partitions.find((partition) => partition.path === "app/core.py").digest);
+  assert.ok(changedGraph.nodes.some((node) => node.kind === "symbol" && node.label === "extra"));
+
+  // Deleting a file removes its partition and leaves no stale resolved edge behind.
+  await rm(path.join(rootPath, "app", "stable.py"));
+  const afterDelete = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const deletedGraph = buildKnowledgeGraph(afterDelete, { previous: changedGraph });
+  assert.equal(deletedGraph.stats.removedPartitions, 1);
+  assert.equal(deletedGraph.nodes.some((node) => node.id === "file:app/stable.py"), false);
+  assert.equal(deletedGraph.edges.some((edge) => edge.to === "file:app/stable.py"), false);
+
+  const around = neighborhood(changedGraph, "file:app/runner.py", 1);
+  assert.ok(around.nodes.some((node) => node.id === "file:app/core.py"));
+  assert.ok(around.edges.every((edge) => edge.from === "file:app/runner.py" || edge.to === "file:app/runner.py"));
+  const callsOnly = neighborhood(changedGraph, "file:app/runner.py", 1, ["imports"]);
+  assert.ok(callsOnly.edges.every((edge) => edge.kind === "imports"));
 });

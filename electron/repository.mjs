@@ -146,6 +146,26 @@ async function gitValue(rootPath, args, fallback = "") {
   }
 }
 
+/** Untrimmed git output: porcelain status lines start with a significant space. */
+async function gitOutput(rootPath, args, fallback = "") {
+  try {
+    return (await run("git", ["-C", rootPath, ...args])).stdout;
+  } catch {
+    return fallback;
+  }
+}
+
+/** Parse `git status --porcelain` into the set of paths whose working tree differs from HEAD. */
+export function changedPathsFromStatus(statusText) {
+  return new Set(
+    statusText
+      .split(/\r?\n/)
+      .filter((line) => line.length > 3)
+      .map((line) => line.slice(3).replace(/^.* -> /, "").replace(/^"(.*)"$/, "$1").trim())
+      .filter(Boolean),
+  );
+}
+
 async function walkDirectory(rootPath, currentPath = rootPath, output = []) {
   if (output.length >= 4_000) return output;
   const entries = await readdir(currentPath, { withFileTypes: true });
@@ -255,6 +275,21 @@ function symbolPatterns(language) {
   return [];
 }
 
+// Per-blob analysis cache: re-indexing a repository only re-parses files whose
+// content hash changed, which is what makes knowledge-graph rebuilds incremental.
+const ANALYSIS_CACHE_LIMIT = 8_000;
+const analysisCache = new Map();
+let analysisCacheHits = 0;
+
+export function analysisCacheStats() {
+  return { entries: analysisCache.size, hits: analysisCacheHits, limit: ANALYSIS_CACHE_LIMIT };
+}
+
+export function resetAnalysisCache() {
+  analysisCache.clear();
+  analysisCacheHits = 0;
+}
+
 function regexSymbols(file, source) {
   const patterns = symbolPatterns(file.language);
   if (!patterns.length) return [];
@@ -281,16 +316,22 @@ export async function analyzeFile(rootPath, file) {
   if (file.size > 600_000) return empty;
   const canParse = treeSitterSupports(file.language, file.path);
   if (!canParse && !symbolPatterns(file.language).length) return empty;
+  const cacheKey = file.blobId ? `${file.path}:${file.blobId}` : null;
+  if (cacheKey && analysisCache.has(cacheKey)) {
+    analysisCacheHits += 1;
+    return analysisCache.get(cacheKey);
+  }
   let source;
   try {
     source = await readFile(path.join(rootPath, file.path), "utf8");
   } catch {
     return empty;
   }
+  let result = null;
   if (canParse) {
     const analysis = await analyzeSource(file.path, file.language, source);
     if (analysis?.definitions.length || analysis?.imports.length) {
-      return {
+      result = {
         symbols: analysis.definitions.slice(0, 80),
         references: analysis.references,
         callEdges: analysis.callEdges,
@@ -299,8 +340,15 @@ export async function analyzeFile(rootPath, file) {
       };
     }
   }
-  const symbols = regexSymbols(file, source);
-  return { symbols, references: [], callEdges: [], imports: [], indexer: symbols.length ? "regex" : "none" };
+  if (!result) {
+    const symbols = regexSymbols(file, source);
+    result = { symbols, references: [], callEdges: [], imports: [], indexer: symbols.length ? "regex" : "none" };
+  }
+  if (cacheKey) {
+    analysisCache.set(cacheKey, result);
+    if (analysisCache.size > ANALYSIS_CACHE_LIMIT) analysisCache.delete(analysisCache.keys().next().value);
+  }
+  return result;
 }
 
 async function extractSymbols(rootPath, file) {
@@ -334,6 +382,27 @@ export async function inspectRepository(input, repositoriesDirectory) {
       }),
     )
   ).filter(Boolean);
+
+  const head = await gitValue(location.rootPath, ["rev-parse", "HEAD"], "unversioned");
+  const branch = await gitValue(location.rootPath, ["branch", "--show-current"], "local");
+  const statusText = await gitOutput(location.rootPath, ["status", "--porcelain"], "");
+  const diffSummary = await gitValue(location.rootPath, ["diff", "--numstat"], "");
+  const changedPaths = changedPathsFromStatus(statusText);
+  // Refresh content hashes for working-tree changes before analysis so the
+  // per-blob analysis cache never serves a stale parse for a modified file.
+  await Promise.all(
+    fileRecords
+      .filter((file) => changedPaths.has(file.path))
+      .map(async (file) => {
+        try {
+          file.blobId = createHash("sha256")
+            .update(await readFile(path.join(location.rootPath, file.path)))
+            .digest("hex");
+        } catch {
+          file.blobId = `missing-${file.size}`;
+        }
+      }),
+  );
 
   const packageRoots = new Set(
     fileRecords
@@ -381,29 +450,6 @@ export async function inspectRepository(input, repositoriesDirectory) {
   const languages = {};
   for (const file of fileRecords) languages[file.language] = (languages[file.language] ?? 0) + 1;
 
-  const head = await gitValue(location.rootPath, ["rev-parse", "HEAD"], "unversioned");
-  const branch = await gitValue(location.rootPath, ["branch", "--show-current"], "local");
-  const statusText = await gitValue(location.rootPath, ["status", "--porcelain"], "");
-  const diffSummary = await gitValue(location.rootPath, ["diff", "--numstat"], "");
-  const changedPaths = new Set(
-    statusText
-      .split(/\r?\n/)
-      .filter(Boolean)
-      .map((line) => line.slice(3).replace(/^.* -> /, "")),
-  );
-  await Promise.all(
-    fileRecords
-      .filter((file) => changedPaths.has(file.path))
-      .map(async (file) => {
-        try {
-          file.blobId = createHash("sha256")
-            .update(await readFile(path.join(location.rootPath, file.path)))
-            .digest("hex");
-        } catch {
-          file.blobId = `missing-${file.size}`;
-        }
-      }),
-  );
   const changedFingerprint = [...changedPaths]
     .sort()
     .map((changedPath) => `${changedPath}:${fileRecords.find((file) => file.path === changedPath)?.blobId ?? "deleted"}`)
