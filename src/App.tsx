@@ -1,5 +1,5 @@
-import Editor, { type OnMount } from "@monaco-editor/react";
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import type { OnMount } from "@monaco-editor/react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { browserBridge, demoCourse, demoLearnerState, demoRepository, demoSkillGraph } from "./demo";
 import { addEvidence, completeDiagnostic, personalizeSkillGraph, skillForLesson } from "./learning";
 import type { AgentState, ContextMode, ContextPack, ContextScope, Course, KnowledgeGraphSummary, LearnerProfile, LearnerState, LearningMemory, Lesson, LessonContentBlock, PracticeReport, PracticeSession, Repository, RepoFile, SkillGraph, SkillNode, SymbolResolution } from "./types";
@@ -16,6 +16,9 @@ const missingDesktopBridge = new Proxy({}, {
   },
 }) as unknown as typeof browserBridge;
 const bridge = window.trace ?? (navigator.userAgent.includes("Electron") ? missingDesktopBridge : browserBridge);
+
+// The React binding ships with the editor, not with the application entry.
+const LazyEditor = lazy(async () => ({ default: (await import("@monaco-editor/react")).default }));
 
 function Icon({ name, size = 16 }: { name: string; size?: number }) {
   const paths: Record<string, ReactNode> = {
@@ -370,11 +373,19 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
   const [notes, setNotes] = useState(() => localStorage.getItem(`trace:notes:${repository.id}:${lesson.id}`) ?? "");
   const [monacoReady, setMonacoReady] = useState(false);
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
+  // Item 19: the 2.6 MB editor core is only fetched once the learner opens Code,
+  // and each grammar is fetched separately for the file actually being read.
   useEffect(() => {
+    if (workspaceMode !== "code") return;
     let active = true;
-    void import("./monaco").then(() => { if (active) setMonacoReady(true); });
+    void import("./monaco")
+      .then(async (module) => {
+        await module.ensureMonaco();
+        await module.ensureLanguage(editorLanguage(currentFile?.language));
+      })
+      .then(() => { if (active) setMonacoReady(true); });
     return () => { active = false; };
-  }, []);
+  }, [currentFile?.language, workspaceMode]);
   useEffect(() => {
     setNotes(localStorage.getItem(`trace:notes:${repository.id}:${lesson.id}`) ?? "");
     onSelection(null);
@@ -439,7 +450,7 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
         {workspaceMode === "diagram" && <LessonCanvas lesson={lesson} diagramOnly onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }} />}
         {workspaceMode === "notes" && <div className="lesson-notes"><span>PRIVATE LEARNING NOTES</span><h3>{lesson.title}</h3><textarea value={notes} onChange={(event) => { setNotes(event.target.value); localStorage.setItem(`trace:notes:${repository.id}:${lesson.id}`, event.target.value); }} placeholder="Capture an insight, question, or source reference…" /><small>Stored locally for this repository and lesson.</small></div>}
         <div className={`editor-wrap ${workspaceMode === "code" ? "" : "hidden"}`}>
-          {monacoReady ? <Editor
+          {monacoReady ? <Suspense fallback={<div className="editor-loading">Loading local editor…</div>}><LazyEditor
             path={currentFile?.path ?? "empty.txt"}
             language={editorLanguage(currentFile?.language)}
             value={content}
@@ -461,7 +472,7 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
               glyphMargin: false,
               lineNumbersMinChars: 3,
             }}
-          /> : <div className="editor-loading">Loading local editor…</div>}
+          /></Suspense> : <div className="editor-loading">Loading local editor…</div>}
         </div>
       </section>
     </main>

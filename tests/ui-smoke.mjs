@@ -33,8 +33,12 @@ const browser = await chromium.launch({ headless: true });
 const context = await browser.newContext({ viewport: { width: 1580, height: 980 }, deviceScaleFactor: 1 });
 const page = await context.newPage();
 const errors = [];
+const requestedScripts = [];
 page.on("pageerror", (error) => errors.push(error.message));
 page.on("console", (message) => { if (message.type() === "error") errors.push(message.text()); });
+page.on("request", (request) => { if (["script", "fetch", "xhr", "other"].includes(request.resourceType())) requestedScripts.push(request.url()); });
+const monacoRequests = () => requestedScripts.filter((url) => /editor\.api|editor\.main|monaco-editor/.test(url));
+const languageRequests = () => requestedScripts.filter((url) => /languages\/definitions|\/(python|typescript|cpp|rust|go)-/.test(url));
 
 try {
   await page.goto(targetUrl, { waitUntil: "networkidle" });
@@ -62,8 +66,16 @@ try {
   await page.locator(".skill-tree").waitFor();
   assert.equal(await page.locator(".skill-node.recommended").count(), 1);
   await page.getByText("YOUR NEXT MOVE").waitFor();
+  // Item 19: the editor core must not be fetched while the learner is still reading the lesson.
+  await page.waitForTimeout(400);
+  assert.deepEqual(monacoRequests(), [], `Monaco was fetched before the Code view: ${monacoRequests().join(", ")}`);
   await page.getByRole("button", { name: "Continue to source" }).click();
   await page.locator(".monaco-editor").waitFor({ timeout: 20_000 });
+  assert.ok(monacoRequests().length > 0, "Monaco was never fetched after opening the Code view");
+  // Only the grammar for the file being read is fetched.
+  const grammars = languageRequests();
+  assert.ok(grammars.some((url) => /python/.test(url)), `expected the python grammar, got ${grammars.join(", ")}`);
+  assert.equal(grammars.some((url) => /\/(ruby|php|sql|swift)-/.test(url)), false, `unused grammars were fetched: ${grammars.join(", ")}`);
   await page.getByRole("button", { name: "I found the flow" }).click();
   await page.getByRole("button", { name: "Open Quick Ask" }).waitFor();
   await page.screenshot({ path: path.join(artifactDirectory, "skill-tree.png") });

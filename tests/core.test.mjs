@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -435,4 +435,47 @@ test("the knowledge graph is versioned and rebuilds incrementally", async (conte
   assert.ok(around.edges.every((edge) => edge.from === "file:app/runner.py" || edge.to === "file:app/runner.py"));
   const callsOnly = neighborhood(changedGraph, "file:app/runner.py", 1, ["imports"]);
   assert.ok(callsOnly.edges.every((edge) => edge.kind === "imports"));
+});
+
+test("the production entry bundle excludes Monaco and stays inside its budget", async (context) => {
+  const distDirectory = path.resolve("dist");
+  let entryHtml;
+  try {
+    entryHtml = await readFile(path.join(distDirectory, "index.html"), "utf8");
+  } catch {
+    context.skip("Run `npm run build` before this test to check the bundle budget.");
+    return;
+  }
+  const assetDirectory = path.join(distDirectory, "assets");
+  const assets = await readdir(assetDirectory);
+
+  // Everything the browser downloads before any interaction.
+  const eagerScripts = [...entryHtml.matchAll(/<script[^>]+src="\.\/assets\/([^"]+)"/g)].map((match) => match[1]);
+  const modulePreloads = [...entryHtml.matchAll(/rel="modulepreload"[^>]+href="\.\/assets\/([^"]+)"/g)].map((match) => match[1]);
+  const eager = [...new Set([...eagerScripts, ...modulePreloads])];
+  assert.equal(eagerScripts.length, 1, `expected a single entry script, got ${eagerScripts.join(", ")}`);
+
+  let eagerBytes = 0;
+  for (const asset of eager) {
+    const source = await readFile(path.join(assetDirectory, asset), "utf8");
+    eagerBytes += Buffer.byteLength(source);
+    assert.equal(/monaco-editor\/esm\/vs\/editor\/editor\.main/.test(source), false, `${asset} statically bundles the Monaco editor core`);
+    assert.equal(/createMonacoBaseAPI|StandaloneEditor/.test(source), false, `${asset} statically bundles Monaco internals`);
+  }
+  assert.ok(eagerBytes < 320_000, `eager bundle grew to ${eagerBytes} bytes across ${eager.join(", ")}`);
+
+  // Monaco still ships, but only as separately fetchable chunks.
+  const monacoCore = assets.filter((asset) => /^editor\.api-.*\.js$/.test(asset));
+  assert.equal(monacoCore.length, 1, `expected one lazy Monaco core chunk, got ${monacoCore.join(", ")}`);
+  assert.equal(eager.includes(monacoCore[0]), false, "the Monaco core must not be preloaded by the entry");
+  const monacoBytes = Buffer.byteLength(await readFile(path.join(assetDirectory, monacoCore[0]), "utf8"));
+  assert.ok(monacoBytes > 1_000_000, "sanity check: the lazy chunk really is the Monaco core");
+
+  // Language grammars are individually fetchable rather than bundled together.
+  for (const language of ["python", "typescript", "cpp", "rust", "go"]) {
+    assert.ok(assets.some((asset) => asset.startsWith(`${language}-`) && asset.endsWith(".js")), `missing lazy chunk for ${language}`);
+  }
+  const workerChunk = assets.find((asset) => asset.startsWith("editor.worker-"));
+  assert.ok(workerChunk, "the editor worker must be emitted as its own chunk");
+  assert.equal(eager.includes(workerChunk), false, "the editor worker must not be preloaded by the entry");
 });
