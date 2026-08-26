@@ -85,6 +85,7 @@ export interface Repository {
     limits?: IndexLimits;
     truncated?: IndexTruncation[];
     complete?: boolean;
+    submodules?: { declared: number; urls: string[]; checkedOut: boolean; note: string };
   };
   indexedAt: string;
 }

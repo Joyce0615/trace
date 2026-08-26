@@ -48,6 +48,15 @@ function Logo() {
 
 const fontBoosts: Record<FontScale, number> = { compact: 0, comfortable: 2, large: 4 };
 
+/** Electron wraps main-process errors; show the learner only the actionable message. */
+function readableError(cause: unknown) {
+  const raw = cause instanceof Error ? cause.message : String(cause);
+  return raw
+    .replace(/^Error invoking remote method '[^']*':\s*/, "")
+    .replace(/^[A-Za-z]*Error:\s*/, "")
+    .trim();
+}
+
 const indexPhaseLabels: Record<IndexProgress["phase"], string> = {
   prepare: "Locating repository",
   discover: "Discovering files",
@@ -787,7 +796,7 @@ export default function App() {
       const workspace = await bridge.openRepository({ source: resolved, profile: profile ?? course?.profile, requestId });
       await activateWorkspace(workspace.repository, workspace.course, workspace.skillGraph, workspace.learnerState, workspace.knowledgeGraph ?? null);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      setError(readableError(cause));
     } finally {
       indexRequestRef.current = null;
       setBusy(false);

@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
-import { access, lstat, mkdir, readdir, readFile, realpath, stat } from "node:fs/promises";
+import { access, lstat, mkdir, readdir, readFile, realpath, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { analyzeSource, treeSitterSupports } from "./tree-sitter-index.mjs";
 import { resolveImportsStatically } from "./language-server.mjs";
+import { cloneArguments, cloneDestination, cloneEnvironment, looksRemote, parseRemoteSource, summarizeSubmodules, verifyExistingClone } from "./clone-guard.mjs";
 
 const SKIP_DIRECTORIES = new Set([
   ".git",
@@ -127,12 +128,12 @@ function progressReporter(onProgress) {
 }
 
 function run(command, args, options = {}) {
-  const { cwd, timeoutMs = 30_000, signal = null } = options;
+  const { cwd, timeoutMs = 30_000, signal = null, env = process.env } = options;
   return new Promise((resolve, reject) => {
     if (signal?.aborted) { reject(new IndexCancelledError("run")); return; }
     const child = spawn(command, args, {
       cwd,
-      env: process.env,
+      env,
       stdio: ["ignore", "pipe", "pipe"],
     });
     const onAbort = () => { child.kill("SIGTERM"); reject(new IndexCancelledError("run")); };
@@ -163,38 +164,56 @@ function run(command, args, options = {}) {
   });
 }
 
-function isRemoteRepository(value) {
-  return /^(https?:\/\/|ssh:\/\/|git@)/i.test(value.trim());
-}
-
-function repositoryName(value) {
-  const cleaned = value.replace(/[?#].*$/, "").replace(/\/$/, "");
-  return path.basename(cleaned).replace(/\.git$/i, "") || "repository";
-}
-
 async function ensureLocalRepository(input, repositoriesDirectory, options = {}) {
-  const value = input.trim();
+  const value = String(input ?? "").trim();
   throwIfCancelled(options.signal, "prepare");
   if (!value) throw new Error("Choose a repository first.");
 
-  if (!isRemoteRepository(value)) {
+  if (!looksRemote(value)) {
     const resolved = await realpath(path.resolve(value));
     const details = await stat(resolved);
     if (!details.isDirectory()) throw new Error("The selected path is not a directory.");
-    return { rootPath: resolved, source: "local", remoteUrl: null };
+    return { rootPath: resolved, source: "local", remoteUrl: null, submodules: summarizeSubmodules(await readOptionalFile(path.join(resolved, ".gitmodules"))) };
   }
 
+  // Every remote is validated before it reaches git: protocol allowlist, no
+  // embedded credentials, no transport helpers, no archives, no option injection.
+  const remote = parseRemoteSource(value);
   await mkdir(repositoriesDirectory, { recursive: true });
-  const fingerprint = createHash("sha256").update(value).digest("hex").slice(0, 9);
-  const destination = path.join(repositoriesDirectory, `${repositoryName(value)}-${fingerprint}`);
+  const destination = cloneDestination(repositoriesDirectory, remote);
 
+  let reuse = { reusable: false, reason: "absent" };
   try {
     await access(path.join(destination, ".git"));
+    const origin = await gitValue(destination, ["config", "--get", "remote.origin.url"], "");
+    reuse = verifyExistingClone(remote, origin);
+    if (!reuse.reusable) {
+      // A cached directory must never be silently repointed at a different remote.
+      await rm(destination, { recursive: true, force: true });
+    }
   } catch {
-    await run("git", ["clone", "--depth=1", "--", value, destination], { timeoutMs: 120_000, signal: options.signal });
+    reuse = { reusable: false, reason: "absent" };
   }
 
-  return { rootPath: await realpath(destination), source: "remote", remoteUrl: value };
+  if (!reuse.reusable) {
+    await run("git", cloneArguments(remote, destination), {
+      timeoutMs: options.cloneTimeoutMs ?? 180_000,
+      signal: options.signal,
+      env: cloneEnvironment(),
+    });
+  }
+
+  const rootPath = await realpath(destination);
+  const submodules = summarizeSubmodules(await readOptionalFile(path.join(rootPath, ".gitmodules")));
+  return { rootPath, source: "remote", remoteUrl: remote.normalized, remote, submodules, reusedClone: reuse.reusable };
+}
+
+async function readOptionalFile(filePath) {
+  try {
+    return await readFile(filePath, "utf8");
+  } catch {
+    return "";
+  }
 }
 
 async function gitValue(rootPath, args, fallback = "") {
@@ -618,6 +637,7 @@ export async function inspectRepository(input, repositoriesDirectory, options = 
       limits,
       truncated,
       complete: truncated.length === 0,
+      submodules: location.submodules ?? { declared: 0, urls: [], checkedOut: false, note: "This repository declares no submodules." },
     },
     indexedAt: new Date().toISOString(),
   };

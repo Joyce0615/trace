@@ -40,6 +40,22 @@ try {
   assert.equal(limits.maxFiles, 4_000);
   await page.evaluate(() => { window.__indexProgress = []; });
 
+  // Item 21: unsafe remotes are rejected in the trusted main process, before git runs.
+  const unsafeRemotes = [
+    ["http://github.com/a/b.git", /^Plain http is not allowed/],
+    ["git://github.com/a/b.git", /^Only https and ssh remotes are supported, not git\.$/],
+    ["ext::sh -c 'touch /tmp/trace-pwned'", /^Git transport helpers such as `ext::` are not allowed\.$/],
+    ["https://user:token@github.com/a/b.git", /^Remove the credentials from the URL\./],
+    ["https://github.com/a/b.tar.gz", /^Trace clones Git repositories and never unpacks downloaded archives\.$/],
+  ];
+  for (const [candidate, pattern] of unsafeRemotes) {
+    await page.getByLabel("Repository path or URL").fill(candidate);
+    await page.getByRole("button", { name: "Start learning" }).click();
+    await page.locator(".error-banner").waitFor({ timeout: 30_000 });
+    const message = await page.locator(".error-banner").innerText();
+    assert.match(message, pattern, `${candidate} produced: ${message}`);
+  }
+
   await page.getByLabel("Repository path or URL").fill(repositoryPath);
   await page.getByRole("button", { name: "Start learning" }).click();
   await page.locator(".index-progress").waitFor({ timeout: 30_000 });

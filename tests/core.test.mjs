@@ -10,6 +10,7 @@ import { loadCourse, saveCourse } from "../electron/course-store.mjs";
 import { createPracticeSession, inspectPracticeSession, removePracticeSession } from "../electron/practice.mjs";
 import { DEFAULT_INDEX_LIMITS, IndexCancelledError, analysisCacheStats, analyzeFile, fileImportance, inspectRepository, languageFor, readRepositoryFile, resetAnalysisCache } from "../electron/repository.mjs";
 import { buildKnowledgeGraph, loadKnowledgeGraph, neighborhood, saveKnowledgeGraph } from "../electron/knowledge-graph.mjs";
+import { RemoteSourceError, cloneArguments, cloneDestination, cloneEnvironment, looksRemote, parseRemoteSource, summarizeSubmodules, verifyExistingClone } from "../electron/clone-guard.mjs";
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
 import { detectLanguageServers, resolveImportsStatically, resolveSymbol, serverForLanguage, shutdownLanguageServers } from "../electron/language-server.mjs";
 import { answerFromLocalIndex, buildContextPack } from "../electron/context-engine.mjs";
@@ -573,4 +574,137 @@ test("indexing enforces size limits, streams progress, and can be cancelled", as
     () => inspectRepository(rootPath, path.join(workspace, "clones"), { signal: preAborted.signal }),
     (error) => error.cancelled === true && error.phase === "prepare",
   );
+});
+
+test("remote clone intake rejects unsafe URLs, credentials, helpers, and archives", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-clone-guard-"));
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+
+  // Accepted forms.
+  const https = parseRemoteSource("https://github.com/GeeeekExplorer/nano-vllm.git");
+  assert.equal(https.protocol, "https:");
+  assert.equal(https.host, "github.com");
+  assert.equal(https.normalized, "https://github.com/GeeeekExplorer/nano-vllm.git");
+  const ssh = parseRemoteSource("git@github.com:GeeeekExplorer/nano-vllm.git");
+  assert.equal(ssh.form, "scp");
+  assert.equal(ssh.protocol, "ssh:");
+  assert.equal(ssh.username, "git");
+  const sshUrl = parseRemoteSource("ssh://git@example.com:2222/team/repo.git");
+  assert.equal(sshUrl.port, "2222");
+  assert.equal(sshUrl.username, "git");
+  assert.equal(sshUrl.normalized, "ssh://git@example.com:2222/team/repo.git");
+  // A username over https is a smuggled token, not a legitimate ssh identity.
+  assert.throws(() => parseRemoteSource("https://ghp_secret@github.com/a/b.git"), (error) => error.reason === "embedded-credentials");
+  assert.equal(looksRemote("/Users/user/GitHub/flashinfer"), false);
+  assert.equal(looksRemote("git@github.com:a/b.git"), true);
+
+  const rejected = [
+    ["http://github.com/a/b.git", "insecure-protocol"],
+    ["git://github.com/a/b.git", "protocol"],
+    ["file:///etc/passwd", "protocol"],
+    ["ftp://example.com/a.git", "protocol"],
+    ["ext::sh -c 'curl evil.example'", "transport-helper"],
+    ["git::https://example.com/a.git", "transport-helper"],
+    ["https://user:token@github.com/a/b.git", "embedded-credentials"],
+    ["https://oauth2:ghp_secret@gitlab.com/a/b.git", "embedded-credentials"],
+    ["--upload-pack=touch /tmp/pwned", "option-injection"],
+    ["https://github.com/a/b.git\nrm -rf /", "control-characters"],
+    ["https://github.com/../../etc/passwd", "traversal"],
+    ["https://github.com/a/b.zip", "archive"],
+    ["https://github.com/a/b.tar.gz", "archive"],
+    ["https://github.com/a/b.bundle", "archive"],
+    ["https://github.com/a/b.git?x=1", "url-extras"],
+    ["https://github.com/a/b.git#frag", "url-extras"],
+    [`https://github.com/${"a".repeat(600)}`, "too-long"],
+    ["not a url at all", "unparsable"],
+    ["", "empty"],
+  ];
+  for (const [candidate, reason] of rejected) {
+    assert.throws(
+      () => parseRemoteSource(candidate),
+      (error) => {
+        assert.equal(error instanceof RemoteSourceError, true, `${candidate} threw ${error}`);
+        assert.equal(error.reason, reason, `${candidate} -> ${error.reason}`);
+        return true;
+      },
+      `expected ${candidate} to be rejected as ${reason}`,
+    );
+  }
+
+  // Destinations always stay inside the managed clone root and are name-sanitized.
+  const destination = cloneDestination(workspace, https);
+  assert.equal(path.dirname(destination), workspace);
+  assert.match(path.basename(destination), /^nano-vllm-[0-9a-f]{9}$/);
+  assert.notEqual(cloneDestination(workspace, https), cloneDestination(workspace, parseRemoteSource("https://gitlab.com/GeeeekExplorer/nano-vllm.git")));
+  // Even a hostile pathname is contained by basename sanitisation plus the escape guard.
+  const hostile = cloneDestination(workspace, { normalized: "hostile", pathname: "/../../etc/passwd" });
+  assert.equal(path.dirname(hostile), workspace);
+  assert.equal(path.basename(hostile).startsWith("passwd-"), true);
+  const slashOnly = cloneDestination(workspace, { normalized: "slash", pathname: "/" });
+  assert.equal(path.dirname(slashOnly), workspace);
+  assert.equal(path.basename(slashOnly).startsWith("repository-"), true);
+
+  // Clone arguments disable submodules, tags, credential helpers, and transport helpers.
+  const args = cloneArguments(https, destination);
+  assert.ok(args.includes("--no-recurse-submodules"));
+  assert.ok(args.includes("--no-tags"));
+  assert.ok(args.includes("--single-branch"));
+  assert.ok(args.includes("--depth=1"));
+  assert.ok(args.includes("credential.helper="));
+  assert.ok(args.includes("protocol.ext.allow=never"));
+  assert.ok(args.includes("protocol.file.allow=never"));
+  assert.ok(args.includes("core.symlinks=false"));
+  // The URL is always after `--` so it can never be read as an option.
+  assert.equal(args[args.indexOf("--") + 1], https.normalized);
+  assert.equal(args.at(-1), destination);
+
+  const environment = cloneEnvironment({ GIT_ASKPASS: "/tmp/evil", SSH_ASKPASS: "/tmp/evil", GIT_SSH_COMMAND: "sh -c evil", PATH: "/usr/bin" });
+  assert.equal(environment.GIT_TERMINAL_PROMPT, "0");
+  assert.equal(environment.GIT_CONFIG_NOSYSTEM, "1");
+  assert.equal(environment.GIT_ALLOW_PROTOCOL, "https:ssh");
+  assert.equal(environment.GIT_ASKPASS, undefined);
+  assert.equal(environment.SSH_ASKPASS, undefined);
+  assert.equal(environment.GIT_SSH_COMMAND, undefined);
+  assert.equal(environment.PATH, "/usr/bin");
+
+  // A cached clone is only reused when its origin still matches.
+  assert.deepEqual(verifyExistingClone(https, "https://github.com/GeeeekExplorer/nano-vllm.git"), { reusable: true, reason: null });
+  assert.equal(verifyExistingClone(https, "https://evil.example/GeeeekExplorer/nano-vllm.git").reason, "origin-mismatch");
+  assert.equal(verifyExistingClone(https, "").reason, "missing-origin");
+  assert.equal(verifyExistingClone(https, "ext::sh -c evil").reason, "unverifiable-origin");
+
+  // Submodules are reported but never checked out.
+  const submodules = summarizeSubmodules('[submodule "vendor/dep"]\n\tpath = vendor/dep\n\turl = https://github.com/x/dep.git\n');
+  assert.equal(submodules.declared, 1);
+  assert.equal(submodules.checkedOut, false);
+  assert.deepEqual(submodules.urls, ["https://github.com/x/dep.git"]);
+  assert.equal(summarizeSubmodules("").declared, 0);
+});
+
+test("a hardened clone of a local bare remote never checks out submodules", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-clone-run-"));
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  const origin = path.join(workspace, "origin");
+  await mkdir(origin, { recursive: true });
+  await execFileAsync("git", ["init", origin]);
+  await execFileAsync("git", ["-C", origin, "config", "user.email", "trace@example.com"]);
+  await execFileAsync("git", ["-C", origin, "config", "user.name", "Trace Test"]);
+  await writeFile(path.join(origin, "main.py"), "def go():\n    return 1\n");
+  await writeFile(path.join(origin, ".gitmodules"), '[submodule "vendor/dep"]\n\tpath = vendor/dep\n\turl = https://github.com/x/dep.git\n');
+  await execFileAsync("git", ["-C", origin, "add", "."]);
+  await execFileAsync("git", ["-C", origin, "commit", "-m", "initial"]);
+
+  // `file://` remotes are blocked, which is exactly the protocol allowlist working.
+  await assert.rejects(
+    () => inspectRepository(`file://${origin}`, path.join(workspace, "clones")),
+    (error) => error.reason === "protocol",
+  );
+
+  // The same repository opened as a local path reports its submodules without checkout.
+  const local = await inspectRepository(origin, path.join(workspace, "clones"));
+  assert.equal(local.source, "local");
+  assert.equal(local.stats.submodules.declared, 1);
+  assert.equal(local.stats.submodules.checkedOut, false);
+  assert.match(local.stats.submodules.note, /not checked out/);
+  await assert.rejects(() => access(path.join(local.rootPath, "vendor", "dep")));
 });
