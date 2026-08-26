@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import { generateStarterCourse, normalizeAgentCourse } from "../electron/course.mjs";
 import { loadCourse, saveCourse } from "../electron/course-store.mjs";
 import { createPracticeSession, inspectPracticeSession, removePracticeSession } from "../electron/practice.mjs";
-import { analysisCacheStats, analyzeFile, fileImportance, inspectRepository, languageFor, readRepositoryFile, resetAnalysisCache } from "../electron/repository.mjs";
+import { DEFAULT_INDEX_LIMITS, IndexCancelledError, analysisCacheStats, analyzeFile, fileImportance, inspectRepository, languageFor, readRepositoryFile, resetAnalysisCache } from "../electron/repository.mjs";
 import { buildKnowledgeGraph, loadKnowledgeGraph, neighborhood, saveKnowledgeGraph } from "../electron/knowledge-graph.mjs";
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
 import { detectLanguageServers, resolveImportsStatically, resolveSymbol, serverForLanguage, shutdownLanguageServers } from "../electron/language-server.mjs";
@@ -478,4 +478,99 @@ test("the production entry bundle excludes Monaco and stays inside its budget", 
   const workerChunk = assets.find((asset) => asset.startsWith("editor.worker-"));
   assert.ok(workerChunk, "the editor worker must be emitted as its own chunk");
   assert.equal(eager.includes(workerChunk), false, "the editor worker must not be preloaded by the entry");
+});
+
+test("indexing enforces size limits, streams progress, and can be cancelled", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-limits-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "src"), { recursive: true });
+  for (let index = 0; index < 40; index += 1) {
+    await writeFile(
+      path.join(rootPath, "src", `module_${index}.py`),
+      `def helper_${index}(value):\n    return value\n\n\ndef caller_${index}(value):\n    return helper_${index}(value)\n`,
+    );
+  }
+  await writeFile(path.join(rootPath, "huge.py"), `# padding\n${"x = 1\n".repeat(6_000)}`);
+
+  resetAnalysisCache();
+  const progress = [];
+  const full = await inspectRepository(rootPath, path.join(workspace, "clones"), {
+    onProgress: (event) => progress.push(event),
+  });
+  assert.equal(full.stats.complete, true);
+  assert.deepEqual(full.stats.truncated, []);
+  assert.equal(full.stats.fileCount, 41);
+  assert.ok(full.stats.totalBytes > 0);
+  assert.deepEqual(full.stats.limits, DEFAULT_INDEX_LIMITS);
+
+  // Progress is emitted for every phase, in order, with monotonic ratios per phase.
+  const phases = [...new Set(progress.map((event) => event.phase))];
+  assert.deepEqual(phases, ["prepare", "discover", "read", "git", "analyze", "link", "finalize"]);
+  assert.ok(progress.every((event) => event.ratio >= 0 && event.ratio <= 1));
+  assert.ok(progress.every((event) => typeof event.message === "string" && event.message.length > 0));
+  const analyzeEvents = progress.filter((event) => event.phase === "analyze");
+  assert.equal(analyzeEvents.at(-1).completed, analyzeEvents.at(-1).total);
+
+  // A smaller batch size proves the analysis really streams instead of resolving in one step.
+  const streamed = [];
+  await inspectRepository(rootPath, path.join(workspace, "clones"), {
+    limits: { analysisBatchSize: 8 },
+    onProgress: (event) => { if (event.phase === "analyze") streamed.push(event); },
+  });
+  assert.ok(streamed.length >= 5, `expected streamed analysis batches, got ${streamed.length}`);
+  assert.deepEqual(streamed.map((event) => event.completed), [...streamed.map((event) => event.completed)].sort((a, b) => a - b));
+  assert.equal(streamed.at(-1).completed, streamed.at(-1).total);
+
+  // A progress listener that throws must not fail the index.
+  const resilient = await inspectRepository(rootPath, path.join(workspace, "clones"), {
+    onProgress: () => { throw new Error("listener exploded"); },
+  });
+  assert.equal(resilient.stats.fileCount, 41);
+
+  // Size limits truncate honestly and are reported.
+  const limited = await inspectRepository(rootPath, path.join(workspace, "clones"), {
+    limits: { maxFiles: 10, maxAnalyzedFiles: 4, maxSymbols: 5, maxFileBytes: 1_000, analysisBatchSize: 2 },
+  });
+  assert.equal(limited.stats.complete, false);
+  assert.ok(limited.stats.fileCount <= 10);
+  assert.ok(limited.stats.symbolCount <= 5);
+  assert.equal(limited.stats.limits.maxFiles, 10);
+  const limitNames = limited.stats.truncated.map((item) => item.limit);
+  assert.ok(limitNames.includes("maxFileBytes"), JSON.stringify(limited.stats.truncated));
+  assert.ok(limitNames.includes("maxSymbols"), JSON.stringify(limited.stats.truncated));
+  assert.ok(limited.stats.truncated.every((item) => Number.isFinite(item.value)));
+
+  // A total-byte ceiling stops intake without failing.
+  const byteCapped = await inspectRepository(rootPath, path.join(workspace, "clones"), { limits: { maxTotalBytes: 400 } });
+  assert.equal(byteCapped.stats.complete, false);
+  assert.ok(byteCapped.stats.totalBytes <= 400);
+  assert.ok(byteCapped.stats.truncated.some((item) => item.limit === "maxTotalBytes"));
+
+  // Cancellation stops the run and reports the phase it stopped in.
+  const controller = new AbortController();
+  const seen = [];
+  const cancelled = inspectRepository(rootPath, path.join(workspace, "clones"), {
+    signal: controller.signal,
+    limits: { analysisBatchSize: 1 },
+    onProgress: (event) => {
+      seen.push(event.phase);
+      if (event.phase === "read") controller.abort();
+    },
+  });
+  await assert.rejects(cancelled, (error) => {
+    assert.equal(error instanceof IndexCancelledError, true);
+    assert.equal(error.cancelled, true);
+    assert.ok(["read", "git", "analyze", "link"].includes(error.phase), `unexpected cancel phase ${error.phase}`);
+    return true;
+  });
+  assert.ok(seen.includes("read"));
+
+  // Aborting before the run starts fails immediately at the first phase.
+  const preAborted = new AbortController();
+  preAborted.abort();
+  await assert.rejects(
+    () => inspectRepository(rootPath, path.join(workspace, "clones"), { signal: preAborted.signal }),
+    (error) => error.cancelled === true && error.phase === "prepare",
+  );
 });

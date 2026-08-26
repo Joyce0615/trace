@@ -358,3 +358,13 @@ button { color: inherit; }
   .diagnostic-card { padding: 20px; }.diagnostic-card > h2 { font-size: calc(22px + var(--font-boost)); }.diagnostic-questions { gap: 7px; }.diagnostic-questions fieldset { padding: 9px; }
   .lesson-canvas { padding-top: 18px; }.lesson-canvas > header { margin-bottom: 14px; }.lesson-canvas > header h2 { font-size: calc(20px + var(--font-boost)); }
 }
+
+.index-progress { margin: 14px 0 4px; display: flex; flex-direction: column; gap: 7px; }
+.index-progress-bar { height: 5px; border-radius: 3px; background: #1a2030; overflow: hidden; }
+.index-progress-bar span { display: block; height: 100%; background: linear-gradient(90deg, var(--purple), var(--green)); transition: width .25s ease; }
+.index-progress-meta { display: flex; align-items: center; gap: 10px; }
+.index-progress-meta strong { color: #b3bcc9; font-size: calc(10px + var(--font-boost)); font-weight: 600; }
+.index-progress-meta small { color: #5f6a7b; font-family: "SFMono-Regular", Menlo, monospace; font-size: calc(9px + var(--font-boost)); }
+.index-cancel { margin-left: auto; padding: 4px 11px; border: 1px solid #3a2b30; border-radius: 6px; background: #1a1418; color: #d08b8b; font-size: calc(9px + var(--font-boost)); cursor: pointer; }
+.index-cancel:hover { border-color: #5b3d43; color: #e8a5a5; }
+.index-truncation { margin-top: 8px; padding: 7px 10px; border: 1px solid #3a3222; border-radius: 7px; background: #16130d; color: #c8ad72; font-size: calc(9px + var(--font-boost)); }

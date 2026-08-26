@@ -2,7 +2,7 @@ import type { OnMount } from "@monaco-editor/react";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { browserBridge, demoCourse, demoLearnerState, demoRepository, demoSkillGraph } from "./demo";
 import { addEvidence, completeDiagnostic, personalizeSkillGraph, skillForLesson } from "./learning";
-import type { AgentState, ContextMode, ContextPack, ContextScope, Course, KnowledgeGraphSummary, LearnerProfile, LearnerState, LearningMemory, Lesson, LessonContentBlock, PracticeReport, PracticeSession, Repository, RepoFile, SkillGraph, SkillNode, SymbolResolution } from "./types";
+import type { AgentState, ContextMode, ContextPack, ContextScope, Course, IndexProgress, KnowledgeGraphSummary, LearnerProfile, LearnerState, LearningMemory, Lesson, LessonContentBlock, PracticeReport, PracticeSession, Repository, RepoFile, SkillGraph, SkillNode, SymbolResolution } from "./types";
 
 type TutorMode = "learn" | "ask" | "quiz" | "practice";
 type WorkspaceMode = "lesson" | "diagram" | "code" | "notes";
@@ -48,6 +48,17 @@ function Logo() {
 
 const fontBoosts: Record<FontScale, number> = { compact: 0, comfortable: 2, large: 4 };
 
+const indexPhaseLabels: Record<IndexProgress["phase"], string> = {
+  prepare: "Locating repository",
+  discover: "Discovering files",
+  read: "Reading file metadata",
+  git: "Reading git version",
+  analyze: "Parsing definitions and call edges",
+  link: "Resolving references",
+  finalize: "Finalizing index",
+  cancelled: "Cancelled",
+};
+
 function FontSizeControl({ value, onChange }: { value: FontScale; onChange: (value: FontScale) => void }) {
   return <div className="font-size-control" role="group" aria-label="Text size">
     <button aria-label="Compact text" aria-pressed={value === "compact"} className={value === "compact" ? "active" : ""} onClick={() => onChange("compact")}>A−</button>
@@ -75,7 +86,7 @@ function editorLanguage(language?: string) {
   return language ?? "plaintext";
 }
 
-function StartScreen({ onOpen, onDemo, busy, error, fontScale, onFontScale }: { onOpen: (source?: string, profile?: LearnerProfile) => void; onDemo: (profile: LearnerProfile) => void; busy: boolean; error: string | null; fontScale: FontScale; onFontScale: (value: FontScale) => void }) {
+function StartScreen({ onOpen, onDemo, onCancel, busy, progress, error, fontScale, onFontScale }: { onOpen: (source?: string, profile?: LearnerProfile) => void; onDemo: (profile: LearnerProfile) => void; onCancel: () => void; busy: boolean; progress: IndexProgress | null; error: string | null; fontScale: FontScale; onFontScale: (value: FontScale) => void }) {
   const [source, setSource] = useState("");
   const [profile, setProfile] = useState<LearnerProfile>({ goal: "architecture", level: "adaptive" });
   const submit = (event: FormEvent) => {
@@ -105,6 +116,14 @@ function StartScreen({ onOpen, onDemo, busy, error, fontScale, onFontScale }: { 
           <span />
           <button className="text-button featured-demo" onClick={() => onDemo(profile)} disabled={busy}><Icon name="spark" />Explore nano-vllm <em>FEATURED</em></button>
         </div>
+        {busy && <div className="index-progress" data-phase={progress?.phase ?? "prepare"}>
+          <div className="index-progress-bar"><span style={{ width: `${Math.round((progress?.ratio ?? 0) * 100)}%` }} /></div>
+          <div className="index-progress-meta">
+            <strong>{indexPhaseLabels[progress?.phase ?? "prepare"]}</strong>
+            <small>{progress?.total ? `${progress.completed.toLocaleString()} / ${progress.total.toLocaleString()}` : "starting"}</small>
+            <button type="button" className="index-cancel" onClick={onCancel}>Cancel indexing</button>
+          </div>
+        </div>}
         {error && <div className="error-banner">{error}</div>}
         <div className="feature-row">
           <div><Icon name="layers" /><strong>Adaptive skill trees</strong><small>Learn only what moves you forward</small></div>
@@ -675,6 +694,8 @@ export default function App() {
   const [line, setLine] = useState(1);
   const [selection, setSelection] = useState<CodeSelection | null>(null);
   const [busy, setBusy] = useState(false);
+  const [indexProgress, setIndexProgress] = useState<IndexProgress | null>(null);
+  const indexRequestRef = useRef<string | null>(null);
   const [agentBusy, setAgentBusy] = useState(false);
   const [courseBusy, setCourseBusy] = useState(false);
   const [courseElapsed, setCourseElapsed] = useState(0);
@@ -696,6 +717,9 @@ export default function App() {
   const [resolutionBusy, setResolutionBusy] = useState(false);
 
   useEffect(() => { bridge.detectAgents().then(setAgents).catch(() => undefined); }, []);
+  useEffect(() => bridge.onIndexProgress((progress) => {
+    if (!indexRequestRef.current || progress.requestId === indexRequestRef.current) setIndexProgress(progress);
+  }), []);
   useEffect(() => {
     document.documentElement.style.setProperty("--font-boost", `${fontBoosts[fontScale]}px`);
     localStorage.setItem("trace:text-size", fontScale);
@@ -756,14 +780,23 @@ export default function App() {
       let resolved = source;
       if (!resolved) resolved = (await bridge.chooseRepository()) ?? undefined;
       if (!resolved) return;
+      const requestId = `index-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+      indexRequestRef.current = requestId;
+      setIndexProgress(null);
       setBusy(true);
-      const workspace = await bridge.openRepository({ source: resolved, profile: profile ?? course?.profile });
+      const workspace = await bridge.openRepository({ source: resolved, profile: profile ?? course?.profile, requestId });
       await activateWorkspace(workspace.repository, workspace.course, workspace.skillGraph, workspace.learnerState, workspace.knowledgeGraph ?? null);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
+      indexRequestRef.current = null;
       setBusy(false);
     }
+  };
+
+  const cancelIndexing = () => {
+    const requestId = indexRequestRef.current;
+    if (requestId) void bridge.cancelRepositoryOpen(requestId).catch(() => undefined);
   };
 
   const selectLesson = async (lesson: Lesson) => {
@@ -889,7 +922,7 @@ export default function App() {
   };
 
   if (!repository || !course || !selectedLesson || !skillGraph || !learnerState) {
-    return <StartScreen onOpen={openRepository} onDemo={(profile) => { void bridge.graphSummary({ repository: demoRepository }).then(setKnowledgeGraph).catch(() => setKnowledgeGraph(null)); return activateWorkspace(demoRepository, { ...demoCourse, profile, level: profile.level }, personalizeSkillGraph(demoSkillGraph, profile.goal), { ...structuredClone(demoLearnerState), diagnosticCompleted: false }); }} busy={busy} error={error} fontScale={fontScale} onFontScale={setFontScale} />;
+    return <StartScreen onOpen={openRepository} onDemo={(profile) => { void bridge.graphSummary({ repository: demoRepository }).then(setKnowledgeGraph).catch(() => setKnowledgeGraph(null)); return activateWorkspace(demoRepository, { ...demoCourse, profile, level: profile.level }, personalizeSkillGraph(demoSkillGraph, profile.goal), { ...structuredClone(demoLearnerState), diagnosticCompleted: false }); }} onCancel={cancelIndexing} busy={busy} progress={indexProgress} error={error} fontScale={fontScale} onFontScale={setFontScale} />;
   }
 
   const openFile = (file: RepoFile, targetLine = 1) => loadSource(repository, file, targetLine);
@@ -948,7 +981,7 @@ export default function App() {
       <header className="app-bar">
         <div className="brand"><Logo /><span>TRACE</span></div>
         <button className="repo-switcher" onClick={() => openRepository()}><span className="repo-icon"><Icon name="code" size={15} /></span><strong>{repository.name}</strong><Icon name="chevron" size={13} /></button>
-        <div className="repo-meta"><span><Icon name="branch" size={13} />{repository.branch}</span><span>{commit}</span>{repository.isDirty && <span className="dirty">modified</span>}<span className="index-badge" data-indexer={repository.stats.indexer ?? "regex"} title={`${repository.stats.symbolCount} definitions · ${repository.stats.referenceCount ?? 0} references · ${repository.stats.resolvedCallEdgeCount ?? 0}/${repository.stats.callEdgeCount ?? 0} resolved call edges`}>{repository.stats.fileCount} files · {repository.stats.indexer === "tree-sitter" ? "tree-sitter" : "regex"} index</span></div>
+        <div className="repo-meta"><span><Icon name="branch" size={13} />{repository.branch}</span><span>{commit}</span>{repository.isDirty && <span className="dirty">modified</span>}{!(repository.stats.complete ?? true) && <span className="dirty" title={(repository.stats.truncated ?? []).map((item) => `${item.limit}=${item.value}`).join(", ")} data-truncated={(repository.stats.truncated ?? []).length}>partial index</span>}<span className="index-badge" data-indexer={repository.stats.indexer ?? "regex"} title={`${repository.stats.symbolCount} definitions · ${repository.stats.referenceCount ?? 0} references · ${repository.stats.resolvedCallEdgeCount ?? 0}/${repository.stats.callEdgeCount ?? 0} resolved call edges`}>{repository.stats.fileCount} files · {repository.stats.indexer === "tree-sitter" ? "tree-sitter" : "regex"} index</span></div>
         <div className="app-bar-spacer" />
         <FontSizeControl value={fontScale} onChange={setFontScale} />
         <span className="privacy"><i />LOCAL · CONTEXT BUDGETED</span>

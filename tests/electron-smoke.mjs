@@ -17,9 +17,38 @@ const electronApp = await electron.launch({
 
 try {
   const page = await electronApp.firstWindow();
+
+  // Item 20: streaming progress is reported and an in-flight index can be cancelled.
+  await page.evaluate(() => {
+    window.__indexProgress = [];
+    window.trace.onIndexProgress((progress) => window.__indexProgress.push(progress));
+  });
+  const cancelRequestId = "smoke-cancel-request";
+  const cancelledOpen = page.evaluate((args) => window.trace
+    .openRepository({ source: args.repositoryPath, requestId: args.requestId, limits: { analysisBatchSize: 1 } })
+    .then(() => "resolved")
+    .catch((error) => `rejected: ${error.message}`), { repositoryPath, requestId: cancelRequestId });
+  await page.waitForFunction(() => (window.__indexProgress ?? []).some((progress) => progress.phase === "read"), null, { timeout: 60_000 });
+  assert.equal(await page.evaluate((requestId) => window.trace.cancelRepositoryOpen(requestId), cancelRequestId), true);
+  const cancelledResult = await cancelledOpen;
+  assert.match(cancelledResult, /rejected: .*cancelled/i, cancelledResult);
+  const cancelPhases = await page.evaluate(() => (window.__indexProgress ?? []).map((progress) => progress.phase));
+  assert.ok(cancelPhases.includes("prepare") && cancelPhases.includes("discover") && cancelPhases.includes("read"), cancelPhases.join(","));
+  assert.ok(cancelPhases.includes("cancelled"), `expected a cancelled event, got ${cancelPhases.join(",")}`);
+  assert.equal(await page.evaluate((requestId) => window.trace.cancelRepositoryOpen(requestId), cancelRequestId), false);
+  const limits = await page.evaluate(() => window.trace.indexLimits());
+  assert.equal(limits.maxFiles, 4_000);
+  await page.evaluate(() => { window.__indexProgress = []; });
+
   await page.getByLabel("Repository path or URL").fill(repositoryPath);
   await page.getByRole("button", { name: "Start learning" }).click();
-  await page.getByRole("dialog", { name: "Adaptive skill assessment" }).waitFor({ timeout: 60_000 });
+  await page.locator(".index-progress").waitFor({ timeout: 30_000 });
+  await page.getByRole("dialog", { name: "Adaptive skill assessment" }).waitFor({ timeout: 120_000 });
+  const observedPhases = await page.evaluate(() => [...new Set((window.__indexProgress ?? []).map((progress) => progress.phase))]);
+  assert.deepEqual(observedPhases, ["prepare", "discover", "read", "git", "analyze", "link", "finalize"], observedPhases.join(","));
+  const analyzeProgress = await page.evaluate(() => (window.__indexProgress ?? []).filter((progress) => progress.phase === "analyze"));
+  assert.ok(analyzeProgress.length >= 10, `expected streamed analyze progress, got ${analyzeProgress.length}`);
+  assert.ok(analyzeProgress.every((progress) => progress.requestId?.startsWith("index-")));
   await page.getByRole("button", { name: "Skip for now" }).click();
   await page.getByText("flashinfer Deep Dive").waitFor({ timeout: 30_000 });
 

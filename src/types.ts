@@ -81,6 +81,10 @@ export interface Repository {
     indexer?: string;
     indexerCounts?: Record<string, number>;
     languages: Record<string, number>;
+    totalBytes?: number;
+    limits?: IndexLimits;
+    truncated?: IndexTruncation[];
+    complete?: boolean;
   };
   indexedAt: string;
 }
@@ -294,6 +298,36 @@ export interface KnowledgeGraphSummary {
   };
 }
 
+export interface IndexProgress {
+  requestId?: string;
+  phase: "prepare" | "discover" | "read" | "git" | "analyze" | "link" | "finalize" | "cancelled";
+  completed: number;
+  total: number;
+  ratio: number;
+  message: string;
+  at?: number;
+}
+
+export interface IndexLimits {
+  maxFiles: number;
+  maxFileBytes: number;
+  maxTotalBytes: number;
+  maxAnalyzedFiles: number;
+  maxSymbols: number;
+  maxReferences: number;
+  maxCallEdges: number;
+  maxImports: number;
+  analysisBatchSize: number;
+}
+
+export interface IndexTruncation {
+  limit: string;
+  value: number;
+  discovered?: number;
+  skipped?: number;
+  indexedBytes?: number;
+}
+
 export interface LanguageServerRecord {
   id: string;
   command: string;
@@ -351,7 +385,10 @@ export interface PracticeReport {
 
 export interface TraceBridge {
   chooseRepository(): Promise<string | null>;
-  openRepository(request: string | { source: string; profile?: LearnerProfile }): Promise<{ repository: Repository; course: Course; skillGraph: SkillGraph; learnerState: LearnerState; knowledgeGraph?: KnowledgeGraphSummary }>;
+  cancelRepositoryOpen(requestId: string): Promise<boolean>;
+  indexLimits(): Promise<IndexLimits>;
+  onIndexProgress(callback: (progress: IndexProgress) => void): () => void;
+  openRepository(request: string | { source: string; profile?: LearnerProfile; requestId?: string; limits?: Partial<IndexLimits> }): Promise<{ repository: Repository; course: Course; skillGraph: SkillGraph; learnerState: LearnerState; knowledgeGraph?: KnowledgeGraphSummary }>;
   graphSummary(request: { repository: Repository }): Promise<KnowledgeGraphSummary>;
   graphNeighborhood(request: { repository: Repository; nodeId: string; depth?: number; edgeKinds?: string[] }): Promise<{ nodes: KnowledgeGraphNode[]; edges: KnowledgeGraphEdge[] }>;
   readFile(rootPath: string, filePath: string): Promise<string>;

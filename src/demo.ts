@@ -62,6 +62,11 @@ function demoPack(request: Parameters<TraceBridge["askAgent"]>[0]): ContextPack 
 
 export const browserBridge: TraceBridge = {
   async chooseRepository() { return null; },
+  async cancelRepositoryOpen() { return false; },
+  async indexLimits() {
+    return { maxFiles: 4_000, maxFileBytes: 2_000_000, maxTotalBytes: 900_000_000, maxAnalyzedFiles: 1_200, maxSymbols: 2_500, maxReferences: 20_000, maxCallEdges: 20_000, maxImports: 20_000, analysisBatchSize: 48 };
+  },
+  onIndexProgress() { return () => undefined; },
   async openRepository() { return { repository: nanoRepository, course: nanoCourse, skillGraph: nanoSkillGraph, learnerState: savedLearning, knowledgeGraph: demoKnowledgeGraph }; },
   async graphSummary() { return demoKnowledgeGraph; },
   async graphNeighborhood(request) {

@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { askAgent, detectAgents, generateCourseWithAgent } from "./agents.mjs";
 import { generateStarterCourse, normalizeAgentCourse } from "./course.mjs";
 import { loadCourse, saveCourse } from "./course-store.mjs";
-import { inspectRepository, readRepositoryFile } from "./repository.mjs";
+import { DEFAULT_INDEX_LIMITS, IndexCancelledError, inspectRepository, readRepositoryFile } from "./repository.mjs";
 import { createPracticeSession, getPracticeSessionPath, inspectPracticeSession, removePracticeSession } from "./practice.mjs";
 import { answerFromLocalIndex, buildContextPack, loadCachedResponse, responseCacheKey, saveCachedResponse } from "./context-engine.mjs";
 import { loadLearnerState, saveLearnerState } from "./learning-store.mjs";
@@ -15,6 +15,7 @@ import { buildKnowledgeGraph, loadKnowledgeGraph, neighborhood, saveKnowledgeGra
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const openedRepositories = new Map();
 const knowledgeGraphs = new Map();
+const indexingRequests = new Map();
 
 function openedRepository(candidate) {
   const repository = candidate?.id ? openedRepositories.get(candidate.id) : null;
@@ -56,12 +57,48 @@ ipcMain.handle("repository:choose", async () => {
   return result.canceled ? null : result.filePaths[0];
 });
 
-ipcMain.handle("repository:open", async (_event, source) => {
+ipcMain.handle("repository:cancel", (_event, requestId) => {
+  const controller = indexingRequests.get(requestId);
+  if (!controller) return false;
+  controller.abort();
+  indexingRequests.delete(requestId);
+  return true;
+});
+
+ipcMain.handle("repository:limits", () => DEFAULT_INDEX_LIMITS);
+
+ipcMain.handle("repository:open", async (event, source) => {
   const request = typeof source === "string" ? { source } : source;
   if (!request || typeof request.source !== "string") throw new Error("Repository source must be a path or Git URL.");
   const repositoriesDirectory = path.join(app.getPath("userData"), "repositories");
   const courseDirectory = path.join(app.getPath("userData"), "courses");
-  const repository = await inspectRepository(request.source, repositoriesDirectory);
+  const requestId = typeof request.requestId === "string" && request.requestId.length <= 64
+    ? request.requestId
+    : `index-${Date.now()}`;
+  const controller = new AbortController();
+  indexingRequests.set(requestId, controller);
+  const sender = event.sender;
+  const onProgress = (progress) => {
+    if (!sender.isDestroyed()) sender.send("repository:progress", { requestId, ...progress });
+  };
+  let repository;
+  try {
+    repository = await inspectRepository(request.source, repositoriesDirectory, {
+      signal: controller.signal,
+      onProgress,
+      limits: request.limits,
+    });
+  } catch (cause) {
+    if (cause instanceof IndexCancelledError || cause?.cancelled) {
+      onProgress({ phase: "cancelled", completed: 0, total: 1, ratio: 0, message: "Indexing cancelled." });
+      const error = new Error("Repository indexing was cancelled.");
+      error.cancelled = true;
+      throw error;
+    }
+    throw cause;
+  } finally {
+    indexingRequests.delete(requestId);
+  }
   openedRepositories.set(repository.id, repository);
   const course = await loadCourse(courseDirectory, repository, request.profile)
     ?? generateStarterCourse(repository, request.profile);

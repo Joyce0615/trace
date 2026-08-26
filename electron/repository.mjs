@@ -72,14 +72,71 @@ const ENTRY_BASENAMES = new Set([
   "server.ts",
 ]);
 
+export const DEFAULT_INDEX_LIMITS = {
+  maxFiles: 4_000,
+  maxFileBytes: 2_000_000,
+  maxTotalBytes: 900_000_000,
+  maxAnalyzedFiles: 1_200,
+  maxSymbols: 2_500,
+  maxReferences: 20_000,
+  maxCallEdges: 20_000,
+  maxImports: 20_000,
+  analysisBatchSize: 48,
+};
+
+export class IndexCancelledError extends Error {
+  constructor(phase) {
+    super("Repository indexing was cancelled.");
+    this.name = "IndexCancelledError";
+    this.cancelled = true;
+    this.phase = phase;
+  }
+}
+
+function throwIfCancelled(signal, phase) {
+  if (signal?.aborted) throw new IndexCancelledError(phase);
+}
+
+function resolveLimits(overrides = {}) {
+  const limits = { ...DEFAULT_INDEX_LIMITS };
+  for (const [key, value] of Object.entries(overrides)) {
+    if (key in limits && Number.isFinite(value) && value > 0) limits[key] = Math.floor(value);
+  }
+  return limits;
+}
+
+function progressReporter(onProgress) {
+  let lastPhase = null;
+  return (phase, completed, total, message) => {
+    if (typeof onProgress !== "function") return;
+    lastPhase = phase;
+    try {
+      onProgress({
+        phase,
+        completed: Math.max(0, Math.round(completed)),
+        total: Math.max(0, Math.round(total)),
+        ratio: total > 0 ? Math.min(1, completed / total) : 0,
+        message,
+        at: Date.now(),
+      });
+    } catch {
+      // A failing progress listener must never fail the index.
+      void lastPhase;
+    }
+  };
+}
+
 function run(command, args, options = {}) {
-  const { cwd, timeoutMs = 30_000 } = options;
+  const { cwd, timeoutMs = 30_000, signal = null } = options;
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) { reject(new IndexCancelledError("run")); return; }
     const child = spawn(command, args, {
       cwd,
       env: process.env,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    const onAbort = () => { child.kill("SIGTERM"); reject(new IndexCancelledError("run")); };
+    signal?.addEventListener?.("abort", onAbort, { once: true });
     const stdout = [];
     const stderr = [];
     const timer = setTimeout(() => {
@@ -94,6 +151,7 @@ function run(command, args, options = {}) {
     });
     child.on("close", (code) => {
       clearTimeout(timer);
+      signal?.removeEventListener?.("abort", onAbort);
       const result = {
         code: code ?? 1,
         stdout: Buffer.concat(stdout).toString("utf8"),
@@ -114,8 +172,9 @@ function repositoryName(value) {
   return path.basename(cleaned).replace(/\.git$/i, "") || "repository";
 }
 
-async function ensureLocalRepository(input, repositoriesDirectory) {
+async function ensureLocalRepository(input, repositoriesDirectory, options = {}) {
   const value = input.trim();
+  throwIfCancelled(options.signal, "prepare");
   if (!value) throw new Error("Choose a repository first.");
 
   if (!isRemoteRepository(value)) {
@@ -132,7 +191,7 @@ async function ensureLocalRepository(input, repositoriesDirectory) {
   try {
     await access(path.join(destination, ".git"));
   } catch {
-    await run("git", ["clone", "--depth=1", "--", value, destination], { timeoutMs: 120_000 });
+    await run("git", ["clone", "--depth=1", "--", value, destination], { timeoutMs: 120_000, signal: options.signal });
   }
 
   return { rootPath: await realpath(destination), source: "remote", remoteUrl: value };
@@ -166,20 +225,21 @@ export function changedPathsFromStatus(statusText) {
   );
 }
 
-async function walkDirectory(rootPath, currentPath = rootPath, output = []) {
-  if (output.length >= 4_000) return output;
+async function walkDirectory(rootPath, currentPath = rootPath, output = [], maxFiles = DEFAULT_INDEX_LIMITS.maxFiles, signal = null) {
+  if (output.length >= maxFiles) return output;
+  throwIfCancelled(signal, "discover");
   const entries = await readdir(currentPath, { withFileTypes: true });
   for (const entry of entries) {
-    if (output.length >= 4_000) break;
+    if (output.length >= maxFiles) break;
     if (entry.isDirectory() && SKIP_DIRECTORIES.has(entry.name)) continue;
     const absolute = path.join(currentPath, entry.name);
-    if (entry.isDirectory()) await walkDirectory(rootPath, absolute, output);
+    if (entry.isDirectory()) await walkDirectory(rootPath, absolute, output, maxFiles, signal);
     else if (entry.isFile()) output.push(path.relative(rootPath, absolute));
   }
   return output;
 }
 
-async function listRepositoryFiles(rootPath) {
+async function listRepositoryFiles(rootPath, limits = DEFAULT_INDEX_LIMITS, signal = null) {
   try {
     const { stdout } = await run(
       "git",
@@ -187,11 +247,12 @@ async function listRepositoryFiles(rootPath) {
       { timeoutMs: 45_000 },
     );
     const files = stdout.split("\0").filter(Boolean);
-    if (files.length) return files.slice(0, 4_000);
+    if (files.length) return { files: files.slice(0, limits.maxFiles), discovered: files.length };
   } catch {
     // A plain folder is still a valid learning source.
   }
-  return walkDirectory(rootPath);
+  const walked = await walkDirectory(rootPath, rootPath, [], limits.maxFiles, signal);
+  return { files: walked, discovered: walked.length };
 }
 
 async function gitBlobIds(rootPath) {
@@ -355,34 +416,69 @@ async function extractSymbols(rootPath, file) {
   return (await analyzeFile(rootPath, file)).symbols;
 }
 
-export async function inspectRepository(input, repositoriesDirectory) {
-  const location = await ensureLocalRepository(input, repositoriesDirectory);
-  const rawFiles = await listRepositoryFiles(location.rootPath);
-  const blobIds = await gitBlobIds(location.rootPath);
-  const fileRecords = (
-    await Promise.all(
-      rawFiles.map(async (relativePath) => {
-        try {
-          const absolute = path.join(location.rootPath, relativePath);
-          const details = await lstat(absolute);
-          if (!details.isFile() || details.size > 2_000_000) return null;
-          const normalizedRelativePath = relativePath.split(path.sep).join("/");
-          return {
-            path: normalizedRelativePath,
-            name: path.basename(relativePath),
-            directory: path.dirname(relativePath) === "." ? "" : path.dirname(relativePath),
-            language: languageFor(relativePath),
-            size: details.size,
-            blobId: blobIds.get(normalizedRelativePath)
-              ?? createHash("sha256").update(await readFile(absolute)).digest("hex"),
-          };
-        } catch {
-          return null;
-        }
-      }),
-    )
-  ).filter(Boolean);
+export async function inspectRepository(input, repositoriesDirectory, options = {}) {
+  const limits = resolveLimits(options.limits);
+  const signal = options.signal ?? null;
+  const report = progressReporter(options.onProgress);
+  const truncated = [];
 
+  report("prepare", 0, 1, "Locating the repository");
+  throwIfCancelled(signal, "prepare");
+  const location = await ensureLocalRepository(input, repositoriesDirectory, { signal });
+
+  report("discover", 0, 1, "Listing tracked and untracked files");
+  throwIfCancelled(signal, "discover");
+  const discovery = await listRepositoryFiles(location.rootPath, limits, signal);
+  const rawFiles = discovery.files;
+  if (discovery.discovered > rawFiles.length) {
+    truncated.push({ limit: "maxFiles", value: limits.maxFiles, discovered: discovery.discovered });
+  }
+  report("discover", rawFiles.length, rawFiles.length, `Found ${rawFiles.length} files`);
+
+  const blobIds = await gitBlobIds(location.rootPath);
+  const fileRecords = [];
+  let totalBytes = 0;
+  let skippedTooLarge = 0;
+  let stoppedForTotalBytes = false;
+  // Streaming file intake: records are appended in batches so progress is
+  // observable and cancellation lands within one batch instead of at the end.
+  for (let start = 0; start < rawFiles.length; start += limits.analysisBatchSize) {
+    throwIfCancelled(signal, "read");
+    const batch = rawFiles.slice(start, start + limits.analysisBatchSize);
+    const records = await Promise.all(batch.map(async (relativePath) => {
+      try {
+        const absolute = path.join(location.rootPath, relativePath);
+        const details = await lstat(absolute);
+        if (!details.isFile()) return null;
+        if (details.size > limits.maxFileBytes) { skippedTooLarge += 1; return null; }
+        const normalizedRelativePath = relativePath.split(path.sep).join("/");
+        return {
+          path: normalizedRelativePath,
+          name: path.basename(relativePath),
+          directory: path.dirname(relativePath) === "." ? "" : path.dirname(relativePath),
+          language: languageFor(relativePath),
+          size: details.size,
+          blobId: blobIds.get(normalizedRelativePath)
+            ?? createHash("sha256").update(await readFile(absolute)).digest("hex"),
+        };
+      } catch {
+        return null;
+      }
+    }));
+    for (const record of records) {
+      if (!record) continue;
+      if (totalBytes + record.size > limits.maxTotalBytes) { stoppedForTotalBytes = true; break; }
+      totalBytes += record.size;
+      fileRecords.push(record);
+    }
+    report("read", Math.min(start + batch.length, rawFiles.length), rawFiles.length, "Reading file metadata");
+    if (stoppedForTotalBytes) break;
+  }
+  if (skippedTooLarge) truncated.push({ limit: "maxFileBytes", value: limits.maxFileBytes, skipped: skippedTooLarge });
+  if (stoppedForTotalBytes) truncated.push({ limit: "maxTotalBytes", value: limits.maxTotalBytes, indexedBytes: totalBytes });
+
+  report("git", 0, 1, "Reading git version information");
+  throwIfCancelled(signal, "git");
   const head = await gitValue(location.rootPath, ["rev-parse", "HEAD"], "unversioned");
   const branch = await gitValue(location.rootPath, ["branch", "--show-current"], "local");
   const statusText = await gitOutput(location.rootPath, ["status", "--porcelain"], "");
@@ -403,6 +499,7 @@ export async function inspectRepository(input, repositoriesDirectory) {
         }
       }),
   );
+  report("git", 1, 1, "Repository version resolved");
 
   const packageRoots = new Set(
     fileRecords
@@ -414,27 +511,49 @@ export async function inspectRepository(input, repositoriesDirectory) {
     file.importance = fileImportance(file.path, file.language);
     if (packageRoots.has(file.path.split("/")[0])) file.importance += 100;
   }
-  const sourceFiles = fileRecords
+  const parseableFiles = fileRecords
     .filter((file) => symbolPatterns(file.language).length || treeSitterSupports(file.language, file.path))
     .sort((left, right) => right.importance - left.importance || left.path.localeCompare(right.path));
-  const analyses = await Promise.all(sourceFiles.slice(0, 1_200).map((file) => analyzeFile(location.rootPath, file)));
+  const sourceFiles = parseableFiles.slice(0, limits.maxAnalyzedFiles);
+  if (parseableFiles.length > sourceFiles.length) {
+    truncated.push({ limit: "maxAnalyzedFiles", value: limits.maxAnalyzedFiles, skipped: parseableFiles.length - sourceFiles.length });
+  }
+
+  // Streaming analysis: bounded-concurrency batches with progress between batches.
+  const analyses = [];
+  for (let start = 0; start < sourceFiles.length; start += limits.analysisBatchSize) {
+    throwIfCancelled(signal, "analyze");
+    const batch = sourceFiles.slice(start, start + limits.analysisBatchSize);
+    analyses.push(...await Promise.all(batch.map((file) => analyzeFile(location.rootPath, file))));
+    report("analyze", analyses.length, sourceFiles.length, "Extracting definitions and call edges");
+  }
+
+  report("link", 0, 1, "Resolving references and imports");
+  throwIfCancelled(signal, "link");
   const symbolGroups = analyses.map((analysis) => analysis.symbols);
   const symbols = [];
-  for (let symbolIndex = 0; symbolIndex < 80 && symbols.length < 2_500; symbolIndex += 1) {
+  for (let symbolIndex = 0; symbolIndex < 80 && symbols.length < limits.maxSymbols; symbolIndex += 1) {
     for (const group of symbolGroups) {
       if (group[symbolIndex]) symbols.push(group[symbolIndex]);
-      if (symbols.length >= 2_500) break;
+      if (symbols.length >= limits.maxSymbols) break;
     }
   }
-  const references = analyses.flatMap((analysis) => analysis.references).slice(0, 20_000);
+  const totalSymbols = symbolGroups.reduce((sum, group) => sum + group.length, 0);
+  if (totalSymbols > symbols.length) truncated.push({ limit: "maxSymbols", value: limits.maxSymbols, skipped: totalSymbols - symbols.length });
+
+  const allReferences = analyses.flatMap((analysis) => analysis.references);
+  const references = allReferences.slice(0, limits.maxReferences);
+  if (allReferences.length > references.length) truncated.push({ limit: "maxReferences", value: limits.maxReferences, skipped: allReferences.length - references.length });
+
   const definitionIndex = new Map();
   for (const symbol of symbols) {
     if (!definitionIndex.has(symbol.name)) definitionIndex.set(symbol.name, []);
     definitionIndex.get(symbol.name).push(symbol);
   }
-  const callEdges = analyses
-    .flatMap((analysis) => analysis.callEdges)
-    .slice(0, 20_000)
+  const allCallEdges = analyses.flatMap((analysis) => analysis.callEdges);
+  if (allCallEdges.length > limits.maxCallEdges) truncated.push({ limit: "maxCallEdges", value: limits.maxCallEdges, skipped: allCallEdges.length - limits.maxCallEdges });
+  const callEdges = allCallEdges
+    .slice(0, limits.maxCallEdges)
     .map((edge) => {
       const targets = definitionIndex.get(edge.callee) ?? [];
       const target = targets.find((candidate) => candidate.path === edge.path) ?? targets[0] ?? null;
@@ -445,10 +564,12 @@ export async function inspectRepository(input, repositoriesDirectory) {
     return counts;
   }, {});
   const indexer = indexerCounts["tree-sitter"] ? "tree-sitter" : indexerCounts.regex ? "regex" : "none";
-  const rawImports = analyses.flatMap((analysis) => analysis.imports ?? []).slice(0, 20_000);
-  const imports = resolveImportsStatically({ files: fileRecords }, rawImports);
+  const allImports = analyses.flatMap((analysis) => analysis.imports ?? []);
+  if (allImports.length > limits.maxImports) truncated.push({ limit: "maxImports", value: limits.maxImports, skipped: allImports.length - limits.maxImports });
+  const imports = resolveImportsStatically({ files: fileRecords }, allImports.slice(0, limits.maxImports));
   const languages = {};
   for (const file of fileRecords) languages[file.language] = (languages[file.language] ?? 0) + 1;
+  report("link", 1, 1, "Index linked");
 
   const changedFingerprint = [...changedPaths]
     .sort()
@@ -458,6 +579,7 @@ export async function inspectRepository(input, repositoriesDirectory) {
     .update(`${head}\n${statusText}\n${diffSummary}\n${changedFingerprint}`)
     .digest("hex")
     .slice(0, 20);
+  report("finalize", 1, 1, "Index ready");
   const entryFiles = fileRecords
     .filter((file) => ENTRY_BASENAMES.has(file.name.toLowerCase()) || (file.name === "__init__.py" && file.path.split("/").length === 2 && !["tests", "test"].includes(file.path.split("/")[0])))
     .sort((left, right) => {
@@ -492,6 +614,10 @@ export async function inspectRepository(input, repositoriesDirectory) {
       indexer,
       indexerCounts,
       languages,
+      totalBytes,
+      limits,
+      truncated,
+      complete: truncated.length === 0,
     },
     indexedAt: new Date().toISOString(),
   };

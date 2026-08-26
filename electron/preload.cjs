@@ -3,6 +3,13 @@ const { contextBridge, ipcRenderer } = require("electron");
 contextBridge.exposeInMainWorld("trace", {
   chooseRepository: () => ipcRenderer.invoke("repository:choose"),
   openRepository: (source) => ipcRenderer.invoke("repository:open", source),
+  cancelRepositoryOpen: (requestId) => ipcRenderer.invoke("repository:cancel", requestId),
+  indexLimits: () => ipcRenderer.invoke("repository:limits"),
+  onIndexProgress: (callback) => {
+    const listener = (_event, progress) => callback(progress);
+    ipcRenderer.on("repository:progress", listener);
+    return () => ipcRenderer.removeListener("repository:progress", listener);
+  },
   readFile: (rootPath, filePath) => ipcRenderer.invoke("repository:read-file", { rootPath, filePath }),
   detectAgents: () => ipcRenderer.invoke("agents:detect"),
   detectLanguageServers: () => ipcRenderer.invoke("index:language-servers"),
