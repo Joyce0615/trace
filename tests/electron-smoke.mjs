@@ -40,6 +40,49 @@ try {
   assert.equal(limits.maxFiles, 4_000);
   await page.evaluate(() => { window.__indexProgress = []; });
 
+  // Item 22: malformed IPC payloads are rejected by the schema layer, not the handler.
+  const invalidCalls = [
+    ["repository:open with a non-string source", () => window.trace.openRepository({ source: 42 }), /must be a string/],
+    ["repository:open with an unknown field", () => window.trace.openRepository({ source: "/tmp", nodeIntegration: true }), /unexpected field nodeIntegration/],
+    ["repository:open with an oversized source", () => window.trace.openRepository({ source: "x".repeat(5000) }), /exceeds 4096 characters/],
+    ["graph:summary with a full repository object", () => window.trace.graphSummary({ repository: { id: "a", rootPath: "/tmp", files: [] } }), /unexpected field files/],
+    ["graph:neighborhood with an out-of-range depth", () => window.trace.graphNeighborhood({ repository: { id: "a", rootPath: "/tmp" }, nodeId: "n", depth: 99 }), /must be between 1 and 3/],
+    ["practice:inspect with an object", () => window.trace.inspectPractice({ sessionId: "x" }), /must be a string/],
+    ["agents:ask with an unsupported provider", () => window.trace.askAgent({ provider: "gemini", rootPath: "/tmp", context: {} }), /must be one of codex, claude/],
+  ];
+  for (const [label, invoke, pattern] of invalidCalls) {
+    const message = await page.evaluate(async (index) => {
+      const calls = [
+        () => window.trace.openRepository({ source: 42 }),
+        () => window.trace.openRepository({ source: "/tmp", nodeIntegration: true }),
+        () => window.trace.openRepository({ source: "x".repeat(5000) }),
+        () => window.trace.graphSummary({ repository: { id: "a", rootPath: "/tmp", files: [] } }),
+        () => window.trace.graphNeighborhood({ repository: { id: "a", rootPath: "/tmp" }, nodeId: "n", depth: 99 }),
+        () => window.trace.inspectPractice({ sessionId: "x" }),
+        () => window.trace.askAgent({ provider: "gemini", rootPath: "/tmp", context: {} }),
+      ];
+      try {
+        await calls[index]();
+        return "resolved";
+      } catch (error) {
+        return error.message;
+      }
+    }, invalidCalls.findIndex(([name]) => name === label));
+    assert.match(message, /IpcValidationError/, `${label} was not rejected by the schema layer: ${message}`);
+    assert.match(message, pattern, `${label} produced: ${message}`);
+    void invoke;
+  }
+  // A payload over the size ceiling is rejected before any handler runs.
+  const oversized = await page.evaluate(async () => {
+    try {
+      await window.trace.readFile("/tmp", "x".repeat(4_100_000));
+      return "resolved";
+    } catch (error) {
+      return error.message;
+    }
+  });
+  assert.match(oversized, /over the 4000000 byte limit|exceeds 4096 characters/, oversized);
+
   // Item 21: unsafe remotes are rejected in the trusted main process, before git runs.
   const unsafeRemotes = [
     ["http://github.com/a/b.git", /^Plain http is not allowed/],
@@ -80,13 +123,13 @@ try {
   await page.locator(".knowledge-graph-card").waitFor({ timeout: 30_000 });
   const graphVersion = await page.locator(".knowledge-graph-card").getAttribute("data-graph-version");
   assert.ok((graphVersion ?? "").length >= 8, `unexpected graph version: ${graphVersion}`);
-  const graphSummary = await page.evaluate(() => window.trace.graphSummary({ repository: window.traceWorkspace.repository }));
+  const graphSummary = await page.evaluate(() => window.trace.graphSummary({ repository: { id: window.traceWorkspace.repository.id, rootPath: window.traceWorkspace.repository.rootPath } }));
   assert.equal(graphSummary.format, "kg-v1");
   assert.equal(graphSummary.version, graphVersion);
   assert.ok(graphSummary.stats.nodeCount > 1_000, JSON.stringify(graphSummary.stats));
   assert.ok(graphSummary.stats.resolvedCallEdges > 0);
   assert.equal(graphSummary.stats.danglingEdges, 0);
-  const hood = await page.evaluate(() => window.trace.graphNeighborhood({ repository: window.traceWorkspace.repository, nodeId: `repository:${window.traceWorkspace.repository.id}`, depth: 1 }));
+  const hood = await page.evaluate(() => window.trace.graphNeighborhood({ repository: { id: window.traceWorkspace.repository.id, rootPath: window.traceWorkspace.repository.rootPath }, nodeId: `repository:${window.traceWorkspace.repository.id}`, depth: 1 }));
   assert.ok(hood.nodes.length > 1 && hood.edges.length > 1, JSON.stringify({ nodes: hood.nodes.length, edges: hood.edges.length }));
 
   // Item 17: real-repository import resolution plus the optional language-server bridge.

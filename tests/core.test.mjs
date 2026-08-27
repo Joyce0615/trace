@@ -11,6 +11,7 @@ import { createPracticeSession, inspectPracticeSession, removePracticeSession } 
 import { DEFAULT_INDEX_LIMITS, IndexCancelledError, analysisCacheStats, analyzeFile, fileImportance, inspectRepository, languageFor, readRepositoryFile, resetAnalysisCache } from "../electron/repository.mjs";
 import { buildKnowledgeGraph, loadKnowledgeGraph, neighborhood, saveKnowledgeGraph } from "../electron/knowledge-graph.mjs";
 import { RemoteSourceError, cloneArguments, cloneDestination, cloneEnvironment, looksRemote, parseRemoteSource, summarizeSubmodules, verifyExistingClone } from "../electron/clone-guard.mjs";
+import { IPC_PROTOCOL_VERSION, IPC_SCHEMAS, MAX_PAYLOAD_BYTES, MAX_PAYLOAD_DEPTH, registerValidatedHandlers, schemaFor, validatePayload } from "../electron/ipc-schema.mjs";
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
 import { detectLanguageServers, resolveImportsStatically, resolveSymbol, serverForLanguage, shutdownLanguageServers } from "../electron/language-server.mjs";
 import { answerFromLocalIndex, buildContextPack } from "../electron/context-engine.mjs";
@@ -707,4 +708,108 @@ test("a hardened clone of a local bare remote never checks out submodules", asyn
   assert.equal(local.stats.submodules.checkedOut, false);
   assert.match(local.stats.submodules.note, /not checked out/);
   await assert.rejects(() => access(path.join(local.rootPath, "vendor", "dep")));
+});
+
+test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () => {
+  // Every channel the preload exposes must have a declared schema entry.
+  const preload = ["repository:choose", "repository:open", "repository:cancel", "repository:limits", "repository:read-file",
+    "agents:detect", "index:language-servers", "index:resolve", "graph:summary", "graph:neighborhood", "agents:ask",
+    "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
+  assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
+  assert.throws(() => schemaFor("repository:evil"), /is not a registered IPC channel/);
+  assert.equal(IPC_PROTOCOL_VERSION, 1);
+
+  const open = IPC_SCHEMAS["repository:open"];
+  assert.deepEqual(
+    validatePayload("repository:open", open, { source: "/tmp/repo", requestId: "abc" }),
+    { source: "/tmp/repo", requestId: "abc" },
+  );
+
+  // Type, range, enum, and required-field failures.
+  assert.throws(() => validatePayload("repository:open", open, { source: 42 }), /must be a string/);
+  assert.throws(() => validatePayload("repository:open", open, {}), /\.source: is required/);
+  assert.throws(() => validatePayload("repository:open", open, { source: "" }), /at least 1 characters/);
+  assert.throws(() => validatePayload("repository:open", open, { source: "x".repeat(5_000) }), /exceeds 4096 characters/);
+  assert.throws(() => validatePayload("repository:open", open, { source: "/tmp", profile: { goal: "evil", level: "adaptive" } }), /must be one of architecture/);
+  assert.throws(() => validatePayload("repository:open", open, { source: "/tmp", limits: { maxFiles: "many" } }), /must be a finite number/);
+  assert.throws(() => validatePayload("repository:open", open, { source: "/tmp", limits: { maxFiles: Infinity } }), /must be a finite number/);
+
+  // Unknown fields are rejected rather than ignored.
+  assert.throws(() => validatePayload("repository:open", open, { source: "/tmp", __proto__evil: 1 }), /unexpected field/);
+  const reference = IPC_SCHEMAS["graph:summary"];
+  assert.throws(
+    () => validatePayload("graph:summary", reference, { repository: { id: "a", rootPath: "/tmp", files: [] } }),
+    /unexpected field files/,
+  );
+  assert.deepEqual(validatePayload("graph:summary", reference, { repository: { id: "a", rootPath: "/tmp" } }), { repository: { id: "a", rootPath: "/tmp" } });
+
+  // Bounded collections.
+  const neighborhoodSchema = IPC_SCHEMAS["graph:neighborhood"];
+  assert.throws(
+    () => validatePayload("graph:neighborhood", neighborhoodSchema, { repository: { id: "a", rootPath: "/tmp" }, nodeId: "n", depth: 9 }),
+    /must be between 1 and 3/,
+  );
+  assert.throws(
+    () => validatePayload("graph:neighborhood", neighborhoodSchema, { repository: { id: "a", rootPath: "/tmp" }, nodeId: "n", edgeKinds: ["contains", "evil"] }),
+    /edgeKinds\[1\]: must be one of/,
+  );
+  assert.throws(
+    () => validatePayload("graph:neighborhood", neighborhoodSchema, { repository: { id: "a", rootPath: "/tmp" }, nodeId: "n".repeat(600) }),
+    /exceeds 512 characters/,
+  );
+
+  // Size ceiling, measured before structural validation.
+  assert.throws(
+    () => validatePayload("repository:read-file", IPC_SCHEMAS["repository:read-file"], { rootPath: "/tmp", filePath: "a", blob: "x".repeat(MAX_PAYLOAD_BYTES) }),
+    new RegExp(`over the ${MAX_PAYLOAD_BYTES} byte limit`),
+  );
+
+  // Depth ceiling stops pathological nesting before any traversal.
+  let deep = "leaf";
+  for (let level = 0; level < MAX_PAYLOAD_DEPTH + 4; level += 1) deep = { child: deep };
+  assert.throws(() => validatePayload("practice:inspect", IPC_SCHEMAS["practice:inspect"], deep), new RegExp(`deeper than ${MAX_PAYLOAD_DEPTH} levels`));
+
+  // Scalar channels.
+  assert.equal(validatePayload("practice:inspect", IPC_SCHEMAS["practice:inspect"], "session-1"), "session-1");
+  assert.throws(() => validatePayload("practice:inspect", IPC_SCHEMAS["practice:inspect"], { sessionId: "x" }), /must be a string/);
+  assert.throws(() => validatePayload("practice:inspect", IPC_SCHEMAS["practice:inspect"], "s".repeat(200)), /exceeds 64 characters/);
+  assert.throws(() => validatePayload("practice:inspect", IPC_SCHEMAS["practice:inspect"], undefined), /is required/);
+
+  // A realistic tutor request passes; a malformed one does not.
+  const ask = IPC_SCHEMAS["agents:ask"];
+  const validAsk = {
+    provider: "codex",
+    rootPath: "/tmp/repo",
+    context: {
+      lesson: { id: "l1", title: "T", objective: "O", anchors: [{ path: "a.py", line: 3, symbol: null }] },
+      question: "How does this work?",
+      repository: { id: "r1", rootPath: "/tmp/repo" },
+      mode: "lean",
+      scope: { selection: false, currentFile: true, lesson: true, dependencies: false },
+      memory: [],
+    },
+  };
+  assert.equal(validatePayload("agents:ask", ask, validAsk).context.question, "How does this work?");
+  assert.throws(() => validatePayload("agents:ask", ask, { ...validAsk, provider: "gemini" }), /must be one of codex, claude/);
+  assert.throws(
+    () => validatePayload("agents:ask", ask, { ...validAsk, context: { ...validAsk.context, mode: "unlimited" } }),
+    /must be one of lean, balanced, deep/,
+  );
+  assert.throws(
+    () => validatePayload("agents:ask", ask, { ...validAsk, context: { ...validAsk.context, question: "q".repeat(9_000) } }),
+    /exceeds 8000 characters/,
+  );
+  assert.throws(
+    () => validatePayload("agents:ask", ask, { ...validAsk, context: { ...validAsk.context, lesson: { ...validAsk.context.lesson, anchors: [{ path: "a.py", line: 0, symbol: null }] } } }),
+    /must be between 1 and 10000000/,
+  );
+
+  // A channel with no payload accepts undefined and still enforces the ceilings.
+  assert.equal(validatePayload("agents:detect", IPC_SCHEMAS["agents:detect"], undefined), undefined);
+
+  // The registry refuses to start if a declared channel has no handler.
+  const fakeIpc = { handled: [], handle(channel) { this.handled.push(channel); } };
+  assert.throws(() => registerValidatedHandlers(fakeIpc, { "agents:detect": () => null }), /declared without handlers/);
+  const complete = Object.fromEntries(Object.keys(IPC_SCHEMAS).map((channel) => [channel, () => null]));
+  assert.deepEqual(registerValidatedHandlers({ handle() {} }, complete).sort(), [...Object.keys(IPC_SCHEMAS)].sort());
 });

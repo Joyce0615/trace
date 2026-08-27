@@ -119,7 +119,7 @@ export const browserBridge: TraceBridge = {
   async saveLearning(state) { savedLearning = structuredClone(state); return true; },
   async createPractice(request) {
     await new Promise((resolve) => setTimeout(resolve, 400));
-    return { id: "demo-practice", repositoryId: request.repository.id, repositoryName: request.repository.name, worktreePath: "/tmp/trace-practice/nano-vllm-a1b2c3d4", baseCommit: request.repository.head, lessonId: request.lesson.id, lessonTitle: request.lesson.title, createdAt: new Date().toISOString() };
+    return { id: "demo-practice", repositoryId: request.repository.id, repositoryName: nanoRepository.name, worktreePath: "/tmp/trace-practice/nano-vllm-a1b2c3d4", baseCommit: nanoRepository.head, lessonId: request.lesson.id, lessonTitle: request.lesson.title, createdAt: new Date().toISOString() };
   },
   async inspectPractice(sessionId) { return { sessionId, clean: true, status: "", diffStat: "", diffCheckPassed: true, diffCheckOutput: "", checkedAt: new Date().toISOString() }; },
   async openPractice() { return true; },

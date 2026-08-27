@@ -44,6 +44,12 @@ export interface CallEdge {
   resolved?: boolean;
 }
 
+/** Minimal repository identity sent across IPC instead of the full index. */
+export interface RepositoryRef {
+  id: string;
+  rootPath: string;
+}
+
 export interface ImportEdge {
   path: string;
   line: number;
@@ -389,20 +395,20 @@ export interface TraceBridge {
   cancelRepositoryOpen(requestId: string): Promise<boolean>;
   indexLimits(): Promise<IndexLimits>;
   onIndexProgress(callback: (progress: IndexProgress) => void): () => void;
-  openRepository(request: string | { source: string; profile?: LearnerProfile; requestId?: string; limits?: Partial<IndexLimits> }): Promise<{ repository: Repository; course: Course; skillGraph: SkillGraph; learnerState: LearnerState; knowledgeGraph?: KnowledgeGraphSummary }>;
-  graphSummary(request: { repository: Repository }): Promise<KnowledgeGraphSummary>;
-  graphNeighborhood(request: { repository: Repository; nodeId: string; depth?: number; edgeKinds?: string[] }): Promise<{ nodes: KnowledgeGraphNode[]; edges: KnowledgeGraphEdge[] }>;
+  openRepository(request: { source: string; profile?: LearnerProfile; requestId?: string; limits?: Partial<IndexLimits> }): Promise<{ repository: Repository; course: Course; skillGraph: SkillGraph; learnerState: LearnerState; knowledgeGraph?: KnowledgeGraphSummary }>;
+  graphSummary(request: { repository: RepositoryRef }): Promise<KnowledgeGraphSummary>;
+  graphNeighborhood(request: { repository: RepositoryRef; nodeId: string; depth?: number; edgeKinds?: string[] }): Promise<{ nodes: KnowledgeGraphNode[]; edges: KnowledgeGraphEdge[] }>;
   readFile(rootPath: string, filePath: string): Promise<string>;
   detectAgents(): Promise<AgentState>;
   detectLanguageServers(): Promise<Record<string, LanguageServerRecord>>;
-  resolveSymbol(request: { repository: Repository; path: string; line: number; column?: number; symbol?: string }): Promise<SymbolResolution>;
+  resolveSymbol(request: { repository: RepositoryRef; path: string; line: number; column?: number; symbol?: string }): Promise<SymbolResolution>;
   askAgent(request: {
     provider: "codex" | "claude";
     rootPath: string;
     context: {
       lesson: Lesson;
       question: string;
-      repository: Repository;
+      repository: RepositoryRef;
       skill?: SkillNode;
       mode: ContextMode;
       scope: ContextScope;
@@ -412,12 +418,12 @@ export interface TraceBridge {
   }): Promise<AgentAnswer>;
   enhanceCourse(request: {
     provider: "codex" | "claude";
-    repository: Repository;
+    repository: RepositoryRef;
     course: Course;
   }): Promise<{ course: Course; skillGraph: SkillGraph }>;
-  loadLearning(request: { repository: Repository; skillGraph: SkillGraph }): Promise<LearnerState>;
+  loadLearning(request: { repository: RepositoryRef; skillGraph: SkillGraph }): Promise<LearnerState>;
   saveLearning(state: LearnerState): Promise<boolean>;
-  createPractice(request: { repository: Repository; lesson: Lesson }): Promise<PracticeSession>;
+  createPractice(request: { repository: RepositoryRef; lesson: Lesson }): Promise<PracticeSession>;
   inspectPractice(sessionId: string): Promise<PracticeReport>;
   openPractice(sessionId: string): Promise<boolean>;
   removePractice(request: { sessionId: string; discardChanges: boolean }): Promise<{ removed: boolean; requiresConfirmation: boolean; report?: PracticeReport }>;

@@ -48,6 +48,11 @@ function Logo() {
 
 const fontBoosts: Record<FontScale, number> = { compact: 0, comfortable: 2, large: 4 };
 
+/** The main process owns the index; the renderer only sends a repository reference. */
+function repositoryRef(repository: Repository) {
+  return { id: repository.id, rootPath: repository.rootPath };
+}
+
 /** Electron wraps main-process errors; show the learner only the actionable message. */
 function readableError(cause: unknown) {
   const raw = cause instanceof Error ? cause.message : String(cause);
@@ -848,7 +853,7 @@ export default function App() {
         context: {
           lesson: selectedLesson,
           question,
-          repository,
+          repository: repositoryRef(repository),
           skill,
           mode: options?.mode ?? "balanced",
           scope: options?.scope ?? { selection: false, currentFile: true, lesson: true, dependencies: true },
@@ -869,8 +874,8 @@ export default function App() {
     setCourseBusy(true);
     setError(null);
     try {
-      const enhanced = await bridge.enhanceCourse({ provider, repository, course });
-      const nextState = await bridge.loadLearning({ repository, skillGraph: enhanced.skillGraph });
+      const enhanced = await bridge.enhanceCourse({ provider, repository: repositoryRef(repository), course });
+      const nextState = await bridge.loadLearning({ repository: repositoryRef(repository), skillGraph: enhanced.skillGraph });
       await activateWorkspace(repository, enhanced.course, enhanced.skillGraph, nextState);
       setMessages([{ id: `enhanced-${Date.now()}`, role: "agent", text: `${provider === "codex" ? "Codex" : "Claude"} redesigned the course from the repository source. We are starting from the new first lesson, and every lesson has a validated source anchor.` }]);
     } catch (cause) {
@@ -884,7 +889,7 @@ export default function App() {
     if (!repository || !selectedLesson || practiceBusy) return;
     setPracticeBusy(true);
     try {
-      const session = await bridge.createPractice({ repository, lesson: selectedLesson });
+      const session = await bridge.createPractice({ repository: repositoryRef(repository), lesson: selectedLesson });
       setPracticeSession(session);
       setPracticeReport(null);
     } catch (cause) {
@@ -931,7 +936,7 @@ export default function App() {
   };
 
   if (!repository || !course || !selectedLesson || !skillGraph || !learnerState) {
-    return <StartScreen onOpen={openRepository} onDemo={(profile) => { void bridge.graphSummary({ repository: demoRepository }).then(setKnowledgeGraph).catch(() => setKnowledgeGraph(null)); return activateWorkspace(demoRepository, { ...demoCourse, profile, level: profile.level }, personalizeSkillGraph(demoSkillGraph, profile.goal), { ...structuredClone(demoLearnerState), diagnosticCompleted: false }); }} onCancel={cancelIndexing} busy={busy} progress={indexProgress} error={error} fontScale={fontScale} onFontScale={setFontScale} />;
+    return <StartScreen onOpen={openRepository} onDemo={(profile) => { void bridge.graphSummary({ repository: repositoryRef(demoRepository) }).then(setKnowledgeGraph).catch(() => setKnowledgeGraph(null)); return activateWorkspace(demoRepository, { ...demoCourse, profile, level: profile.level }, personalizeSkillGraph(demoSkillGraph, profile.goal), { ...structuredClone(demoLearnerState), diagnosticCompleted: false }); }} onCancel={cancelIndexing} busy={busy} progress={indexProgress} error={error} fontScale={fontScale} onFontScale={setFontScale} />;
   }
 
   const openFile = (file: RepoFile, targetLine = 1) => loadSource(repository, file, targetLine);
@@ -940,7 +945,7 @@ export default function App() {
     setResolutionBusy(true);
     try {
       const symbol = repository.symbols.find((candidate) => candidate.path === currentFile.path && candidate.line === line)?.name;
-      setResolution(await bridge.resolveSymbol({ repository, path: currentFile.path, line, column: selection?.startLine === line ? 1 : 1, symbol }));
+      setResolution(await bridge.resolveSymbol({ repository: repositoryRef(repository), path: currentFile.path, line, column: selection?.startLine === line ? 1 : 1, symbol }));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
