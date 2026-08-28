@@ -40,6 +40,43 @@ try {
   assert.equal(limits.maxFiles, 4_000);
   await page.evaluate(() => { window.__indexProgress = []; });
 
+  // Item 23: the link policy blocks hostile schemes and gates unlisted origins.
+  const linkDecisions = await page.evaluate(async () => {
+    const candidates = [
+      "https://github.com/GeeeekExplorer/nano-vllm",
+      "javascript:alert(document.cookie)",
+      "data:text/html,<script>1</script>",
+      "file:///etc/passwd",
+      "http://github.com/a/b",
+      "https://user:token@github.com/a/b",
+      "https://evil.example/steal",
+    ];
+    const results = [];
+    for (const candidate of candidates) results.push(await window.trace.classifyLink(candidate));
+    return results;
+  });
+  assert.deepEqual(linkDecisions.map((decision) => decision.decision), ["allow", "block", "block", "block", "block", "block", "confirm"]);
+  assert.deepEqual(linkDecisions.map((decision) => decision.reason), [
+    "allowlisted-origin", "blocked-scheme:javascript", "blocked-scheme:data", "blocked-scheme:file",
+    "insecure-scheme", "embedded-credentials", "unlisted-origin",
+  ]);
+  assert.ok(linkDecisions.slice(1, 6).every((decision) => decision.url === null), "blocked links must never expose a usable URL");
+
+  // A blocked link never reaches the shell, and the decision is recorded.
+  const blockedOpen = await page.evaluate(() => window.trace.openLink("javascript:alert(1)"));
+  assert.equal(blockedOpen.opened, false);
+  assert.equal(blockedOpen.decision, "block");
+  const lastDecision = await page.evaluate(() => window.trace.lastLinkDecision());
+  assert.equal(lastDecision.reason, "blocked-scheme:javascript");
+  assert.ok(lastDecision.at);
+
+  // The renderer's own link component reflects the policy.
+  await page.locator('.external-link[data-decision="allow"]').waitFor({ timeout: 30_000 });
+  await page.locator('.external-link[data-decision="confirm"]').waitFor({ timeout: 30_000 });
+  assert.equal(await page.locator('.external-link[data-decision="allow"]').getAttribute("data-reason"), "allowlisted-origin");
+  assert.equal(await page.locator('.external-link[data-decision="confirm"]').getAttribute("data-reason"), "unlisted-origin");
+  assert.equal(await page.locator('.external-link[data-decision="block"]').count(), 0);
+
   // Item 22: malformed IPC payloads are rejected by the schema layer, not the handler.
   const invalidCalls = [
     ["repository:open with a non-string source", () => window.trace.openRepository({ source: 42 }), /must be a string/],

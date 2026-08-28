@@ -12,6 +12,7 @@ import { DEFAULT_INDEX_LIMITS, IndexCancelledError, analysisCacheStats, analyzeF
 import { buildKnowledgeGraph, loadKnowledgeGraph, neighborhood, saveKnowledgeGraph } from "../electron/knowledge-graph.mjs";
 import { RemoteSourceError, cloneArguments, cloneDestination, cloneEnvironment, looksRemote, parseRemoteSource, summarizeSubmodules, verifyExistingClone } from "../electron/clone-guard.mjs";
 import { IPC_PROTOCOL_VERSION, IPC_SCHEMAS, MAX_PAYLOAD_BYTES, MAX_PAYLOAD_DEPTH, registerValidatedHandlers, schemaFor, validatePayload } from "../electron/ipc-schema.mjs";
+import { LINK_POLICY_VERSION, classifyExternalLink, confirmationPrompt, isInternalNavigation, repositoryOrigins } from "../electron/link-policy.mjs";
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
 import { detectLanguageServers, resolveImportsStatically, resolveSymbol, serverForLanguage, shutdownLanguageServers } from "../electron/language-server.mjs";
 import { answerFromLocalIndex, buildContextPack } from "../electron/context-engine.mjs";
@@ -713,6 +714,7 @@ test("a hardened clone of a local bare remote never checks out submodules", asyn
 test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () => {
   // Every channel the preload exposes must have a declared schema entry.
   const preload = ["repository:choose", "repository:open", "repository:cancel", "repository:limits", "repository:read-file",
+    "links:classify", "links:open", "links:last-decision",
     "agents:detect", "index:language-servers", "index:resolve", "graph:summary", "graph:neighborhood", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
@@ -812,4 +814,74 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
   assert.throws(() => registerValidatedHandlers(fakeIpc, { "agents:detect": () => null }), /declared without handlers/);
   const complete = Object.fromEntries(Object.keys(IPC_SCHEMAS).map((channel) => [channel, () => null]));
   assert.deepEqual(registerValidatedHandlers({ handle() {} }, complete).sort(), [...Object.keys(IPC_SCHEMAS)].sort());
+});
+
+test("external links are classified by an explicit origin policy", () => {
+  assert.equal(LINK_POLICY_VERSION, 1);
+
+  const allowed = ["https://github.com/GeeeekExplorer/nano-vllm", "https://gist.github.com/x", "https://arxiv.org/abs/2607.25996", "https://docs.python.org/3/library/asyncio.html"];
+  for (const candidate of allowed) {
+    const decision = classifyExternalLink(candidate);
+    assert.equal(decision.decision, "allow", `${candidate} -> ${decision.decision}`);
+    assert.equal(decision.reason, "allowlisted-origin");
+    assert.equal(decision.url, candidate);
+  }
+
+  const blocked = [
+    ["javascript:alert(document.cookie)", "blocked-scheme:javascript"],
+    ["JavaScript:alert(1)", "blocked-scheme:javascript"],
+    ["data:text/html,<script>fetch('https://evil.example')</script>", "blocked-scheme:data"],
+    ["file:///etc/passwd", "blocked-scheme:file"],
+    ["vbscript:msgbox(1)", "blocked-scheme:vbscript"],
+    ["about:blank", "blocked-scheme:about"],
+    ["smb://server/share", "blocked-scheme:smb"],
+    ["http://github.com/a/b", "insecure-scheme"],
+    ["https://user:token@github.com/a/b", "embedded-credentials"],
+    ["https://github.com/a/b\u0000", "control-characters"],
+    [`https://github.com/${"a".repeat(3_000)}`, "url-too-long"],
+    ["not-a-url", "unparsable"],
+    ["", "empty-url"],
+    [null, "empty-url"],
+  ];
+  for (const [candidate, reason] of blocked) {
+    const decision = classifyExternalLink(candidate);
+    assert.equal(decision.decision, "block", `${candidate} -> ${decision.decision}`);
+    assert.equal(decision.reason, reason, `${candidate} -> ${decision.reason}`);
+    assert.equal(decision.url, null, "a blocked link must never expose a usable URL");
+  }
+
+  // Everything else is gated, not silently allowed and not silently dropped.
+  for (const candidate of ["https://evil.example/steal", "https://github.com.evil.example/a", "https://internal.corp/wiki"]) {
+    const decision = classifyExternalLink(candidate);
+    assert.equal(decision.decision, "confirm", `${candidate} -> ${decision.decision}`);
+    assert.equal(decision.reason, "unlisted-origin");
+    assert.ok(decision.host);
+  }
+
+  // Subdomains of allowlisted origins are allowed; lookalike suffixes are not.
+  assert.equal(classifyExternalLink("https://raw.githubusercontent.com/a/b").decision, "confirm");
+  assert.equal(classifyExternalLink("https://docs.nvidia.com/cuda/").decision, "allow");
+  assert.equal(classifyExternalLink("https://notgithub.com/a").decision, "confirm");
+
+  // The open repository's own host is trusted without a prompt.
+  const origins = repositoryOrigins({ remoteUrl: "https://git.internal.example/team/repo.git" });
+  assert.deepEqual(origins, ["git.internal.example"]);
+  assert.equal(classifyExternalLink("https://git.internal.example/team/repo/-/issues/4", { additionalOrigins: origins }).decision, "allow");
+  assert.equal(classifyExternalLink("https://git.internal.example/x").decision, "confirm");
+  assert.deepEqual(repositoryOrigins({ remoteUrl: "git@ssh.internal.example:team/repo.git" }), ["ssh.internal.example"]);
+  assert.deepEqual(repositoryOrigins({}), []);
+
+  // The confirmation prompt always shows the exact destination and defaults to cancel.
+  const prompt = confirmationPrompt(classifyExternalLink("https://evil.example/steal"));
+  assert.match(prompt.detail, /https:\/\/evil\.example\/steal/);
+  assert.match(prompt.message, /evil\.example/);
+  assert.equal(prompt.cancelId, 0);
+  assert.equal(prompt.defaultId, 0);
+  assert.deepEqual(prompt.buttons, ["Cancel", "Open link"]);
+
+  // In-app navigation stays inside the bundle or the dev server origin.
+  assert.equal(isInternalNavigation("file:///app/dist/index.html"), true);
+  assert.equal(isInternalNavigation("http://127.0.0.1:5173/src/main.tsx", "http://127.0.0.1:5173"), true);
+  assert.equal(isInternalNavigation("https://evil.example", "http://127.0.0.1:5173"), false);
+  assert.equal(isInternalNavigation("http://127.0.0.1:9999/", "http://127.0.0.1:5173"), false);
 });

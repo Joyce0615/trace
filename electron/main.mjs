@@ -12,6 +12,7 @@ import { buildSkillGraph, reconcileLearnerState } from "./skill-graph.mjs";
 import { detectLanguageServers, resolveImportsStatically, resolveSymbol, shutdownLanguageServers } from "./language-server.mjs";
 import { buildKnowledgeGraph, loadKnowledgeGraph, neighborhood, saveKnowledgeGraph } from "./knowledge-graph.mjs";
 import { registerValidatedHandlers } from "./ipc-schema.mjs";
+import { classifyExternalLink, confirmationPrompt, isInternalNavigation, repositoryOrigins } from "./link-policy.mjs";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const openedRepositories = new Map();
@@ -53,14 +54,46 @@ function createWindow() {
     },
   });
 
+  // Nothing opens a new window; every external link goes through the policy gate.
   window.webContents.setWindowOpenHandler(({ url }) => {
-    if (/^https?:\/\//.test(url)) shell.openExternal(url);
+    void openExternalLink(window, url);
     return { action: "deny" };
   });
+
+  // The renderer may only ever navigate within its own bundle or the dev server.
+  window.webContents.on("will-navigate", (event, url) => {
+    if (isInternalNavigation(url, process.env.VITE_DEV_SERVER_URL)) return;
+    event.preventDefault();
+    void openExternalLink(window, url);
+  });
+
+  window.webContents.on("will-attach-webview", (event) => event.preventDefault());
 
   const developmentUrl = process.env.VITE_DEV_SERVER_URL;
   if (developmentUrl) window.loadURL(developmentUrl);
   else window.loadFile(path.join(currentDirectory, "..", "dist", "index.html"));
+}
+
+let lastLinkDecision = null;
+
+/**
+ * Single exit point for every outbound link. Blocked links never reach the shell,
+ * and unlisted origins require an explicit confirmation showing the destination.
+ */
+async function openExternalLink(window, candidate) {
+  const additionalOrigins = [...openedRepositories.values()].flatMap((repository) => repositoryOrigins(repository));
+  const classification = classifyExternalLink(candidate, { additionalOrigins });
+  lastLinkDecision = { ...classification, at: new Date().toISOString() };
+  if (classification.decision === "block") return { ...classification, opened: false };
+  if (classification.decision === "confirm") {
+    const prompt = confirmationPrompt(classification);
+    const { response } = window
+      ? await dialog.showMessageBox(window, { type: "question", ...prompt })
+      : await dialog.showMessageBox({ type: "question", ...prompt });
+    if (response !== 1) return { ...classification, opened: false, confirmed: false };
+  }
+  await shell.openExternal(classification.url);
+  return { ...classification, opened: true, confirmed: true };
 }
 
 /**
@@ -69,6 +102,14 @@ function createWindow() {
  * workspace invariants (is this repository open?) rather than payload shape.
  */
 const ipcHandlers = {
+  "links:classify": (_event, request) => classifyExternalLink(request.url, {
+    additionalOrigins: [...openedRepositories.values()].flatMap((repository) => repositoryOrigins(repository)),
+  }),
+
+  "links:open": async (event, request) => openExternalLink(BrowserWindow.fromWebContents(event.sender), request.url),
+
+  "links:last-decision": () => lastLinkDecision,
+
   "repository:choose": async () => {
     const result = await dialog.showOpenDialog({
       title: "Choose a codebase to learn",

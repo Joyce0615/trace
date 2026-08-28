@@ -2,7 +2,7 @@ import type { OnMount } from "@monaco-editor/react";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { browserBridge, demoCourse, demoLearnerState, demoRepository, demoSkillGraph } from "./demo";
 import { addEvidence, completeDiagnostic, personalizeSkillGraph, skillForLesson } from "./learning";
-import type { AgentState, ContextMode, ContextPack, ContextScope, Course, IndexProgress, KnowledgeGraphSummary, LearnerProfile, LearnerState, LearningMemory, Lesson, LessonContentBlock, PracticeReport, PracticeSession, Repository, RepoFile, SkillGraph, SkillNode, SymbolResolution } from "./types";
+import type { AgentState, ContextMode, ContextPack, ContextScope, Course, IndexProgress, KnowledgeGraphSummary, LearnerProfile, LinkClassification, LearnerState, LearningMemory, Lesson, LessonContentBlock, PracticeReport, PracticeSession, Repository, RepoFile, SkillGraph, SkillNode, SymbolResolution } from "./types";
 
 type TutorMode = "learn" | "ask" | "quiz" | "practice";
 type WorkspaceMode = "lesson" | "diagram" | "code" | "notes";
@@ -47,6 +47,25 @@ function Logo() {
 }
 
 const fontBoosts: Record<FontScale, number> = { compact: 0, comfortable: 2, large: 4 };
+
+/**
+ * Every outbound link is routed through the main-process policy, so the renderer
+ * can never hand a URL straight to the shell.
+ */
+function ExternalLink({ href, children, className }: { href: string; children: ReactNode; className?: string }) {
+  const [decision, setDecision] = useState<LinkClassification | null>(null);
+  useEffect(() => { void bridge.classifyLink(href).then(setDecision).catch(() => setDecision(null)); }, [href]);
+  const blocked = decision?.decision === "block";
+  return <button
+    type="button"
+    className={`external-link ${className ?? ""}`.trim()}
+    data-decision={decision?.decision ?? "pending"}
+    data-reason={decision?.reason ?? ""}
+    disabled={blocked}
+    title={blocked ? `Blocked: ${decision?.reason}` : decision?.decision === "confirm" ? `${decision.host} needs confirmation` : href}
+    onClick={() => { void bridge.openLink(href).then(setDecision).catch(() => undefined); }}
+  >{children}{decision?.decision === "confirm" && <em className="link-gate">confirm</em>}</button>;
+}
 
 /** The main process owns the index; the renderer only sends a repository reference. */
 function repositoryRef(repository: Repository) {
@@ -145,7 +164,7 @@ function StartScreen({ onOpen, onDemo, onCancel, busy, progress, error, fontScal
           <div><Icon name="terminal" /><strong>Credit-aware agents</strong><small>Transparent, budgeted context packs</small></div>
         </div>
       </main>
-      <footer className="welcome-footer">Your code stays local · Agent actions are read-only by default</footer>
+      <footer className="welcome-footer">Your code stays local · Agent actions are read-only by default · <ExternalLink href="https://github.com/GeeeekExplorer/nano-vllm">nano-vllm source</ExternalLink> · <ExternalLink href="https://unlisted.example/tracker">unlisted example</ExternalLink></footer>
     </div>
   );
 }

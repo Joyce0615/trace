@@ -188,6 +188,9 @@ export const IPC_SCHEMAS = {
     rootPath: s.string({ maxLength: 4_096 }),
     filePath: s.string({ maxLength: 4_096 }),
   }),
+  "links:classify": s.object({ url: s.string({ maxLength: 2_048 }) }),
+  "links:open": s.object({ url: s.string({ maxLength: 2_048 }) }),
+  "links:last-decision": null,
   "agents:detect": null,
   "index:language-servers": null,
   "index:resolve": s.object({

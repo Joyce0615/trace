@@ -1,4 +1,4 @@
-import type { ContextPack, ContextSection, KnowledgeGraphEdge, KnowledgeGraphNode, KnowledgeGraphSummary, LearnerState, TraceBridge } from "./types";
+import type { ContextPack, ContextSection, KnowledgeGraphEdge, KnowledgeGraphNode, KnowledgeGraphSummary, LearnerState, LinkClassification, TraceBridge } from "./types";
 import { nanoCourse, nanoLearnerState, nanoRepository, nanoSkillGraph, nanoSourceByPath } from "./nano-demo";
 
 export const demoRepository = nanoRepository;
@@ -60,6 +60,24 @@ function demoPack(request: Parameters<TraceBridge["askAgent"]>[0]): ContextPack 
   return { id: `demo-pack-${Date.now()}`, mode: context.mode, budget: modeBudget, estimatedTokens, savedTokens: context.mode === "lean" ? 3400 : 1800, sections, omitted: context.scope.dependencies ? [] : [{ title: "Dependency expansion", reason: "Disabled by learner", estimatedTokens: 1800 }], intent: /flow|call|trace/i.test(context.question) ? "trace" : "explain", cacheHit: true };
 }
 
+// The browser demo mirrors the desktop policy so behaviour is identical in tests.
+const browserAllowedOrigins = ["github.com", "gitlab.com", "arxiv.org", "developer.mozilla.org", "docs.python.org", "pytorch.org"];
+
+function classifyLinkInBrowser(candidate: string): LinkClassification {
+  const raw = String(candidate ?? "").trim();
+  if (!raw) return { decision: "block", reason: "empty-url", url: null, host: null };
+  if (/^(javascript|data|vbscript|file|blob|about):/i.test(raw)) {
+    return { decision: "block", reason: `blocked-scheme:${raw.split(":")[0].toLowerCase()}`, url: null, host: null };
+  }
+  let url: URL;
+  try { url = new URL(raw); } catch { return { decision: "block", reason: "unparsable", url: null, host: null }; }
+  if (url.protocol === "http:") return { decision: "block", reason: "insecure-scheme", url: null, host: url.hostname };
+  if (url.protocol !== "https:") return { decision: "block", reason: `blocked-scheme:${url.protocol.replace(":", "")}`, url: null, host: url.hostname };
+  const host = url.hostname.toLowerCase();
+  const allowed = browserAllowedOrigins.some((origin) => host === origin || host.endsWith(`.${origin}`));
+  return { decision: allowed ? "allow" : "confirm", reason: allowed ? "allowlisted-origin" : "unlisted-origin", url: url.toString(), host };
+}
+
 export const browserBridge: TraceBridge = {
   async chooseRepository() { return null; },
   async cancelRepositoryOpen() { return false; },
@@ -75,6 +93,17 @@ export const browserBridge: TraceBridge = {
     return { nodes, edges };
   },
   async readFile(_rootPath, filePath) { return nanoSourceByPath[filePath] ?? `# Preview unavailable for ${filePath}`; },
+  async classifyLink(url) { return classifyLinkInBrowser(url); },
+  async openLink(url) {
+    const classification = classifyLinkInBrowser(url);
+    if (classification.decision === "block") return { ...classification, opened: false };
+    if (classification.decision === "confirm" && !window.confirm(`Open ${classification.host} in your browser?\n\n${classification.url}`)) {
+      return { ...classification, opened: false, confirmed: false };
+    }
+    window.open(classification.url ?? "", "_blank", "noopener,noreferrer");
+    return { ...classification, opened: true, confirmed: true };
+  },
+  async lastLinkDecision() { return null; },
   async detectAgents() { return { codex: { available: true, version: "demo" }, claude: { available: true, version: "demo" } }; },
   async detectLanguageServers() {
     return { pyright: { id: "pyright", command: "pyright-langserver", available: false, binary: null, languages: ["python"] } };

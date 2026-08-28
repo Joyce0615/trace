@@ -368,3 +368,8 @@ button { color: inherit; }
 .index-cancel { margin-left: auto; padding: 4px 11px; border: 1px solid #3a2b30; border-radius: 6px; background: #1a1418; color: #d08b8b; font-size: calc(9px + var(--font-boost)); cursor: pointer; }
 .index-cancel:hover { border-color: #5b3d43; color: #e8a5a5; }
 .index-truncation { margin-top: 8px; padding: 7px 10px; border: 1px solid #3a3222; border-radius: 7px; background: #16130d; color: #c8ad72; font-size: calc(9px + var(--font-boost)); }
+
+.external-link { display: inline-flex; align-items: center; gap: 5px; padding: 0; border: 0; background: none; color: #7fa7d8; font: inherit; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+.external-link:hover:not(:disabled) { color: #a8c8ec; }
+.external-link:disabled { color: #5a5f68; text-decoration: line-through; cursor: not-allowed; }
+.external-link .link-gate { font-size: .78em; font-style: normal; letter-spacing: .08em; color: #c8ad72; border: 1px solid #3a3222; border-radius: 4px; padding: 0 4px; text-decoration: none; }

@@ -335,6 +335,16 @@ export interface IndexTruncation {
   indexedBytes?: number;
 }
 
+export interface LinkClassification {
+  decision: "allow" | "confirm" | "block";
+  reason: string;
+  url: string | null;
+  host: string | null;
+  opened?: boolean;
+  confirmed?: boolean;
+  at?: string;
+}
+
 export interface LanguageServerRecord {
   id: string;
   command: string;
@@ -399,6 +409,9 @@ export interface TraceBridge {
   graphSummary(request: { repository: RepositoryRef }): Promise<KnowledgeGraphSummary>;
   graphNeighborhood(request: { repository: RepositoryRef; nodeId: string; depth?: number; edgeKinds?: string[] }): Promise<{ nodes: KnowledgeGraphNode[]; edges: KnowledgeGraphEdge[] }>;
   readFile(rootPath: string, filePath: string): Promise<string>;
+  classifyLink(url: string): Promise<LinkClassification>;
+  openLink(url: string): Promise<LinkClassification>;
+  lastLinkDecision(): Promise<LinkClassification | null>;
   detectAgents(): Promise<AgentState>;
   detectLanguageServers(): Promise<Record<string, LanguageServerRecord>>;
   resolveSymbol(request: { repository: RepositoryRef; path: string; line: number; column?: number; symbol?: string }): Promise<SymbolResolution>;

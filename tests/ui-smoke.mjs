@@ -46,6 +46,15 @@ try {
   assert.equal(await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--font-boost").trim()), "4px");
   await page.reload({ waitUntil: "networkidle" });
   assert.equal(await page.getByRole("button", { name: "Large text" }).getAttribute("aria-pressed"), "true");
+  // Item 23: external links are classified before they are clickable.
+  await page.locator('.external-link[data-decision="allow"]').waitFor();
+  assert.equal(await page.locator('.external-link[data-decision="allow"]').getAttribute("data-reason"), "allowlisted-origin");
+  const gated = page.locator('.external-link[data-decision="confirm"]');
+  await gated.waitFor();
+  assert.equal(await gated.getAttribute("data-reason"), "unlisted-origin");
+  assert.equal(await gated.locator(".link-gate").innerText(), "confirm");
+  page.once("dialog", (dialog) => dialog.dismiss());
+  await gated.click();
   await page.screenshot({ path: path.join(artifactDirectory, "welcome.png") });
   await page.getByRole("button", { name: /Explore nano-vllm/ }).click();
   await page.getByRole("dialog", { name: "Adaptive skill assessment" }).waitFor();
