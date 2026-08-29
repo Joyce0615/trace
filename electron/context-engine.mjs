@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { readRepositoryFile } from "./repository.mjs";
+import { detectInjection } from "./prompt-isolation.mjs";
 
 const BUDGETS = { lean: 2_400, balanced: 5_200, deep: 10_000 };
 const excerptCache = new Map();
@@ -32,7 +33,12 @@ async function excerpt(repository, filePath, startLine, endLine) {
   return { content, cached: false };
 }
 
+// `instruction` is the only section Trace authors; everything else originates in
+// the repository or the learner and is therefore scanned and fenced downstream.
+const TRUSTED_SECTION_KINDS = new Set(["instruction"]);
+
 function section(kind, title, reason, content, priority, source, cached = false) {
+  const untrusted = !TRUSTED_SECTION_KINDS.has(kind);
   return {
     id: createHash("sha1").update(`${kind}:${title}:${source ?? ""}`).digest("hex").slice(0, 10),
     kind,
@@ -43,6 +49,8 @@ function section(kind, title, reason, content, priority, source, cached = false)
     estimatedTokens: estimateTokens(content),
     priority,
     cached,
+    untrusted,
+    injectionFindings: untrusted ? detectInjection(content) : [],
   };
 }
 
@@ -129,6 +137,7 @@ export async function buildContextPack(repository, context) {
     sections,
     omitted,
     intent,
+    injectionFindings: sections.flatMap((item) => (item.injectionFindings ?? []).map((finding) => ({ ...finding, section: item.title, source: item.source ?? null }))),
     cacheHit: sections.filter((item) => item.kind === "source" || item.kind === "selection").every((item) => item.cached),
   };
 }

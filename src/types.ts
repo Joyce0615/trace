@@ -232,6 +232,17 @@ export interface ContextSection {
   estimatedTokens: number;
   priority: number;
   cached: boolean;
+  untrusted?: boolean;
+  injectionFindings?: InjectionFinding[];
+}
+
+export interface InjectionFinding {
+  id: string;
+  severity: "high" | "medium";
+  excerpt: string;
+  line: number;
+  section?: string;
+  source?: string | null;
 }
 
 export interface ContextPack {
@@ -243,6 +254,7 @@ export interface ContextPack {
   sections: ContextSection[];
   omitted: Array<{ title: string; reason: string; estimatedTokens: number }>;
   intent: "lookup" | "explain" | "trace" | "design" | "practice";
+  injectionFindings?: InjectionFinding[];
   cacheHit: boolean;
 }
 

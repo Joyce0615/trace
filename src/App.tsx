@@ -535,7 +535,12 @@ function ContextPackCard({ pack }: { pack: ContextPack }) {
   const [open, setOpen] = useState(false);
   return <div className="context-pack-card">
     <button onClick={() => setOpen((value) => !value)}><span><Icon name="layers" size={13} /><strong>{pack.estimatedTokens.toLocaleString()}</strong> est. tokens</span><em>{pack.savedTokens.toLocaleString()} saved</em><Icon name="chevron" size={12} /></button>
-    {open && <div className="context-pack-detail"><div><span>{pack.mode.toUpperCase()} PACK</span><strong>{pack.sections.length} included · {pack.omitted.length} omitted</strong></div>{pack.sections.map((section) => <article key={section.id}><span>{section.kind}</span><strong>{section.title}</strong><small>{section.reason}</small><em>{section.estimatedTokens} tok{section.cached ? " · cached" : ""}</em></article>)}</div>}
+    {(pack.injectionFindings?.length ?? 0) > 0 && <div className="injection-warning" data-findings={pack.injectionFindings?.length}>
+      <Icon name="target" size={12} />
+      <span>{pack.injectionFindings?.length} prompt-injection pattern{(pack.injectionFindings?.length ?? 0) > 1 ? "s" : ""} found in repository content</span>
+      <small>{[...new Set((pack.injectionFindings ?? []).map((finding) => finding.id))].join(", ")} · fenced as untrusted data</small>
+    </div>}
+    {open && <div className="context-pack-detail"><div><span>{pack.mode.toUpperCase()} PACK</span><strong>{pack.sections.length} included · {pack.omitted.length} omitted</strong></div>{pack.sections.map((section) => <article key={section.id} data-untrusted={section.untrusted ? "true" : "false"}><span>{section.kind}</span><strong>{section.title}</strong><small>{section.reason}</small><em>{section.estimatedTokens} tok{section.cached ? " · cached" : ""}{section.untrusted ? " · fenced" : " · trusted"}</em></article>)}</div>}
   </div>;
 }
 

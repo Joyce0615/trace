@@ -46,7 +46,7 @@ function demoPack(request: Parameters<TraceBridge["askAgent"]>[0]): ContextPack 
   const context = request.context;
   const modeBudget = { lean: 2400, balanced: 5200, deep: 10000 }[context.mode];
   const sections: ContextSection[] = [
-    { id: "lesson", kind: "lesson" as const, title: context.lesson.title, reason: "Active learning objective", content: context.lesson.objective, estimatedTokens: Math.ceil(context.lesson.objective.length / 4), priority: 95, cached: true },
+    { id: "lesson", kind: "lesson" as const, title: context.lesson.title, reason: "Active learning objective", content: context.lesson.objective, estimatedTokens: Math.ceil(context.lesson.objective.length / 4), priority: 95, cached: true, untrusted: true, injectionFindings: [] },
   ];
   if (context.openFile && context.scope.currentFile) {
     const source = nanoSourceByPath[context.openFile.path] ?? "";
@@ -57,7 +57,7 @@ function demoPack(request: Parameters<TraceBridge["askAgent"]>[0]): ContextPack 
     sections.push({ id: "memory", kind: "memory" as const, title: "Learning memory", reason: "Keeps established concepts without replaying chat history", content, estimatedTokens: Math.ceil(content.length / 4), priority: 80, cached: true });
   }
   const estimatedTokens = sections.reduce((sum, item) => sum + item.estimatedTokens, 140);
-  return { id: `demo-pack-${Date.now()}`, mode: context.mode, budget: modeBudget, estimatedTokens, savedTokens: context.mode === "lean" ? 3400 : 1800, sections, omitted: context.scope.dependencies ? [] : [{ title: "Dependency expansion", reason: "Disabled by learner", estimatedTokens: 1800 }], intent: /flow|call|trace/i.test(context.question) ? "trace" : "explain", cacheHit: true };
+  return { id: `demo-pack-${Date.now()}`, mode: context.mode, budget: modeBudget, estimatedTokens, savedTokens: context.mode === "lean" ? 3400 : 1800, sections, omitted: context.scope.dependencies ? [] : [{ title: "Dependency expansion", reason: "Disabled by learner", estimatedTokens: 1800 }], intent: /flow|call|trace/i.test(context.question) ? "trace" : "explain", injectionFindings: [], cacheHit: true };
 }
 
 // The browser demo mirrors the desktop policy so behaviour is identical in tests.

@@ -198,6 +198,34 @@ try {
   await page.getByText(/_log_import_version is defined at flashinfer\/__init__\.py:/).waitFor({ timeout: 30_000 });
   await page.getByText(/0 agent credits/).waitFor();
   await page.screenshot({ path: path.join(artifactDirectory, "flashinfer-electron-chat.png") });
+  // Item 24: repository content reaches the agent only as fenced, scanned data.
+  const packAudit = await page.evaluate(async () => {
+    const workspace = window.traceWorkspace;
+    const lesson = workspace.course.modules[0].lessons[0];
+    const answer = await window.trace.askAgent({
+      provider: "codex",
+      rootPath: workspace.repository.rootPath,
+      context: {
+        lesson,
+        question: "Where is _log_import_version defined?",
+        repository: { id: workspace.repository.id, rootPath: workspace.repository.rootPath },
+        mode: "lean",
+        scope: { selection: false, currentFile: false, lesson: true, dependencies: false },
+        memory: [],
+      },
+    });
+    return {
+      answeredBy: answer.answeredBy,
+      sections: answer.pack.sections.map((section) => ({ kind: section.kind, untrusted: section.untrusted })),
+      findings: answer.pack.injectionFindings,
+    };
+  });
+  assert.equal(packAudit.answeredBy, "local-index");
+  assert.ok(packAudit.sections.length > 1);
+  assert.deepEqual(packAudit.sections.filter((section) => !section.untrusted).map((section) => section.kind), ["instruction"]);
+  assert.ok(packAudit.sections.filter((section) => section.untrusted).length >= 1);
+  assert.ok(Array.isArray(packAudit.findings));
+
   await page.getByRole("button", { name: "Learn", exact: true }).click();
   await page.getByText("YOUR NEXT MOVE").waitFor();
   await page.getByRole("button", { name: "Take checkpoint" }).waitFor();

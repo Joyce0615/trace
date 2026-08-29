@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { buildIsolatedPrompt } from "./prompt-isolation.mjs";
 
 const COURSE_SCHEMA = {
   type: "object",
@@ -107,30 +108,30 @@ export async function detectAgents() {
   return { codex, claude };
 }
 
+/**
+ * Build the tutor prompt with a hard trust boundary: repository content is fenced
+ * as untrusted data and can never act as instruction. Returns the prompt plus the
+ * injection findings so the renderer can warn the learner.
+ */
 function tutorPrompt(context) {
   const lesson = context.lesson;
   const anchorText = lesson.anchors
     .map((anchor) => `${anchor.path}:${anchor.line}${anchor.symbol ? ` (${anchor.symbol})` : ""}`)
     .join(", ");
-  const packedContext = context.contextPack?.sections
-    ?.map((section) => `### ${section.title}${section.source ? ` (${section.source})` : ""}\nReason included: ${section.reason}\n${section.content}`)
-    .join("\n\n") ?? "No additional context was selected.";
-
-  return `You are a patient codebase tutor. You are teaching the repository in your current working directory.
-
-Active lesson: ${lesson.title}
-Learning objective: ${lesson.objective}
-Relevant code anchors: ${anchorText || "Use the repository index to find the best anchor."}
-Learner question: ${context.question}
-
-Context pack (${context.contextPack?.mode ?? "balanced"}, approximately ${context.contextPack?.estimatedTokens ?? "unknown"} tokens):
-${packedContext}
-
-Answer in concise, approachable English. Ground every important explanation in this repository. Cite source locations as relative/path.ext:line. Guide the learner with one concrete next observation or action. Do not modify files or run destructive commands.`;
+  const instruction = [
+    `Relevant code anchors: ${anchorText || "Use the repository index to find the best anchor."}`,
+    `Context pack: ${context.contextPack?.mode ?? "balanced"}, approximately ${context.contextPack?.estimatedTokens ?? "unknown"} tokens.`,
+  ].join("\n");
+  return buildIsolatedPrompt({
+    instruction,
+    lesson,
+    sections: context.contextPack?.sections ?? [],
+    question: context.question,
+  });
 }
 
 export async function askAgent(provider, rootPath, context) {
-  const prompt = tutorPrompt(context);
+  const { prompt } = tutorPrompt(context);
   if (provider === "codex") {
     return execute(
       "codex",
@@ -180,6 +181,8 @@ function parseStructuredOutput(output) {
   if (typeof parsed?.result === "string") return JSON.parse(parsed.result.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, ""));
   return parsed;
 }
+
+export { tutorPrompt };
 
 export async function generateCourseWithAgent(provider, rootPath, repository, starterCourse) {
   const prompt = coursePrompt(repository, starterCourse);
