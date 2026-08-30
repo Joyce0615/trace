@@ -234,6 +234,18 @@ export interface ContextSection {
   cached: boolean;
   untrusted?: boolean;
   injectionFindings?: InjectionFinding[];
+  redacted?: boolean;
+  secretFindings?: SecretFinding[];
+}
+
+export interface SecretFinding {
+  id: string;
+  severity: "critical" | "high" | "medium" | "low";
+  line: number;
+  preview: string;
+  length: number;
+  section?: string;
+  source?: string | null;
 }
 
 export interface InjectionFinding {
@@ -255,6 +267,9 @@ export interface ContextPack {
   omitted: Array<{ title: string; reason: string; estimatedTokens: number }>;
   intent: "lookup" | "explain" | "trace" | "design" | "practice";
   injectionFindings?: InjectionFinding[];
+  secretFindings?: SecretFinding[];
+  redactedSections?: number;
+  secretSummary?: { total: number; critical: number; high: number; byType: Record<string, number> };
   cacheHit: boolean;
 }
 

@@ -3,6 +3,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { readRepositoryFile } from "./repository.mjs";
 import { detectInjection } from "./prompt-isolation.mjs";
+import { redactValue, scanContextPack, summarizeFindings } from "./secret-scanner.mjs";
 
 const BUDGETS = { lean: 2_400, balanced: 5_200, deep: 10_000 };
 const excerptCache = new Map();
@@ -128,7 +129,7 @@ export async function buildContextPack(repository, context) {
     }
   }
   const naiveTotal = candidates.reduce((sum, candidate) => sum + candidate.estimatedTokens, estimateTokens(context.question));
-  return {
+  const pack = {
     id: createHash("sha256").update(`${repository.versionId}:${context.lesson.id}:${mode}:${context.question}:${sections.map((item) => item.id).join(":")}`).digest("hex").slice(0, 16),
     mode,
     budget,
@@ -140,6 +141,9 @@ export async function buildContextPack(repository, context) {
     injectionFindings: sections.flatMap((item) => (item.injectionFindings ?? []).map((finding) => ({ ...finding, section: item.title, source: item.source ?? null }))),
     cacheHit: sections.filter((item) => item.kind === "source" || item.kind === "selection").every((item) => item.cached),
   };
+  // Nothing leaves the machine before it is scanned and redacted.
+  const scanned = scanContextPack(pack);
+  return { ...scanned, secretSummary: summarizeFindings(scanned.secretFindings) };
 }
 
 function responsePath(directory, key) {
@@ -158,6 +162,7 @@ export async function saveCachedResponse(directory, key, value) {
   await mkdir(directory, { recursive: true });
   const destination = responsePath(directory, key);
   const temporary = `${destination}.${process.pid}.tmp`;
-  await writeFile(temporary, JSON.stringify(value, null, 2));
+  // Cached agent output is scanned again: a model can echo a secret it was shown.
+  await writeFile(temporary, JSON.stringify(redactValue(value), null, 2));
   await rename(temporary, destination);
 }

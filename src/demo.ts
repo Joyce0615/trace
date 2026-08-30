@@ -57,7 +57,7 @@ function demoPack(request: Parameters<TraceBridge["askAgent"]>[0]): ContextPack 
     sections.push({ id: "memory", kind: "memory" as const, title: "Learning memory", reason: "Keeps established concepts without replaying chat history", content, estimatedTokens: Math.ceil(content.length / 4), priority: 80, cached: true });
   }
   const estimatedTokens = sections.reduce((sum, item) => sum + item.estimatedTokens, 140);
-  return { id: `demo-pack-${Date.now()}`, mode: context.mode, budget: modeBudget, estimatedTokens, savedTokens: context.mode === "lean" ? 3400 : 1800, sections, omitted: context.scope.dependencies ? [] : [{ title: "Dependency expansion", reason: "Disabled by learner", estimatedTokens: 1800 }], intent: /flow|call|trace/i.test(context.question) ? "trace" : "explain", injectionFindings: [], cacheHit: true };
+  return { id: `demo-pack-${Date.now()}`, mode: context.mode, budget: modeBudget, estimatedTokens, savedTokens: context.mode === "lean" ? 3400 : 1800, sections, omitted: context.scope.dependencies ? [] : [{ title: "Dependency expansion", reason: "Disabled by learner", estimatedTokens: 1800 }], intent: /flow|call|trace/i.test(context.question) ? "trace" : "explain", injectionFindings: [], secretFindings: [], redactedSections: 0, secretSummary: { total: 0, critical: 0, high: 0, byType: {} }, cacheHit: true };
 }
 
 // The browser demo mirrors the desktop policy so behaviour is identical in tests.

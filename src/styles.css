@@ -377,3 +377,7 @@ button { color: inherit; }
 .injection-warning { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 7px; padding: 7px 9px; border: 1px solid #4a2f2f; border-radius: 7px; background: #1a1113; color: #dfa2a2; font-size: calc(9px + var(--font-boost)); }
 .injection-warning small { width: 100%; color: #8f6f6f; font-size: calc(8px + var(--font-boost)); }
 .context-pack-detail article[data-untrusted="true"] > span::after { content: " · untrusted"; color: #a5806a; }
+
+.secret-warning { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 7px; padding: 7px 9px; border: 1px solid #3d3a24; border-radius: 7px; background: #16150d; color: #d8c78a; font-size: calc(9px + var(--font-boost)); }
+.secret-warning small { width: 100%; color: #86804f; font-size: calc(8px + var(--font-boost)); }
+.secret-warning[data-critical="0"] { border-color: #333a2a; }

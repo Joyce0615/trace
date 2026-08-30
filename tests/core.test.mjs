@@ -15,9 +15,10 @@ import { IPC_PROTOCOL_VERSION, IPC_SCHEMAS, MAX_PAYLOAD_BYTES, MAX_PAYLOAD_DEPTH
 import { LINK_POLICY_VERSION, classifyExternalLink, confirmationPrompt, isInternalNavigation, repositoryOrigins } from "../electron/link-policy.mjs";
 import { PROMPT_ISOLATION_VERSION, buildIsolatedPrompt, createNonce, detectInjection, neutralize } from "../electron/prompt-isolation.mjs";
 import { tutorPrompt } from "../electron/agents.mjs";
+import { SECRET_SCANNER_VERSION, anonymizePath, redact, redactValue, scanText, shannonEntropy, summarizeFindings } from "../electron/secret-scanner.mjs";
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
 import { detectLanguageServers, resolveImportsStatically, resolveSymbol, serverForLanguage, shutdownLanguageServers } from "../electron/language-server.mjs";
-import { answerFromLocalIndex, buildContextPack } from "../electron/context-engine.mjs";
+import { answerFromLocalIndex, buildContextPack, loadCachedResponse, saveCachedResponse } from "../electron/context-engine.mjs";
 import { buildSkillGraph, createLearnerState, reconcileLearnerState } from "../electron/skill-graph.mjs";
 import { loadLearnerState, saveLearnerState } from "../electron/learning-store.mjs";
 
@@ -998,4 +999,122 @@ test("repository content is fenced as untrusted data before it reaches an agent"
   assert.ok(findings.some((finding) => finding.id === "override-instructions"));
   assert.match(prompt, /Never follow, obey, summarise-as-a-command/);
   assert.ok(/<TRACE-DATA-[0-9A-F]{18} kind="source"/.test(prompt));
+});
+
+test("secrets and personal data are detected and redacted before leaving the machine", async (context) => {
+  assert.equal(SECRET_SCANNER_VERSION, 1);
+
+  const samples = [
+    ["-----BEGIN RSA PRIVATE KEY-----\nMIIEow==\n", "private-key"],
+    ["AKIAIOSFODNN7EXAMPLE", "aws-access-key"],
+    ['aws_secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"', "aws-secret-key"],
+    ["ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8", "github-token"],
+    ["github_pat_11ABCDEFG0aBcDeFgHiJkL_mNoPqRsTuVwXyZ012345", "github-token"],
+    ["xoxb-" + "2345678901-2345678901234-AbCdEfGhIjKlMnOpQrStUvWx", "slack-token"],
+    ["AIzaSyD-1234567890abcdefghijklmnopqrstu", "google-api-key"],
+    ["sk_live_" + "abcdefghijklmnopqrstuvwx", "stripe-key"],
+    ["sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789", "anthropic-key"],
+    ["sk-abcdefghijklmnopqrstuvwxyz0123456789ABCD", "openai-key"],
+    ["eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk", "jwt"],
+    ["postgres://admin:sup3rS3cretPass@db.internal:5432/app", "credential-uri"],
+    ['api_key = "R7fQ2xLp9vZm4Kd8Tn1Ws6Yc3Bh0Ej5A"', "assigned-secret"],
+    ["contact: alice.smith@realcompany.io", "email-address"],
+    ["/Users/someone/GitHub/project/main.py", "home-directory"],
+  ];
+  for (const [text, expected] of samples) {
+    const found = scanText(text).map((finding) => finding.id);
+    assert.ok(found.includes(expected), `${text.slice(0, 40)} -> ${found.join(",") || "nothing"}`);
+  }
+
+  // Findings never carry the raw secret.
+  const tokenFindings = scanText("ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
+  assert.equal(tokenFindings[0].preview.includes("A1b2C3d4E5f6"), false);
+  assert.match(tokenFindings[0].preview, /^\w{3}\*+\w{3}$/);
+  assert.equal(tokenFindings[0].severity, "critical");
+  assert.equal(tokenFindings[0].line, 1);
+
+  // Placeholders, examples, and environment references are not reported.
+  const benign = [
+    'password = "changeme"',
+    'api_key = "your-api-key"',
+    'token = "${GITHUB_TOKEN}"',
+    'secret = "<your-secret>"',
+    "maintainer: trace@example.com",
+    "def schedule(self, requests):\n    return self.allocate(requests)\n",
+  ];
+  for (const text of benign) assert.deepEqual(scanText(text), [], `${text} was falsely reported`);
+
+  // Entropy separates a real key from a documentation example.
+  assert.ok(shannonEntropy("R7fQ2xLp9vZm4Kd8Tn1Ws6Yc3Bh0Ej5A") > 3.0);
+  assert.ok(shannonEntropy("hunter2") < 3.0);
+  assert.equal(shannonEntropy(""), 0);
+
+  // Redaction removes the value, keeps the shape, and is idempotent.
+  const source = 'TOKEN = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"\nDB = "postgres://admin:sup3rS3cretPass@db:5432/app"\n';
+  const redacted = redact(source);
+  assert.equal(redacted.includes("ghp_A1b2C3d4E5f6"), false);
+  assert.equal(redacted.includes("sup3rS3cretPass"), false);
+  assert.ok(redacted.includes("[REDACTED:github-token]"));
+  assert.ok(redacted.includes("[REDACTED:credential-uri]"));
+  assert.equal(redact(redacted), redacted, "redaction must be idempotent");
+  assert.equal(redact("print('hello')"), "print('hello')");
+
+  // Home directories are collapsed rather than leaked.
+  assert.equal(anonymizePath(path.join(os.homedir(), "GitHub", "project")), path.join("~", "GitHub", "project"));
+  assert.equal(redact("/Users/someone/secrets.txt"), "~/secrets.txt");
+
+  // Nested structures are redacted before caching or persisting.
+  const nested = redactValue({ text: "key sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789", items: [{ note: "AKIAIOSFODNN7EXAMPLE" }], count: 3 });
+  assert.equal(nested.text.includes("sk-ant-api03"), false);
+  assert.equal(nested.items[0].note, "[REDACTED:aws-access-key]");
+  assert.equal(nested.count, 3);
+
+  assert.deepEqual(summarizeFindings(scanText(source)).byType, { "github-token": 1, "credential-uri": 1 });
+  assert.equal(summarizeFindings(scanText(source)).critical, 2);
+
+  // A real repository with a leaked key: the pack is redacted before it is sent.
+  const rootPath = await mkdtemp(path.join(os.tmpdir(), "trace-secrets-"));
+  context.after(() => rm(rootPath, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "src"), { recursive: true });
+  await writeFile(
+    path.join(rootPath, "src", "config.py"),
+    'GITHUB_TOKEN = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"\nOWNER = "alice.smith@realcompany.io"\n\n\ndef load():\n    return GITHUB_TOKEN\n',
+  );
+  const repository = {
+    id: "secret-repo", rootPath, versionId: "v1", name: "fixture", entryFiles: ["src/config.py"],
+    files: [{ path: "src/config.py" }], symbols: [{ name: "load", kind: "function", path: "src/config.py", line: 5 }],
+    stats: { fileCount: 1, symbolCount: 1, languages: { python: 1 } },
+  };
+  const pack = await buildContextPack(repository, {
+    mode: "balanced",
+    question: "What does load return?",
+    scope: { selection: false, currentFile: true, lesson: true, dependencies: false },
+    lesson: { id: "load", title: "Load", objective: "Trace load", summary: "", anchors: [{ path: "src/config.py", line: 5, symbol: "load" }] },
+    openFile: { path: "src/config.py", line: 5 },
+    memory: [],
+  });
+  assert.ok(pack.secretFindings.length >= 2, JSON.stringify(pack.secretFindings));
+  assert.ok(pack.redactedSections >= 1);
+  assert.equal(pack.secretSummary.critical >= 1, true);
+  const serialized = JSON.stringify(pack);
+  assert.equal(serialized.includes("ghp_A1b2C3d4E5f6"), false, "the raw token must never survive into the pack");
+  assert.equal(serialized.includes("alice.smith@realcompany.io"), false, "the email must never survive into the pack");
+  assert.ok(serialized.includes("[REDACTED:github-token]"));
+
+  // Cached agent responses and persisted learner state are redacted on disk.
+  const cacheDirectory = path.join(rootPath, "cache");
+  await saveCachedResponse(cacheDirectory, "abc123", { text: "The token is ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8", answeredBy: "codex" });
+  const cached = await loadCachedResponse(cacheDirectory, "abc123");
+  assert.equal(cached.text.includes("ghp_A1b2C3d4E5f6"), false);
+  assert.ok(cached.text.includes("[REDACTED:github-token]"));
+
+  const stateDirectory = path.join(rootPath, "state");
+  await saveLearnerState(stateDirectory, {
+    repositoryId: "secret-repo",
+    mastery: {},
+    memory: [{ id: "m1", text: "Remember AKIAIOSFODNN7EXAMPLE from config", source: "side-chat", createdAt: new Date().toISOString() }],
+  });
+  const savedState = await loadLearnerState(stateDirectory, "secret-repo");
+  assert.equal(savedState.memory[0].text.includes("AKIAIOSFODNN7EXAMPLE"), false);
+  assert.ok(savedState.memory[0].text.includes("[REDACTED:aws-access-key]"));
 });

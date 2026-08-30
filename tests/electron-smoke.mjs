@@ -226,6 +226,37 @@ try {
   assert.ok(packAudit.sections.filter((section) => section.untrusted).length >= 1);
   assert.ok(Array.isArray(packAudit.findings));
 
+  // Item 25: the pack carries a secret-scan verdict and never a raw secret.
+  const secretAudit = await page.evaluate(async () => {
+    const workspace = window.traceWorkspace;
+    const lesson = workspace.course.modules[0].lessons[0];
+    const answer = await window.trace.askAgent({
+      provider: "codex",
+      rootPath: workspace.repository.rootPath,
+      context: {
+        lesson,
+        question: "Summarise this module",
+        repository: { id: workspace.repository.id, rootPath: workspace.repository.rootPath },
+        mode: "balanced",
+        scope: { selection: false, currentFile: false, lesson: true, dependencies: true },
+        memory: [],
+      },
+    });
+    return {
+      summary: answer.pack.secretSummary,
+      redactedSections: answer.pack.redactedSections,
+      findings: answer.pack.secretFindings,
+      serialized: JSON.stringify(answer.pack),
+    };
+  });
+  assert.equal(typeof secretAudit.summary.total, "number");
+  assert.equal(typeof secretAudit.redactedSections, "number");
+  assert.ok(Array.isArray(secretAudit.findings));
+  // Findings only ever carry masked previews.
+  assert.ok(secretAudit.findings.every((finding) => /\*/.test(finding.preview) || finding.preview.length <= 8));
+  // The learner's home directory is never echoed back into the pack.
+  assert.equal(/\/Users\/[A-Za-z0-9._-]+\//.test(secretAudit.serialized), false, "an absolute home path leaked into the context pack");
+
   await page.getByRole("button", { name: "Learn", exact: true }).click();
   await page.getByText("YOUR NEXT MOVE").waitFor();
   await page.getByRole("button", { name: "Take checkpoint" }).waitFor();

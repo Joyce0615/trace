@@ -535,6 +535,11 @@ function ContextPackCard({ pack }: { pack: ContextPack }) {
   const [open, setOpen] = useState(false);
   return <div className="context-pack-card">
     <button onClick={() => setOpen((value) => !value)}><span><Icon name="layers" size={13} /><strong>{pack.estimatedTokens.toLocaleString()}</strong> est. tokens</span><em>{pack.savedTokens.toLocaleString()} saved</em><Icon name="chevron" size={12} /></button>
+    {(pack.secretFindings?.length ?? 0) > 0 && <div className="secret-warning" data-findings={pack.secretFindings?.length} data-critical={pack.secretSummary?.critical ?? 0}>
+      <Icon name="target" size={12} />
+      <span>{pack.secretFindings?.length} secret/PII match{(pack.secretFindings?.length ?? 0) > 1 ? "es" : ""} redacted before sending</span>
+      <small>{Object.entries(pack.secretSummary?.byType ?? {}).map(([type, count]) => `${type} ×${count}`).join(", ")}</small>
+    </div>}
     {(pack.injectionFindings?.length ?? 0) > 0 && <div className="injection-warning" data-findings={pack.injectionFindings?.length}>
       <Icon name="target" size={12} />
       <span>{pack.injectionFindings?.length} prompt-injection pattern{(pack.injectionFindings?.length ?? 0) > 1 ? "s" : ""} found in repository content</span>

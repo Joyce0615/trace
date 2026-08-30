@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { redactValue } from "./secret-scanner.mjs";
 
 function statePath(directory, repositoryId) {
   const key = createHash("sha256").update(repositoryId).digest("hex").slice(0, 24);
@@ -20,7 +21,8 @@ export async function saveLearnerState(directory, state) {
   await mkdir(directory, { recursive: true });
   const destination = statePath(directory, state.repositoryId);
   const temporary = `${destination}.${process.pid}.tmp`;
-  await writeFile(temporary, JSON.stringify({ ...state, updatedAt: new Date().toISOString() }, null, 2));
+  // Learner notes and saved agent answers can quote source, so persisted state is redacted.
+  await writeFile(temporary, JSON.stringify(redactValue({ ...state, updatedAt: new Date().toISOString() }), null, 2));
   await rename(temporary, destination);
   return true;
 }
