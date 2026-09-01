@@ -169,6 +169,43 @@ try {
   const hood = await page.evaluate(() => window.trace.graphNeighborhood({ repository: { id: window.traceWorkspace.repository.id, rootPath: window.traceWorkspace.repository.rootPath }, nodeId: `repository:${window.traceWorkspace.repository.id}`, depth: 1 }));
   assert.ok(hood.nodes.length > 1 && hood.edges.length > 1, JSON.stringify({ nodes: hood.nodes.length, edges: hood.edges.length }));
 
+  // Item 26: cross-file call chains derived from the real index and graded in main.
+  const chainAudit = await page.evaluate(async () => {
+    const repository = { id: window.traceWorkspace.repository.id, rootPath: window.traceWorkspace.repository.rootPath };
+    const result = await window.trace.callChains({ repository, limit: 6 });
+    const files = new Set(window.traceWorkspace.repository.files.map((file) => file.path));
+    const exercise = result.exercises.find((candidate) => candidate.kind === "next-call");
+    const grades = exercise
+      ? await Promise.all(exercise.options.map((option) => window.trace.gradePrediction({ repository, exerciseId: exercise.id, choiceId: option.id })))
+      : [];
+    let bogus = null;
+    try {
+      bogus = await window.trace.gradePrediction({ repository, exerciseId: "predict-does-not-exist", choiceId: "choice-x" });
+    } catch (error) {
+      bogus = { error: error.message };
+    }
+    return {
+      version: result.version,
+      chainCount: result.chains.length,
+      chains: result.chains.map((chain) => ({ crossFileHops: chain.crossFileHops, steps: chain.steps.length, summary: chain.summary, anchorsExist: chain.steps.every((step) => files.has(step.path) && step.line >= 1) })),
+      exerciseKeys: result.exercises.length ? Object.keys(result.exercises[0]) : [],
+      optionCount: exercise?.options.length ?? 0,
+      grades: grades.map((grade) => ({ correct: grade.correct, answerLabel: grade.answerLabel, explanation: grade.explanation })),
+      bogus,
+    };
+  });
+  assert.equal(chainAudit.version, 1);
+  assert.ok(chainAudit.chainCount > 0, "expected cross-file call chains in flashinfer");
+  assert.ok(chainAudit.chains.every((chain) => chain.crossFileHops >= 1 && chain.steps >= 2 && chain.anchorsExist), JSON.stringify(chainAudit.chains.slice(0, 3)));
+  // The answer never crosses the IPC boundary.
+  assert.equal(chainAudit.exerciseKeys.includes("answerId"), false, chainAudit.exerciseKeys.join(","));
+  assert.equal(chainAudit.exerciseKeys.includes("explanation"), false, chainAudit.exerciseKeys.join(","));
+  // Exactly one option is correct, and the verdict comes from the main process.
+  assert.ok(chainAudit.optionCount >= 3, `expected at least three options, got ${chainAudit.optionCount}`);
+  assert.equal(chainAudit.grades.filter((grade) => grade.correct).length, 1, JSON.stringify(chainAudit.grades));
+  assert.match(chainAudit.grades[0].explanation, /\.(py|cu|cuh|h|cpp|c|ts|js|rs|go):\d+/);
+  assert.match(chainAudit.bogus.error ?? "", /not active for this repository/);
+
   // Item 17: real-repository import resolution plus the optional language-server bridge.
   const languageServers = await page.evaluate(() => window.trace.detectLanguageServers());
   assert.ok(Object.keys(languageServers).length >= 6, JSON.stringify(languageServers));
@@ -267,7 +304,12 @@ try {
   }));
   assert.deepEqual(overflow, { x: false, y: false });
   await page.screenshot({ path: path.join(artifactDirectory, "flashinfer-electron.png") });
-  console.log(JSON.stringify({ ok: true, repositoryPath, screenshot: path.join(artifactDirectory, "flashinfer-electron.png") }, null, 2));
+  console.log(JSON.stringify({
+    ok: true,
+    repositoryPath,
+    screenshot: path.join(artifactDirectory, "flashinfer-electron.png"),
+    callChains: { count: chainAudit.chainCount, longest: chainAudit.chains[0]?.summary, options: chainAudit.optionCount },
+  }, null, 2));
 } finally {
   await electronApp.close();
   await rm(userDataDirectory, { recursive: true, force: true });

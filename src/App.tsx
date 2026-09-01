@@ -2,10 +2,10 @@ import type { OnMount } from "@monaco-editor/react";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { browserBridge, demoCourse, demoLearnerState, demoRepository, demoSkillGraph } from "./demo";
 import { addEvidence, completeDiagnostic, personalizeSkillGraph, skillForLesson } from "./learning";
-import type { AgentState, ContextMode, ContextPack, ContextScope, Course, IndexProgress, KnowledgeGraphSummary, LearnerProfile, LinkClassification, LearnerState, LearningMemory, Lesson, LessonContentBlock, PracticeReport, PracticeSession, Repository, RepoFile, SkillGraph, SkillNode, SymbolResolution } from "./types";
+import type { AgentState, CallChain, ContextMode, ContextPack, ContextScope, Course, IndexProgress, KnowledgeGraphSummary, LearnerProfile, LinkClassification, LearnerState, LearningMemory, Lesson, LessonContentBlock, PracticeReport, PracticeSession, PredictionExercise, PredictionGrade, Repository, RepoFile, SkillGraph, SkillNode, SymbolResolution } from "./types";
 
 type TutorMode = "learn" | "ask" | "quiz" | "practice";
-type WorkspaceMode = "lesson" | "diagram" | "code" | "notes";
+type WorkspaceMode = "lesson" | "diagram" | "code" | "chains" | "notes";
 type FontScale = "compact" | "comfortable" | "large";
 type CodeSelection = { text: string; startLine: number; endLine: number };
 type Message = { id: string; role: "agent" | "user"; text: string; pack?: ContextPack; answeredBy?: string; saved?: boolean };
@@ -390,8 +390,93 @@ function FileExplorer({ repository, lesson, currentFile, query, onQuery, onOpen,
   );
 }
 
+/**
+ * Cross-file call chains plus prediction exercises (item 26). The correct answer
+ * lives in the main process, so a learner cannot read it out of the DOM.
+ */
+function CallChainPanel({ repository, onAnchor }: { repository: Repository; onAnchor: (path: string, line: number) => void }) {
+  const [chains, setChains] = useState<CallChain[]>([]);
+  const [exercises, setExercises] = useState<PredictionExercise[]>([]);
+  const [activeChain, setActiveChain] = useState<string | null>(null);
+  const [choice, setChoice] = useState<Record<string, string>>({});
+  const [grades, setGrades] = useState<Record<string, PredictionGrade>>({});
+  const [status, setStatus] = useState<"loading" | "ready" | "empty" | "error">("loading");
+
+  useEffect(() => {
+    let active = true;
+    setStatus("loading");
+    void bridge.callChains({ repository: repositoryRef(repository), limit: 8 })
+      .then((result) => {
+        if (!active) return;
+        setChains(result.chains);
+        setExercises(result.exercises);
+        setActiveChain(result.chains[0]?.id ?? null);
+        setStatus(result.chains.length ? "ready" : "empty");
+      })
+      .catch(() => { if (active) setStatus("error"); });
+    return () => { active = false; };
+  }, [repository]);
+
+  const chain = chains.find((candidate) => candidate.id === activeChain) ?? chains[0];
+  const chainExercises = exercises.filter((exercise) => exercise.chainId === chain?.id);
+  const submit = async (exercise: PredictionExercise) => {
+    const selected = choice[exercise.id];
+    if (!selected) return;
+    const grade = await bridge.gradePrediction({ repository: repositoryRef(repository), exerciseId: exercise.id, choiceId: selected });
+    setGrades((previous) => ({ ...previous, [exercise.id]: grade }));
+  };
+
+  if (status !== "ready" || !chain) {
+    return <div className="call-chain-panel empty" data-status={status}>
+      <Icon name="branch" size={22} />
+      <h3>Cross-file call chains</h3>
+      <p>{status === "loading" ? "Deriving resolved call chains from the index…" : status === "error" ? "Call chains are unavailable for this repository." : "No resolved chain crosses a file boundary in this index yet."}</p>
+    </div>;
+  }
+
+  return <div className="call-chain-panel" data-status="ready" data-chains={chains.length}>
+    <header><span>CROSS-FILE REASONING</span><h2>Predict the call chain</h2><p>Every option is a real symbol from this repository. Predict before you read the source.</p></header>
+    <div className="chain-picker">
+      {chains.map((candidate) => <button key={candidate.id} className={candidate.id === chain.id ? "active" : ""} onClick={() => setActiveChain(candidate.id)}>
+        <strong>{candidate.summary}</strong><small>{candidate.crossFileHops} cross-file hop{candidate.crossFileHops === 1 ? "" : "s"} · {candidate.files.length} files</small>
+      </button>)}
+    </div>
+    <ol className="chain-steps" data-summary={chain.summary}>
+      {chain.steps.map((step, index) => <li key={`${step.path}-${step.symbol}-${index}`}>
+        <button onClick={() => onAnchor(step.path, step.line)}>
+          <span>{String(index + 1).padStart(2, "0")}</span>
+          <strong>{step.symbol}()</strong>
+          <small>{step.path}:{step.line}</small>
+          {step.callLine && <em>calls next at :{step.callLine}</em>}
+        </button>
+      </li>)}
+    </ol>
+    {chainExercises.map((exercise) => {
+      const grade = grades[exercise.id];
+      return <section className="chain-exercise" key={exercise.id} data-kind={exercise.kind} data-graded={grade ? String(grade.correct) : "pending"}>
+        <div className="chain-exercise-head"><span>{exercise.kind === "next-call" ? "CALL PREDICTION" : "OUTPUT PREDICTION"}</span><small>{exercise.context}</small></div>
+        <h3>{exercise.prompt}</h3>
+        <div className="chain-options">
+          {exercise.options.map((option) => <label key={option.id} className={choice[exercise.id] === option.id ? "selected" : ""}>
+            <input type="radio" name={exercise.id} checked={choice[exercise.id] === option.id} onChange={() => setChoice((previous) => ({ ...previous, [exercise.id]: option.id }))} />
+            <strong>{option.label}</strong><small>{option.detail}</small>
+          </label>)}
+        </div>
+        <div className="chain-actions">
+          <button className="primary" disabled={!choice[exercise.id]} onClick={() => void submit(exercise)}>Check prediction</button>
+          {grade && <button className="ghost" onClick={() => onAnchor(grade.anchor.path, grade.anchor.line)}>Open {grade.anchor.path.split("/").at(-1)}:{grade.anchor.line}</button>}
+        </div>
+        {grade && <div className={`chain-feedback ${grade.correct ? "correct" : "incorrect"}`}>
+          <strong>{grade.correct ? "Correct" : `Not quite — the answer is ${grade.answerLabel}`}</strong>
+          <p>{grade.explanation}</p>
+        </div>}
+      </section>;
+    })}
+  </div>;
+}
+
 function LessonCanvas({ lesson, diagramOnly, onAnchor }: { lesson: Lesson; diagramOnly?: boolean; onAnchor: (path: string, line: number) => void }) {
-  const blocks = (lesson.content ?? []).filter((block) => !diagramOnly || ["diagram", "timeline", "comparison"].includes(block.type));
+  const blocks = (lesson.content ?? []).filter((block) => !diagramOnly || ["diagram", "timeline", "comparison", "callchain"].includes(block.type));
   if (!blocks.length) return <div className="lesson-canvas empty"><Icon name="book" size={26} /><h3>Source-first lesson</h3><p>This lesson is grounded in the active code anchor. Open Code to begin, then use Ask for questions.</p></div>;
   const jump = (path?: string, line = 1) => { if (path) onAnchor(path, line); };
   return <div className="lesson-canvas">
@@ -400,6 +485,7 @@ function LessonCanvas({ lesson, diagramOnly, onAnchor }: { lesson: Lesson; diagr
       if (block.type === "narrative") return <article className="content-narrative" key={block.id}>{block.eyebrow && <span>{block.eyebrow}</span>}<h3>{block.title}</h3><p>{block.body}</p></article>;
       if (block.type === "callout") return <aside className={`content-callout ${block.tone}`} key={block.id}><Icon name={block.tone === "question" ? "target" : "spark"} size={16} /><div><strong>{block.title}</strong><p>{block.body}</p></div></aside>;
       if (block.type === "diagram") return <article className="content-diagram" key={block.id}><div className="content-heading"><div><span>SOURCE-LINKED DIAGRAM</span><h3>{block.title}</h3></div><p>{block.caption}</p></div><div className="diagram-flow">{block.nodes.map((node, index) => <div className="diagram-step" key={node.id}>{index > 0 && <span className="diagram-arrow">→</span>}<button onClick={() => jump(node.anchor?.path, node.anchor?.line)} disabled={!node.anchor}><strong>{node.label}</strong><small>{node.detail}</small>{node.anchor && <em>{node.anchor.path.split("/").at(-1)}:{node.anchor.line}</em>}</button></div>)}</div><div className="diagram-edges">{block.edges.map((edge) => <span key={`${edge.from}-${edge.to}`}>{edge.from} → {edge.to}{edge.label ? ` · ${edge.label}` : ""}</span>)}</div></article>;
+      if (block.type === "callchain") return <article className="content-callchain" key={block.id}><div className="content-heading"><div><span>CROSS-FILE CALL CHAIN</span><h3>{block.title}</h3></div><p>{block.caption}</p></div><div className="callchain-flow">{block.steps.map((step, index) => <div className="callchain-step" key={`${step.symbol}-${index}`}>{index > 0 && <span className="diagram-arrow">→</span>}<button onClick={() => jump(step.anchor.path, step.anchor.line)}><strong>{step.symbol}()</strong><small>{step.detail}</small><em>{step.anchor.path.split("/").at(-1)}:{step.anchor.line}</em></button></div>)}</div></article>;
       if (block.type === "timeline") return <article className="content-timeline" key={block.id}><h3>{block.title}</h3><div>{block.steps.map((step, index) => <button key={`${step.label}-${index}`} onClick={() => jump(step.anchor?.path, step.anchor?.line)} disabled={!step.anchor}><span>{String(index + 1).padStart(2, "0")}</span><strong>{step.label}</strong><small>{step.detail}</small></button>)}</div></article>;
       return <article className="content-comparison" key={block.id}><h3>{block.title}</h3><div>{block.columns.map((column) => <section key={column.title}><strong>{column.title}</strong>{column.items.map((item) => <p key={item}><Icon name="check" size={12} />{item}</p>)}</section>)}</div></article>;
     })}
@@ -493,6 +579,7 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
           <button className={workspaceMode === "lesson" ? "active" : ""} onClick={() => onWorkspaceMode("lesson")}><Icon name="book" size={12} />Lesson</button>
           <button className={workspaceMode === "diagram" ? "active" : ""} onClick={() => onWorkspaceMode("diagram")}><Icon name="layers" size={12} />Diagram</button>
           <button className={workspaceMode === "code" ? "active" : ""} onClick={() => onWorkspaceMode("code")}><Icon name="code" size={12} />Code</button>
+          <button className={workspaceMode === "chains" ? "active" : ""} onClick={() => onWorkspaceMode("chains")}><Icon name="branch" size={12} />Chains</button>
           <button className={workspaceMode === "notes" ? "active" : ""} onClick={() => onWorkspaceMode("notes")}><Icon name="file" size={12} />Notes</button>
           <span />
           {workspaceMode === "code" && <div className="editor-actions"><span>Ln {line}</span><span>{currentFile?.language ?? "text"}</span></div>}
@@ -500,6 +587,7 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
         {workspaceMode === "code" && <><div className="editor-tabs">{currentFile ? <div className="editor-tab active"><Icon name="file" size={13} />{currentFile.name}<span>×</span></div> : <div className="editor-tab active">No file selected</div>}</div><div className="breadcrumb"><Icon name="code" size={13} />{currentFile?.path.split("/").map((part, index, parts) => <span key={`${part}-${index}`}>{part}{index < parts.length - 1 && <Icon name="chevron" size={11} />}</span>)}</div></>}
         {workspaceMode === "lesson" && <LessonCanvas lesson={lesson} onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }} />}
         {workspaceMode === "diagram" && <LessonCanvas lesson={lesson} diagramOnly onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }} />}
+        {workspaceMode === "chains" && <CallChainPanel repository={repository} onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }} />}
         {workspaceMode === "notes" && <div className="lesson-notes"><span>PRIVATE LEARNING NOTES</span><h3>{lesson.title}</h3><textarea value={notes} onChange={(event) => { setNotes(event.target.value); localStorage.setItem(`trace:notes:${repository.id}:${lesson.id}`, event.target.value); }} placeholder="Capture an insight, question, or source reference…" /><small>Stored locally for this repository and lesson.</small></div>}
         <div className={`editor-wrap ${workspaceMode === "code" ? "" : "hidden"}`}>
           {monacoReady ? <Suspense fallback={<div className="editor-loading">Loading local editor…</div>}><LazyEditor

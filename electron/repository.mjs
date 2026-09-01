@@ -295,6 +295,13 @@ function languageFor(filePath) {
   return LANGUAGE_BY_EXTENSION[path.extname(base)] ?? "plaintext";
 }
 
+const LANGUAGE_FAMILIES = { c: "c-family", cpp: "c-family", cuda: "c-family", javascript: "js-family", typescript: "js-family" };
+
+/** Languages that can legitimately call into each other's definitions. */
+export function languageFamily(language) {
+  return LANGUAGE_FAMILIES[language ?? ""] ?? language ?? "unknown";
+}
+
 export function fileImportance(filePath, language = languageFor(filePath)) {
   const normalized = filePath.split(path.sep).join("/");
   const parts = normalized.split("/");
@@ -571,11 +578,18 @@ export async function inspectRepository(input, repositoriesDirectory, options = 
   }
   const allCallEdges = analyses.flatMap((analysis) => analysis.callEdges);
   if (allCallEdges.length > limits.maxCallEdges) truncated.push({ limit: "maxCallEdges", value: limits.maxCallEdges, skipped: allCallEdges.length - limits.maxCallEdges });
+  const languageByPath = new Map(fileRecords.map((file) => [file.path, file.language]));
   const callEdges = allCallEdges
     .slice(0, limits.maxCallEdges)
     .map((edge) => {
       const targets = definitionIndex.get(edge.callee) ?? [];
-      const target = targets.find((candidate) => candidate.path === edge.path) ?? targets[0] ?? null;
+      // A call can only land in the same file or in a file of the same language
+      // family. Without this, a Python `int(...)` call resolves to a C++ `int`
+      // declaration in a header and invents a call chain that cannot exist.
+      const family = languageFamily(languageByPath.get(edge.path));
+      const target = targets.find((candidate) => candidate.path === edge.path)
+        ?? targets.find((candidate) => languageFamily(languageByPath.get(candidate.path)) === family)
+        ?? null;
       return { ...edge, targetPath: target?.path ?? null, targetLine: target?.line ?? null, resolved: Boolean(target) };
     });
   const indexerCounts = analyses.reduce((counts, analysis) => {

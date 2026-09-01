@@ -13,11 +13,13 @@ import { detectLanguageServers, resolveImportsStatically, resolveSymbol, shutdow
 import { buildKnowledgeGraph, loadKnowledgeGraph, neighborhood, saveKnowledgeGraph } from "./knowledge-graph.mjs";
 import { registerValidatedHandlers } from "./ipc-schema.mjs";
 import { classifyExternalLink, confirmationPrompt, isInternalNavigation, repositoryOrigins } from "./link-policy.mjs";
+import { CALL_CHAIN_VERSION, buildCallChainExercises, buildCallChains, gradeCallChainAnswer, publicExercise } from "./call-chain.mjs";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const openedRepositories = new Map();
 const knowledgeGraphs = new Map();
 const indexingRequests = new Map();
+const callChainSets = new Map();
 
 function openedRepository(candidate) {
   const repository = candidate?.id ? openedRepositories.get(candidate.id) : null;
@@ -221,6 +223,31 @@ const ipcHandlers = {
       definitions: resolution.available && resolution.definitions.length ? resolution.definitions : staticDefinitions,
       resolvedBy: resolution.available && resolution.definitions.length ? `language-server:${resolution.server}` : "static-index",
     };
+  },
+
+  "lessons:call-chains": async (_event, request) => {
+    const repository = openedRepository(request.repository);
+    const chains = buildCallChains(repository, { limit: request.limit ?? 8 });
+    // Only the files that actually appear in a chain are read, so output
+    // prediction never turns into a whole-repository read.
+    const sources = {};
+    for (const filePath of [...new Set(chains.flatMap((chain) => chain.files))].slice(0, 40)) {
+      try {
+        sources[filePath] = await readRepositoryFile(repository.rootPath, filePath);
+      } catch {
+        // A file that cannot be read simply yields no output-prediction exercise.
+      }
+    }
+    const exercises = buildCallChainExercises(repository, chains, sources);
+    callChainSets.set(repository.id, new Map(exercises.map((exercise) => [exercise.id, exercise])));
+    return { version: CALL_CHAIN_VERSION, chains, exercises: exercises.map(publicExercise) };
+  },
+
+  "lessons:grade-prediction": (_event, request) => {
+    const repository = openedRepository(request.repository);
+    const exercise = callChainSets.get(repository.id)?.get(request.exerciseId);
+    if (!exercise) throw new Error("That prediction exercise is not active for this repository.");
+    return gradeCallChainAnswer(exercise, request.choiceId);
   },
 
   "agents:ask": async (_event, request) => {

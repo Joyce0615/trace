@@ -106,6 +106,36 @@ try {
   assert.equal((await page.locator(".resolution-source").innerText()).toLowerCase(), "static-index");
   await page.getByText(/No language server for python/).waitFor();
 
+  // Item 26: cross-file call chains with grounded, main-process-graded predictions.
+  await page.locator(".content-tabs").getByRole("button", { name: "Chains" }).click();
+  await page.locator('.call-chain-panel[data-status="ready"]').waitFor();
+  assert.equal(
+    await page.locator(".chain-steps").getAttribute("data-summary"),
+    "LLM() \u2192 generate() \u2192 step() \u2192 schedule() \u2192 allocate()",
+  );
+  assert.equal(await page.locator(".chain-steps li").count(), 5);
+  // The rendered exercise must not leak which option is correct.
+  const exercise = page.locator(".chain-exercise").first();
+  assert.equal(await exercise.getAttribute("data-graded"), "pending");
+  const optionLabels = await exercise.locator(".chain-options label strong").allInnerTexts();
+  assert.ok(optionLabels.includes("generate()"), optionLabels.join(", "));
+  assert.equal(await exercise.evaluate((element) => /answerId|correct/i.test(element.outerHTML)), false);
+  // A wrong prediction is rejected with the real answer and a source anchor.
+  const wrongOption = optionLabels.find((label) => label !== "generate()");
+  await exercise.locator(".chain-options label", { hasText: wrongOption }).click();
+  await exercise.getByRole("button", { name: "Check prediction" }).click();
+  await exercise.locator(".chain-feedback.incorrect").waitFor();
+  assert.match(await exercise.locator(".chain-feedback strong").innerText(), /the answer is generate\(\)/);
+  await exercise.locator(".chain-options label", { hasText: "generate()" }).click();
+  await exercise.getByRole("button", { name: "Check prediction" }).click();
+  await exercise.locator(".chain-feedback.correct").waitFor();
+  assert.match(await exercise.locator(".chain-feedback p").innerText(), /nanovllm\/engine\/llm_engine\.py:\d+/);
+  await page.screenshot({ path: path.join(artifactDirectory, "call-chains.png") });
+  // Chain steps navigate back to the source they were derived from.
+  await page.locator(".chain-steps button").nth(2).click();
+  await page.locator(".monaco-editor").waitFor({ timeout: 20_000 });
+  await page.getByText("nanovllm/engine/llm_engine.py", { exact: false }).first().waitFor();
+
   await page.getByRole("button", { name: "Ask", exact: true }).click();
   await page.getByText("Ask without losing your place.").waitFor();
   await page.locator(".tutor-input textarea").fill("Where is Scheduler defined?");

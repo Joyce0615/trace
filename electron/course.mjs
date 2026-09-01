@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { buildCallChains, callChainBlock } from "./call-chain.mjs";
 
 function anchorFor(repo, filePath, preferredSymbol) {
   const symbols = repo.symbols.filter((symbol) => symbol.path === filePath);
@@ -69,6 +70,7 @@ export function generateStarterCourse(repo, profile = { goal: "architecture", le
     .map((directory) => rankedMatch(repo, (file) => file.path.startsWith(`${directory}/`) && repo.symbols.some((symbol) => symbol.path === file.path)))
     .filter(Boolean);
   if (!coreFiles.length && entry) coreFiles.push(entry);
+  const crossFileChains = buildCallChains(repo, { limit: 6 });
 
   const modules = [
     {
@@ -89,13 +91,20 @@ export function generateStarterCourse(repo, profile = { goal: "architecture", le
       summary: "Move from the entry point into the modules that carry the system's core behavior.",
       lessons: coreFiles.slice(0, 3).map((filePath, index) => {
         const symbol = repo.symbols.find((candidate) => candidate.path === filePath);
-        return lesson(
-          `core-${index + 1}`,
-          symbol ? `Understand ${symbol.name}` : `Explore ${filePath.split("/")[0]}`,
-          "Trace what this module receives, what it changes, and which neighboring components it depends on.",
-          anchorFor(repo, filePath, symbol),
-          { duration: 16 + index * 2, difficulty: index ? "intermediate" : "foundation" },
-        );
+        const anchor = anchorFor(repo, filePath, symbol);
+        const id = `core-${index + 1}`;
+        const title = symbol ? `Understand ${symbol.name}` : `Explore ${filePath.split("/")[0]}`;
+        const objective = "Trace what this module receives, what it changes, and which neighboring components it depends on.";
+        // A resolved cross-file chain through this file turns the lesson from a
+        // file tour into an execution path the learner can predict.
+        const chain = crossFileChains.find((candidate) => candidate.files.includes(filePath));
+        return lesson(id, title, objective, anchor, {
+          duration: 16 + index * 2,
+          difficulty: index ? "intermediate" : "foundation",
+          content: chain
+            ? [...defaultContent(id, title, objective, anchor), callChainBlock(chain, `${id}-chain`)]
+            : undefined,
+        });
       }),
     },
     {

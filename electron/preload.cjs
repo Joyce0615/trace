@@ -19,6 +19,8 @@ contextBridge.exposeInMainWorld("trace", {
   classifyLink: (url) => ipcRenderer.invoke("links:classify", { url }),
   openLink: (url) => ipcRenderer.invoke("links:open", { url }),
   lastLinkDecision: () => ipcRenderer.invoke("links:last-decision"),
+  callChains: (request) => ipcRenderer.invoke("lessons:call-chains", request),
+  gradePrediction: (request) => ipcRenderer.invoke("lessons:grade-prediction", request),
   askAgent: (request) => ipcRenderer.invoke("agents:ask", request),
   enhanceCourse: (request) => ipcRenderer.invoke("course:enhance", request),
   loadLearning: (request) => ipcRenderer.invoke("learning:load", request),

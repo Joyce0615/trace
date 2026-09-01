@@ -114,7 +114,46 @@ export type LessonContentBlock =
   | { id: string; type: "callout"; tone: "insight" | "warning" | "question"; title: string; body: string }
   | { id: string; type: "diagram"; title: string; caption: string; nodes: DiagramNode[]; edges: Array<{ from: string; to: string; label?: string }> }
   | { id: string; type: "timeline"; title: string; steps: Array<{ label: string; detail: string; anchor?: CodeAnchor }> }
-  | { id: string; type: "comparison"; title: string; columns: Array<{ title: string; items: string[] }> };
+  | { id: string; type: "comparison"; title: string; columns: Array<{ title: string; items: string[] }> }
+  | { id: string; type: "callchain"; title: string; caption: string; steps: Array<{ symbol: string; detail: string; anchor: CodeAnchor }> };
+
+export interface CallChainStep {
+  symbol: string;
+  path: string;
+  line: number;
+  kind: string;
+  callLine: number | null;
+}
+
+export interface CallChain {
+  id: string;
+  steps: CallChainStep[];
+  crossFileHops: number;
+  files: string[];
+  summary: string;
+}
+
+/** Exercise as the renderer sees it: options only, never the answer. */
+export interface PredictionExercise {
+  id: string;
+  chainId: string;
+  kind: "next-call" | "output";
+  prompt: string;
+  context: string;
+  anchor: CodeAnchor;
+  options: Array<{ id: string; label: string; detail: string }>;
+}
+
+export interface PredictionGrade {
+  exerciseId: string;
+  kind: "next-call" | "output";
+  correct: boolean;
+  choiceId: string | null;
+  answerId: string;
+  answerLabel: string;
+  explanation: string;
+  anchor: CodeAnchor;
+}
 
 export interface Lesson {
   id: string;
@@ -442,6 +481,8 @@ export interface TraceBridge {
   detectAgents(): Promise<AgentState>;
   detectLanguageServers(): Promise<Record<string, LanguageServerRecord>>;
   resolveSymbol(request: { repository: RepositoryRef; path: string; line: number; column?: number; symbol?: string }): Promise<SymbolResolution>;
+  callChains(request: { repository: RepositoryRef; limit?: number }): Promise<{ version: number; chains: CallChain[]; exercises: PredictionExercise[] }>;
+  gradePrediction(request: { repository: RepositoryRef; exerciseId: string; choiceId: string }): Promise<PredictionGrade>;
   askAgent(request: {
     provider: "codex" | "claude";
     rootPath: string;

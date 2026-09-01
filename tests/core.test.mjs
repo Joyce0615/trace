@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { access, mkdtemp, mkdir, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import os from "node:os";
@@ -8,7 +9,7 @@ import { promisify } from "node:util";
 import { generateStarterCourse, normalizeAgentCourse } from "../electron/course.mjs";
 import { loadCourse, saveCourse } from "../electron/course-store.mjs";
 import { createPracticeSession, inspectPracticeSession, removePracticeSession } from "../electron/practice.mjs";
-import { DEFAULT_INDEX_LIMITS, IndexCancelledError, analysisCacheStats, analyzeFile, fileImportance, inspectRepository, languageFor, readRepositoryFile, resetAnalysisCache } from "../electron/repository.mjs";
+import { DEFAULT_INDEX_LIMITS, IndexCancelledError, analysisCacheStats, analyzeFile, fileImportance, inspectRepository, languageFamily, languageFor, readRepositoryFile, resetAnalysisCache } from "../electron/repository.mjs";
 import { buildKnowledgeGraph, loadKnowledgeGraph, neighborhood, saveKnowledgeGraph } from "../electron/knowledge-graph.mjs";
 import { RemoteSourceError, cloneArguments, cloneDestination, cloneEnvironment, looksRemote, parseRemoteSource, summarizeSubmodules, verifyExistingClone } from "../electron/clone-guard.mjs";
 import { IPC_PROTOCOL_VERSION, IPC_SCHEMAS, MAX_PAYLOAD_BYTES, MAX_PAYLOAD_DEPTH, registerValidatedHandlers, schemaFor, validatePayload } from "../electron/ipc-schema.mjs";
@@ -17,6 +18,7 @@ import { PROMPT_ISOLATION_VERSION, buildIsolatedPrompt, createNonce, detectInjec
 import { tutorPrompt } from "../electron/agents.mjs";
 import { SECRET_SCANNER_VERSION, anonymizePath, redact, redactValue, scanText, shannonEntropy, summarizeFindings } from "../electron/secret-scanner.mjs";
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
+import { CALL_CHAIN_VERSION, buildCallChainExercises, buildCallChains, extractReturnExpressions, gradeCallChainAnswer, publicExercise, symbolBodyRange } from "../electron/call-chain.mjs";
 import { detectLanguageServers, resolveImportsStatically, resolveSymbol, serverForLanguage, shutdownLanguageServers } from "../electron/language-server.mjs";
 import { answerFromLocalIndex, buildContextPack, loadCachedResponse, saveCachedResponse } from "../electron/context-engine.mjs";
 import { buildSkillGraph, createLearnerState, reconcileLearnerState } from "../electron/skill-graph.mjs";
@@ -718,7 +720,8 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
   // Every channel the preload exposes must have a declared schema entry.
   const preload = ["repository:choose", "repository:open", "repository:cancel", "repository:limits", "repository:read-file",
     "links:classify", "links:open", "links:last-decision",
-    "agents:detect", "index:language-servers", "index:resolve", "graph:summary", "graph:neighborhood", "agents:ask",
+    "agents:detect", "index:language-servers", "index:resolve", "graph:summary", "graph:neighborhood",
+    "lessons:call-chains", "lessons:grade-prediction", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
   assert.throws(() => schemaFor("repository:evil"), /is not a registered IPC channel/);
@@ -1117,4 +1120,142 @@ test("secrets and personal data are detected and redacted before leaving the mac
   const savedState = await loadLearnerState(stateDirectory, "secret-repo");
   assert.equal(savedState.memory[0].text.includes("AKIAIOSFODNN7EXAMPLE"), false);
   assert.ok(savedState.memory[0].text.includes("[REDACTED:aws-access-key]"));
+});
+
+test("cross-file call chains generate grounded prediction exercises", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-chain-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "app", "engine"), { recursive: true });
+  await writeFile(path.join(rootPath, "app", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "app", "engine", "__init__.py"), "");
+  await writeFile(
+    path.join(rootPath, "app", "cli.py"),
+    "from app.engine.driver import drive\n\n\ndef main(request):\n    return drive(request)\n",
+  );
+  await writeFile(
+    path.join(rootPath, "app", "engine", "driver.py"),
+    "from app.engine.store import persist\n\n\ndef drive(request):\n    record = persist(request)\n    return record\n",
+  );
+  await writeFile(
+    path.join(rootPath, "app", "engine", "store.py"),
+    "def persist(request):\n    return {\"id\": request.id, \"status\": \"stored\"}\n",
+  );
+  await writeFile(
+    path.join(rootPath, "app", "engine", "unrelated.py"),
+    "def sweep(value):\n    return value * 3\n\n\ndef prune(value):\n    return value - 1\n",
+  );
+  await writeFile(
+    path.join(rootPath, "app", "util.py"),
+    "def normalize(value):\n    return str(value)\n",
+  );
+  // A same-named C definition must never become the target of a Python call.
+  await mkdir(path.join(rootPath, "include"), { recursive: true });
+  await writeFile(path.join(rootPath, "include", "kernel.h"), "int kernel_launch(int value) {\n  return value;\n}\n");
+  await writeFile(path.join(rootPath, "app", "native.py"), "def bridge(value):\n    return kernel_launch(value)\n");
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const chains = buildCallChains(repository, { limit: 6 });
+
+  // Regression: cross-language name collisions must not resolve into a chain.
+  assert.equal(languageFamily("cuda"), languageFamily("cpp"));
+  assert.notEqual(languageFamily("python"), languageFamily("c"));
+  assert.ok(repository.symbols.some((symbol) => symbol.name === "kernel_launch" && symbol.path === "include/kernel.h"));
+  const nativeCall = repository.callEdges.find((edge) => edge.callee === "kernel_launch" && edge.path === "app/native.py");
+  assert.ok(nativeCall, "expected the python call edge to be indexed");
+  assert.equal(nativeCall.resolved, false, "a python call must not resolve into a C header");
+  assert.equal(chains.some((chain) => chain.files.includes("include/kernel.h")), false);
+
+  // The chain must be a real execution path across three different files.
+  assert.equal(CALL_CHAIN_VERSION, 1);
+  const primary = chains.find((chain) => chain.summary === "main() → drive() → persist()");
+  assert.ok(primary, `expected a main → drive → persist chain, got ${chains.map((chain) => chain.summary).join(" | ")}`);
+  assert.equal(primary.crossFileHops, 2);
+  assert.deepEqual(primary.files, ["app/cli.py", "app/engine/driver.py", "app/engine/store.py"]);
+  assert.deepEqual(primary.steps.map((step) => `${step.path}:${step.line}`), ["app/cli.py:4", "app/engine/driver.py:4", "app/engine/store.py:1"]);
+  // The call site of each hop is recorded so the exercise can anchor to it.
+  assert.equal(primary.steps[0].callLine, 5);
+  assert.equal(primary.steps[1].callLine, 5);
+  assert.equal(primary.steps.at(-1).callLine, null);
+  // Chains are stable across rebuilds of the same source.
+  assert.deepEqual(buildCallChains(repository, { limit: 6 }).map((chain) => chain.id), chains.map((chain) => chain.id));
+
+  // Body extraction and return-expression mining work for both scoping styles.
+  const pythonSource = await readFile(path.join(rootPath, "app", "engine", "store.py"), "utf8");
+  // `end` is the exclusive line index where the body stops (dedent for Python).
+  assert.deepEqual(symbolBodyRange(pythonSource, 1, "python"), { start: 1, end: 3 });
+  assert.deepEqual(extractReturnExpressions(pythonSource, 1, "python"), ['{"id": request.id, "status": "stored"}']);
+  const braceSource = "function outer(a) {\n  if (a) {\n    return a + 1;\n  }\n  return 0;\n}\nfunction after() {}\n";
+  assert.deepEqual(symbolBodyRange(braceSource, 1, "typescript"), { start: 1, end: 6 });
+  assert.deepEqual(extractReturnExpressions(braceSource, 1, "typescript"), ["a + 1", "0"]);
+
+  const sources = Object.fromEntries(await Promise.all(
+    repository.files.filter((file) => file.language === "python").map(async (file) => [file.path, await readFile(path.join(rootPath, file.path), "utf8")]),
+  ));
+  const exercises = buildCallChainExercises(repository, chains, sources);
+  const nextCall = exercises.find((exercise) => exercise.chainId === primary.id && exercise.kind === "next-call");
+  assert.ok(nextCall, "expected a next-call exercise for the primary chain");
+  assert.match(nextCall.prompt, /Execution is inside `main`/);
+  assert.equal(nextCall.anchor.path, "app/cli.py");
+  assert.equal(nextCall.anchor.line, 5);
+  assert.ok(nextCall.options.length >= 3);
+  // Every option is a real symbol from this repository, not an invented name.
+  for (const option of nextCall.options) {
+    assert.ok(repository.symbols.some((symbol) => `${symbol.name}()` === option.label), `${option.label} is not an indexed symbol`);
+  }
+  const answer = nextCall.options.find((option) => option.id === nextCall.answerId);
+  assert.equal(answer.label, "drive()");
+  // Distractors never include the correct callee twice.
+  assert.equal(nextCall.options.filter((option) => option.label === "drive()").length, 1);
+
+  const outputExercise = exercises.find((exercise) => exercise.chainId === primary.id && exercise.kind === "output");
+  assert.ok(outputExercise, "expected an output-prediction exercise");
+  const outputAnswer = outputExercise.options.find((option) => option.id === outputExercise.answerId);
+  assert.equal(outputAnswer.label, '{"id": request.id, "status": "stored"}');
+  // Every option is a return expression that literally exists in the source.
+  for (const option of outputExercise.options) {
+    assert.ok(Object.values(sources).some((text) => text.includes(`return ${option.label}`)), `${option.label} is not a real return expression`);
+  }
+  assert.ok(
+    outputExercise.options.some((option) => option.id !== outputExercise.answerId && !sources["app/engine/store.py"].includes(option.label)),
+    "at least one distractor must come from another file",
+  );
+
+  // The renderer projection never carries the answer or the explanation, and an
+  // option id is a hash of its own text, so no id can mark the correct choice.
+  const shipped = publicExercise(nextCall);
+  assert.equal("answerId" in shipped, false);
+  assert.equal("explanation" in shipped, false);
+  assert.deepEqual(shipped.options, nextCall.options);
+  for (const option of shipped.options) {
+    assert.equal(option.id, `choice-${createHash("sha1").update(`${option.label}:${option.detail}`).digest("hex").slice(0, 10)}`);
+  }
+
+  // Grading is decided in the main process and always cites a source anchor.
+  const correct = gradeCallChainAnswer(nextCall, nextCall.answerId);
+  assert.equal(correct.correct, true);
+  assert.match(correct.explanation, /app\/cli\.py:5/);
+  assert.match(correct.explanation, /app\/engine\/driver\.py:4/);
+  const wrong = gradeCallChainAnswer(nextCall, nextCall.options.find((option) => option.id !== nextCall.answerId).id);
+  assert.equal(wrong.correct, false);
+  assert.equal(wrong.answerLabel, "drive()");
+  assert.equal(gradeCallChainAnswer(nextCall, "choice-does-not-exist").correct, false);
+
+  // A repository with no resolved cross-file call edge yields no chains at all.
+  assert.deepEqual(buildCallChains({ files: [], symbols: [], callEdges: [] }), []);
+
+  // The generated course carries the chain as a lesson block anchored to real files.
+  const course = generateStarterCourse(repository);
+  const chainBlocks = course.modules
+    .flatMap((module) => module.lessons)
+    .flatMap((item) => item.content ?? [])
+    .filter((block) => block.type === "callchain");
+  assert.ok(chainBlocks.length >= 1, "expected at least one call-chain lesson block");
+  for (const block of chainBlocks) {
+    for (const step of block.steps) {
+      assert.ok(repository.files.some((file) => file.path === step.anchor.path), `dangling chain anchor ${step.anchor.path}`);
+      assert.ok(step.anchor.line >= 1);
+    }
+  }
 });

@@ -207,6 +207,15 @@ export const IPC_SCHEMAS = {
     depth: s.number({ integer: true, min: 1, max: 3, optional: true }),
     edgeKinds: s.array(s.literal(["contains", "defines", "imports", "calls"]), { maxItems: 6, optional: true }),
   }),
+  "lessons:call-chains": s.object({
+    repository: repositoryReference,
+    limit: s.number({ integer: true, min: 1, max: 24, optional: true }),
+  }),
+  "lessons:grade-prediction": s.object({
+    repository: repositoryReference,
+    exerciseId: s.string({ maxLength: 128 }),
+    choiceId: s.string({ maxLength: 128 }),
+  }),
   "agents:ask": s.object({
     provider: s.literal(["codex", "claude"]),
     rootPath: s.string({ maxLength: 4_096 }),

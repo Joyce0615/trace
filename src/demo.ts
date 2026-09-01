@@ -1,4 +1,4 @@
-import type { ContextPack, ContextSection, KnowledgeGraphEdge, KnowledgeGraphNode, KnowledgeGraphSummary, LearnerState, LinkClassification, TraceBridge } from "./types";
+import type { CallChain, CallChainStep, ContextPack, ContextSection, KnowledgeGraphEdge, KnowledgeGraphNode, KnowledgeGraphSummary, LearnerState, LinkClassification, PredictionExercise, TraceBridge } from "./types";
 import { nanoCourse, nanoLearnerState, nanoRepository, nanoSkillGraph, nanoSourceByPath } from "./nano-demo";
 
 export const demoRepository = nanoRepository;
@@ -41,6 +41,89 @@ const demoKnowledgeGraph: KnowledgeGraphSummary = {
     byKind: { repository: 1, file: nanoRepository.files.length, symbol: nanoRepository.symbols.length },
   },
 };
+
+// The browser demo mirrors the main-process call-chain builder so the chain
+// panel behaves identically without a desktop bridge.
+function buildDemoCallChains(): CallChain[] {
+  const edges = (nanoRepository.callEdges ?? []).filter((edge) => edge.resolved && edge.caller && edge.targetPath);
+  const outgoing = new Map<string, typeof edges>();
+  for (const edge of edges) {
+    const key = `${edge.path}#${edge.caller}`;
+    outgoing.set(key, [...(outgoing.get(key) ?? []), edge]);
+  }
+  const called = new Set(edges.map((edge) => `${edge.targetPath}#${edge.callee}`));
+  const lineOf = (path: string, name: string) => nanoRepository.symbols.find((symbol) => symbol.path === path && symbol.name === name)?.line ?? 1;
+  const chains: CallChain[] = [];
+  for (const root of [...outgoing.keys()].filter((key) => !called.has(key))) {
+    const [rootPath, rootName] = [root.slice(0, root.lastIndexOf("#")), root.slice(root.lastIndexOf("#") + 1)];
+    const stack: CallChainStep[][] = [[{ symbol: rootName, path: rootPath, line: lineOf(rootPath, rootName), kind: "function", callLine: null }]];
+    while (stack.length) {
+      const steps = stack.pop()!;
+      const last = steps[steps.length - 1];
+      const next = steps.length >= 5
+        ? []
+        : (outgoing.get(`${last.path}#${last.symbol}`) ?? []).filter((edge) => !steps.some((step) => step.path === edge.targetPath && step.symbol === edge.callee));
+      if (!next.length) {
+        const crossFileHops = steps.reduce((count, step, index) => count + (index > 0 && step.path !== steps[index - 1].path ? 1 : 0), 0);
+        if (steps.length >= 2 && crossFileHops >= 1) {
+          chains.push({
+            id: `chain-${steps.map((step) => step.symbol).join("-")}`,
+            steps,
+            crossFileHops,
+            files: [...new Set(steps.map((step) => step.path))],
+            summary: steps.map((step) => `${step.symbol}()`).join(" → "),
+          });
+        }
+        continue;
+      }
+      for (const edge of next) {
+        stack.push([
+          ...steps.slice(0, -1),
+          { ...last, callLine: edge.line },
+          { symbol: edge.callee, path: edge.targetPath!, line: edge.targetLine ?? 1, kind: "function", callLine: null },
+        ]);
+      }
+    }
+  }
+  return chains.sort((left, right) => right.crossFileHops - left.crossFileHops || right.steps.length - left.steps.length || left.id.localeCompare(right.id)).slice(0, 8);
+}
+
+const demoAnswers = new Map<string, { answerId: string; explanation: string; label: string }>();
+
+function buildDemoExercises(chains: CallChain[]): PredictionExercise[] {
+  demoAnswers.clear();
+  return chains.flatMap((chain) => {
+    const hop = chain.steps.findIndex((step, index) => index > 0 && step.path !== chain.steps[index - 1].path);
+    const from = chain.steps[Math.max(0, hop - 1)];
+    const to = chain.steps[Math.max(0, hop - 1) + 1];
+    if (!from || !to) return [];
+    const distractors = nanoRepository.symbols
+      .filter((symbol) => symbol.name !== to.symbol && !chain.steps.some((step) => step.symbol === symbol.name))
+      .filter((symbol) => symbol.path === from.path || symbol.path.split("/")[0] === to.path.split("/")[0])
+      .slice(0, 3);
+    if (distractors.length < 2) return [];
+    const answerId = `choice-${to.symbol}`;
+    const options = [
+      { id: answerId, label: `${to.symbol}()`, detail: to.path },
+      ...distractors.map((symbol) => ({ id: `choice-${symbol.name}`, label: `${symbol.name}()`, detail: symbol.path })),
+    ].sort((left, right) => left.id.localeCompare(right.id));
+    const id = `predict-${chain.id}-next`;
+    demoAnswers.set(id, {
+      answerId,
+      label: `${to.symbol}()`,
+      explanation: `\`${from.symbol}\` calls \`${to.symbol}\` at ${from.path}:${from.callLine ?? from.line}; \`${to.symbol}\` is defined at ${to.path}:${to.line}, so the chain crosses a file boundary here.`,
+    });
+    return [{
+      id,
+      chainId: chain.id,
+      kind: "next-call" as const,
+      prompt: `Execution is inside \`${from.symbol}\` (${from.path}${from.callLine ? `:${from.callLine}` : ""}). Which function does it call next?`,
+      context: chain.steps.slice(0, Math.max(0, hop - 1) + 1).map((step) => `${step.symbol}()`).join(" → "),
+      anchor: { path: from.path, line: from.callLine ?? from.line, symbol: from.symbol },
+      options,
+    }];
+  });
+}
 
 function demoPack(request: Parameters<TraceBridge["askAgent"]>[0]): ContextPack {
   const context = request.context;
@@ -123,6 +206,25 @@ export const browserBridge: TraceBridge = {
       definitions,
       resolvedBy: "static-index",
       languageServer: { available: false, server: null, reason: "No language server is installed for the browser demo." },
+    };
+  },
+  async callChains(request) {
+    const chains = buildDemoCallChains().slice(0, request.limit ?? 8);
+    return { version: 1, chains, exercises: buildDemoExercises(chains) };
+  },
+  async gradePrediction(request) {
+    const exercise = buildDemoExercises(buildDemoCallChains()).find((item) => item.id === request.exerciseId);
+    const answer = demoAnswers.get(request.exerciseId);
+    if (!exercise || !answer) throw new Error("That prediction exercise is not active for this repository.");
+    return {
+      exerciseId: exercise.id,
+      kind: exercise.kind,
+      correct: request.choiceId === answer.answerId,
+      choiceId: request.choiceId,
+      answerId: answer.answerId,
+      answerLabel: answer.label,
+      explanation: answer.explanation,
+      anchor: exercise.anchor,
     };
   },
   async askAgent(request) {
