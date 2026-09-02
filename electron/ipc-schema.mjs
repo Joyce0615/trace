@@ -232,6 +232,16 @@ export const IPC_SCHEMAS = {
     selected: s.array(s.string({ maxLength: 1_024 }), { maxItems: 100 }),
     hintsUsed: s.array(s.string({ maxLength: 64 }), { maxItems: 8, optional: true }),
   }),
+  "grade:race-task": s.object({ repository: repositoryReference }),
+  "grade:race": s.object({
+    repository: repositoryReference,
+    taskId: s.string({ maxLength: 128 }),
+    understanding: s.string({ maxLength: 8_000 }),
+    plan: s.string({ maxLength: 8_000 }),
+    files: s.array(s.string({ maxLength: 1_024 }), { maxItems: 100 }),
+    inspected: s.array(s.string({ maxLength: 1_024 }), { maxItems: 500, optional: true }),
+    hintsUsed: s.array(s.string({ maxLength: 64 }), { maxItems: 8, optional: true }),
+  }),
   "agents:ask": s.object({
     provider: s.literal(["codex", "claude"]),
     rootPath: s.string({ maxLength: 4_096 }),

@@ -169,6 +169,37 @@ try {
   assert.equal(await drill.locator(".localization-hint em").innerText(), "-5%");
   await page.screenshot({ path: path.join(artifactDirectory, "localization-drill.png") });
 
+  // Item 28: RACE-style review grades three stages against three rubrics.
+  await page.locator(".content-tabs").getByRole("button", { name: "Review" }).click();
+  await page.getByRole("button", { name: "Start graded review" }).click();
+  const review = page.locator(".review-panel[data-task]");
+  await review.waitFor();
+  assert.match(await review.locator(".review-issue").innerText(), /`generate\(\)`/);
+  assert.equal(await review.locator('.review-stage[data-stage="understanding"] .review-rubric li').count(), 5);
+  assert.equal(await review.locator('.review-stage[data-stage="plan"] .review-rubric li').count(), 5);
+  assert.deepEqual(
+    await review.locator('.review-stage[data-stage="understanding"] .review-rubric li').evaluateAll((items) => items.map((item) => item.getAttribute("data-met"))),
+    ["pending", "pending", "pending", "pending", "pending"],
+  );
+  await review.locator('.review-stage[data-stage="understanding"] textarea').fill(
+    "The generate function in llm_engine.py loops over prompts and sampling_params, but callers in llm.py expect finished sequences to come back in order, so the result is wrong instead of sorted.",
+  );
+  await review.locator('.review-stage[data-stage="plan"] textarea').fill(
+    "1. Change nanovllm/engine/llm_engine.py so that generate preserves the original request ordering.\n2. Check the caller in llm.py for any ordering assumptions it makes.\n3. Add a regression test for the new ordering and run pytest.",
+  );
+  await review.locator('.review-files label', { hasText: "nanovllm/engine/llm_engine.py" }).click();
+  await review.getByRole("button", { name: "Grade my review" }).click();
+  await review.locator(".review-report").waitFor();
+  assert.equal(await review.locator('[data-criterion="names-symbol"]').getAttribute("data-met"), "true");
+  assert.equal(await review.locator('[data-criterion="target-file"]').getAttribute("data-met"), "true");
+  assert.equal(await review.locator('[data-criterion="validation"]').getAttribute("data-met"), "true");
+  assert.equal(await review.locator('[data-stage-score="understanding"]').innerText(), "100%");
+  assert.equal(await review.locator('[data-stage-score="plan"]').innerText(), "100%");
+  // Only one of the two gold files was selected, so localization is the weak stage.
+  assert.equal(await review.locator(".review-report").getAttribute("data-weakest"), "localization");
+  assert.match(await review.locator(".review-next").innerText(), /call edges/);
+  await page.screenshot({ path: path.join(artifactDirectory, "graded-review.png") });
+
   await page.getByRole("button", { name: "Ask", exact: true }).click();
   await page.getByText("Ask without losing your place.").waitFor();
   await page.locator(".tutor-input textarea").fill("Where is Scheduler defined?");

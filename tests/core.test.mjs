@@ -18,6 +18,7 @@ import { PROMPT_ISOLATION_VERSION, buildIsolatedPrompt, createNonce, detectInjec
 import { tutorPrompt } from "../electron/agents.mjs";
 import { SECRET_SCANNER_VERSION, anonymizePath, redact, redactValue, scanText, shannonEntropy, summarizeFindings } from "../electron/secret-scanner.mjs";
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
+import { RACE_GRADER_VERSION, buildRaceTask, gradeRaceSubmission, publicRaceTask, signatureParameters } from "../electron/race-grader.mjs";
 import { LOCALIZATION_VERSION, buildLocalizationExercise, nextHint, publicLocalizationExercise, scoreLocalization } from "../electron/localization.mjs";
 import { CALL_CHAIN_VERSION, buildCallChainExercises, buildCallChains, extractReturnExpressions, gradeCallChainAnswer, publicExercise, symbolBodyRange } from "../electron/call-chain.mjs";
 import { detectLanguageServers, resolveImportsStatically, resolveSymbol, serverForLanguage, shutdownLanguageServers } from "../electron/language-server.mjs";
@@ -487,6 +488,16 @@ test("the production entry bundle excludes Monaco and stays inside its budget", 
   const workerChunk = assets.find((asset) => asset.startsWith("editor.worker-"));
   assert.ok(workerChunk, "the editor worker must be emitted as its own chunk");
   assert.equal(eager.includes(workerChunk), false, "the editor worker must not be preloaded by the entry");
+
+  // The exercise panels (items 26-28) are lazy too, so a learner who never opens
+  // Chains, Locate, or Review does not download them.
+  const exerciseChunk = assets.find((asset) => /^exercises-.*\.js$/.test(asset));
+  assert.ok(exerciseChunk, "the exercise panels must be emitted as their own chunk");
+  assert.equal(eager.includes(exerciseChunk), false, "the exercise panels must not be preloaded by the entry");
+  for (const asset of eager) {
+    const source = await readFile(path.join(assetDirectory, asset), "utf8");
+    assert.equal(/CROSS-FILE REASONING|LOCALIZATION DRILL|GRADED REVIEW/.test(source), false, `${asset} statically bundles an exercise panel`);
+  }
 });
 
 test("indexing enforces size limits, streams progress, and can be cancelled", async (context) => {
@@ -723,7 +734,8 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
     "links:classify", "links:open", "links:last-decision",
     "agents:detect", "index:language-servers", "index:resolve", "graph:summary", "graph:neighborhood",
     "lessons:call-chains", "lessons:grade-prediction",
-    "exercise:localization", "exercise:localization-hint", "exercise:localization-score", "agents:ask",
+    "exercise:localization", "exercise:localization-hint", "exercise:localization-score",
+    "grade:race-task", "grade:race", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
   assert.throws(() => schemaFor("repository:evil"), /is not a registered IPC channel/);
@@ -1358,4 +1370,124 @@ test("localization exercises score coverage, precision, and context efficiency",
   // A repository with no cross-file caller has nothing to localize.
   assert.equal(buildLocalizationExercise({ files: [], symbols: [], callEdges: [] }), null);
   assert.equal(publicLocalizationExercise(null), null);
+});
+
+test("RACE grading scores understanding, localization, and plan separately", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-race-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "src"), { recursive: true });
+  await mkdir(path.join(rootPath, "tests"), { recursive: true });
+  await mkdir(path.join(rootPath, "docs"), { recursive: true });
+  await writeFile(path.join(rootPath, "src", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "src", "tokens.py"), "def tokenize(text, keep_case=False):\n    return text.split()\n");
+  await writeFile(path.join(rootPath, "src", "reader.py"), "from src.tokens import tokenize\n\n\ndef read(text):\n    return tokenize(text)\n");
+  await writeFile(path.join(rootPath, "src", "writer.py"), "from src.tokens import tokenize\n\n\ndef write(text):\n    return len(tokenize(text))\n");
+  await writeFile(path.join(rootPath, "tests", "test_tokens.py"), "def test_tokenize():\n    assert True\n");
+  await writeFile(path.join(rootPath, "docs", "notes.md"), "# Notes\n");
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const exercise = buildLocalizationExercise(repository);
+  const sources = { "src/tokens.py": await readFile(path.join(rootPath, "src", "tokens.py"), "utf8") };
+  const task = buildRaceTask(repository, exercise, sources);
+
+  assert.equal(RACE_GRADER_VERSION, 1);
+  assert.equal(task.symbol, "tokenize");
+  // Rubric criteria are derived from the real signature, callers, and tests.
+  assert.deepEqual(signatureParameters(sources["src/tokens.py"], 1), ["text", "keep_case"]);
+  assert.match(task.stages.understanding.find((item) => item.id === "names-input").description, /text, keep_case/);
+  assert.deepEqual(task.stages.understanding.map((item) => item.id), ["names-symbol", "names-module", "names-input", "names-caller", "expected-vs-actual"]);
+  assert.deepEqual(task.stages.plan.map((item) => item.id), ["target-file", "validation", "check-callers", "ordered-steps", "bounded-scope"]);
+  assert.equal(task.stages.understanding.reduce((sum, item) => sum + item.weight, 0).toFixed(2), "1.00");
+  assert.equal(task.stages.plan.reduce((sum, item) => sum + item.weight, 0).toFixed(2), "1.00");
+
+  // The renderer sees descriptions but never the predicates that grade them.
+  const shipped = publicRaceTask(task);
+  assert.equal(shipped.rubric.understanding.length, 5);
+  assert.equal(shipped.rubric.understanding.some((item) => "test" in item), false);
+  assert.equal("stages" in shipped, false);
+
+  const strongUnderstanding = "The tokenize function in src/tokens.py splits the text argument on whitespace, but callers in reader.py expect punctuation to be separated, so read() returns fewer tokens than expected for text that contains commas.";
+  const strongPlan = [
+    "1. Change src/tokens.py so tokenize separates punctuation from words.",
+    "2. Check the callers in reader.py and writer.py for length assumptions.",
+    "3. Extend tests/test_tokens.py with a regression test and run pytest.",
+  ].join("\n");
+
+  const excellent = gradeRaceSubmission(task, {
+    understanding: strongUnderstanding,
+    plan: strongPlan,
+    files: exercise.goldFiles,
+    inspected: exercise.goldFiles,
+  }, repository);
+  assert.ok(Math.abs(excellent.stages.understanding.score - 1) < 1e-9);
+  assert.ok(Math.abs(excellent.stages.plan.score - 1) < 1e-9);
+  assert.equal(excellent.stageScores.localization, 1);
+  assert.ok(Math.abs(excellent.overall - 1) < 1e-9);
+  assert.equal(excellent.band, "expert");
+
+  // A vague answer fails every rubric criterion that requires repository terms.
+  const vague = gradeRaceSubmission(task, {
+    understanding: "It is broken and returns the wrong thing sometimes for some inputs in some places somewhere.",
+    plan: "I will fix the code and make sure it works properly before shipping the change to everyone.",
+    files: ["docs/notes.md"],
+    inspected: ["docs/notes.md"],
+  }, repository);
+  assert.ok(vague.stages.understanding.score < 0.3, String(vague.stages.understanding.score));
+  assert.equal(vague.stageScores.localization, 0);
+  assert.ok(vague.overall < 0.25, String(vague.overall));
+  assert.equal(vague.band, "novice");
+  assert.deepEqual(vague.stages.understanding.missed, ["names-symbol", "names-module", "names-input", "names-caller"]);
+
+  // Keyword stuffing cannot buy full credit: short answers are length-discounted.
+  const stuffed = gradeRaceSubmission(task, {
+    understanding: "tokenize tokens.py text reader.py expected",
+    plan: strongPlan,
+    files: exercise.goldFiles,
+    inspected: exercise.goldFiles,
+  }, repository);
+  assert.ok(Math.abs(stuffed.stages.understanding.rawScore - 1) < 1e-9);
+  assert.equal(stuffed.stages.understanding.wordCount, 5);
+  assert.ok(Math.abs(stuffed.stages.understanding.lengthFactor - 0.2) < 1e-9);
+  assert.ok(Math.abs(stuffed.stages.understanding.score - 0.2) < 1e-9);
+  assert.ok(stuffed.stages.understanding.score < excellent.stages.understanding.score);
+
+  // Stages are independent: strong understanding with a scattered plan is visible.
+  const mixed = gradeRaceSubmission(task, {
+    understanding: strongUnderstanding,
+    plan: "I would rewrite the whole package from scratch and also move everything under docs/ into a new layout because the design is dated.",
+    files: exercise.goldFiles,
+    inspected: exercise.goldFiles,
+  }, repository);
+  assert.ok(Math.abs(mixed.stages.understanding.score - 1) < 1e-9);
+  assert.ok(mixed.stages.plan.score < 0.5, String(mixed.stages.plan.score));
+  assert.equal(mixed.stages.plan.criteria.find((item) => item.id === "bounded-scope").met, false);
+  assert.equal(mixed.weakestStage, "plan");
+  assert.match(mixed.nextStep, /ordered plan/);
+  assert.equal(mixed.stageBands.understanding, "expert");
+
+  // A learner who plans well but cannot localize is told so specifically.
+  const badLocalization = gradeRaceSubmission(task, {
+    understanding: strongUnderstanding,
+    plan: strongPlan,
+    files: ["docs/notes.md", "tests/test_tokens.py"],
+    inspected: ["docs/notes.md"],
+  }, repository);
+  assert.equal(badLocalization.weakestStage, "localization");
+  assert.match(badLocalization.nextStep, /call edges/);
+  assert.ok(badLocalization.overall < excellent.overall);
+
+  // Every met criterion carries the source evidence that justified it.
+  const symbolCriterion = excellent.stages.understanding.criteria.find((item) => item.id === "names-symbol");
+  assert.equal(symbolCriterion.met, true);
+  assert.equal(symbolCriterion.evidence, "src/tokens.py:1");
+  assert.equal(excellent.stages.plan.criteria.find((item) => item.id === "validation").evidence, "tests/test_tokens.py");
+
+  // An empty submission is graded, not crashed.
+  const empty = gradeRaceSubmission(task, { understanding: "", plan: "", files: [] }, repository);
+  assert.equal(empty.overall, 0);
+  assert.equal(empty.stages.understanding.wordCount, 0);
+  assert.equal(buildRaceTask(repository, null), null);
+  assert.equal(publicRaceTask(null), null);
 });

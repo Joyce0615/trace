@@ -481,6 +481,41 @@ export interface LocalizationScore {
   definition: CodeAnchor;
 }
 
+export interface RaceTask {
+  id: string;
+  version: number;
+  symbol: string;
+  issue: string;
+  localizationExerciseId: string;
+  weights: Record<string, number>;
+  rubric: {
+    understanding: Array<{ id: string; description: string; weight: number }>;
+    plan: Array<{ id: string; description: string; weight: number }>;
+  };
+}
+
+export interface RaceStageResult {
+  score: number;
+  rawScore: number;
+  lengthFactor: number;
+  wordCount: number;
+  criteria: Array<{ id: string; description: string; weight: number; met: boolean; evidence: string }>;
+  met: string[];
+  missed: string[];
+}
+
+export interface RaceReport {
+  taskId: string;
+  version: number;
+  stages: { understanding: RaceStageResult; localization: LocalizationScore; plan: RaceStageResult };
+  stageScores: { understanding: number; localization: number; plan: number };
+  stageBands: Record<string, string>;
+  overall: number;
+  band: "expert" | "competent" | "emerging" | "novice";
+  weakestStage: string;
+  nextStep: string;
+}
+
 export interface AgentState {
   codex: { available: boolean; version: string | null };
   claude: { available: boolean; version: string | null };
@@ -527,6 +562,8 @@ export interface TraceBridge {
   localizationExercise(request: { repository: RepositoryRef; symbol?: string }): Promise<LocalizationExercise>;
   localizationHint(request: { repository: RepositoryRef; exerciseId: string; used?: string[] }): Promise<LocalizationHint | null>;
   scoreLocalization(request: { repository: RepositoryRef; exerciseId: string; inspected: string[]; selected: string[]; hintsUsed?: string[] }): Promise<LocalizationScore>;
+  raceTask(request: { repository: RepositoryRef }): Promise<RaceTask>;
+  gradeRace(request: { repository: RepositoryRef; taskId: string; understanding: string; plan: string; files: string[]; inspected?: string[]; hintsUsed?: string[] }): Promise<RaceReport>;
   askAgent(request: {
     provider: "codex" | "claude";
     rootPath: string;

@@ -15,6 +15,7 @@ import { registerValidatedHandlers } from "./ipc-schema.mjs";
 import { classifyExternalLink, confirmationPrompt, isInternalNavigation, repositoryOrigins } from "./link-policy.mjs";
 import { CALL_CHAIN_VERSION, buildCallChainExercises, buildCallChains, gradeCallChainAnswer, publicExercise } from "./call-chain.mjs";
 import { buildLocalizationExercise, nextHint, publicLocalizationExercise, scoreLocalization } from "./localization.mjs";
+import { buildRaceTask, gradeRaceSubmission, publicRaceTask } from "./race-grader.mjs";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const openedRepositories = new Map();
@@ -22,6 +23,7 @@ const knowledgeGraphs = new Map();
 const indexingRequests = new Map();
 const callChainSets = new Map();
 const localizationExercises = new Map();
+const raceTasks = new Map();
 
 function openedRepository(candidate) {
   const repository = candidate?.id ? openedRepositories.get(candidate.id) : null;
@@ -274,6 +276,32 @@ const ipcHandlers = {
     const exercise = localizationExercises.get(repository.id)?.get(request.exerciseId);
     if (!exercise) throw new Error("That localization exercise is not active for this repository.");
     return scoreLocalization(exercise, request, repository);
+  },
+
+  "grade:race-task": async (_event, request) => {
+    const repository = openedRepository(request.repository);
+    const exercise = buildLocalizationExercise(repository);
+    if (!exercise) throw new Error("This repository has no resolved cross-file caller to grade against.");
+    const active = localizationExercises.get(repository.id) ?? new Map();
+    active.set(exercise.id, exercise);
+    localizationExercises.set(repository.id, active);
+    // Only the definition file is read; the rubric needs the real signature.
+    const sources = {};
+    try {
+      sources[exercise.definition.path] = await readRepositoryFile(repository.rootPath, exercise.definition.path);
+    } catch {
+      // Without the source the rubric falls back to structural criteria.
+    }
+    const task = buildRaceTask(repository, exercise, sources);
+    raceTasks.set(repository.id, task);
+    return publicRaceTask(task);
+  },
+
+  "grade:race": (_event, request) => {
+    const repository = openedRepository(request.repository);
+    const task = raceTasks.get(repository.id);
+    if (!task || task.id !== request.taskId) throw new Error("That grading task is not active for this repository.");
+    return gradeRaceSubmission(task, request, repository);
   },
 
   "agents:ask": async (_event, request) => {

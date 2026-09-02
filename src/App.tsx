@@ -1,66 +1,23 @@
 import type { OnMount } from "@monaco-editor/react";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
-import { browserBridge, demoCourse, demoLearnerState, demoRepository, demoSkillGraph } from "./demo";
+import { demoCourse, demoLearnerState, demoRepository, demoSkillGraph } from "./demo";
+import { emptyChainState, emptyLocalizationState, emptyReviewState, type ChainState, type LocalizationState, type ReviewState } from "./exercise-state";
+import { Icon, bridge, readableError, repositoryRef } from "./shell";
 import { addEvidence, completeDiagnostic, personalizeSkillGraph, skillForLesson } from "./learning";
-import type { AgentState, CallChain, ContextMode, LocalizationExercise, LocalizationHint, LocalizationScore, ContextPack, ContextScope, Course, IndexProgress, KnowledgeGraphSummary, LearnerProfile, LinkClassification, LearnerState, LearningMemory, Lesson, LessonContentBlock, PracticeReport, PracticeSession, PredictionExercise, PredictionGrade, Repository, RepoFile, SkillGraph, SkillNode, SymbolResolution } from "./types";
+import type { AgentState, ContextMode, ContextPack, ContextScope, Course, IndexProgress, KnowledgeGraphSummary, LearnerProfile, LinkClassification, LearnerState, LearningMemory, Lesson, LessonContentBlock, PracticeReport, PracticeSession, Repository, RepoFile, SkillGraph, SkillNode, SymbolResolution } from "./types";
 
 type TutorMode = "learn" | "ask" | "quiz" | "practice";
-type WorkspaceMode = "lesson" | "diagram" | "code" | "chains" | "locate" | "notes";
+type WorkspaceMode = "lesson" | "diagram" | "code" | "chains" | "locate" | "review" | "notes";
 type FontScale = "compact" | "comfortable" | "large";
 type CodeSelection = { text: string; startLine: number; endLine: number };
 type Message = { id: string; role: "agent" | "user"; text: string; pack?: ContextPack; answeredBy?: string; saved?: boolean };
-// Exercise state lives in App so switching workspace tabs (or jumping into the
-// editor from an exercise) never discards a learner's work in progress.
-type ChainState = {
-  chains: CallChain[];
-  exercises: PredictionExercise[];
-  activeChain: string | null;
-  choice: Record<string, string>;
-  grades: Record<string, PredictionGrade>;
-  status: "idle" | "loading" | "ready" | "empty" | "error";
-};
-type LocalizationState = {
-  exercise: LocalizationExercise | null;
-  trailStart: number;
-  selected: string[];
-  hints: LocalizationHint[];
-  score: LocalizationScore | null;
-  error: string | null;
-};
-const emptyChainState: ChainState = { chains: [], exercises: [], activeChain: null, choice: {}, grades: {}, status: "idle" };
-const emptyLocalizationState: LocalizationState = { exercise: null, trailStart: 0, selected: [], hints: [], score: null, error: null };
-
-const missingDesktopBridge = new Proxy({}, {
-  get() {
-    return async () => { throw new Error("Desktop bridge failed to load. Restart Trace or reinstall the app."); };
-  },
-}) as unknown as typeof browserBridge;
-const bridge = window.trace ?? (navigator.userAgent.includes("Electron") ? missingDesktopBridge : browserBridge);
-
 // The React binding ships with the editor, not with the application entry.
 const LazyEditor = lazy(async () => ({ default: (await import("@monaco-editor/react")).default }));
-
-function Icon({ name, size = 16 }: { name: string; size?: number }) {
-  const paths: Record<string, ReactNode> = {
-    arrow: <><path d="m9 18 6-6-6-6" /><path d="M15 12H3" /></>,
-    book: <><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" /><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z" /></>,
-    branch: <><circle cx="6" cy="5" r="2" /><circle cx="18" cy="6" r="2" /><circle cx="6" cy="19" r="2" /><path d="M6 7v10M8 6h5a5 5 0 0 1 5 5v-3" /></>,
-    check: <path d="m5 12 4 4L19 6" />,
-    chevron: <path d="m9 18 6-6-6-6" />,
-    code: <><path d="m8 9-4 3 4 3M16 9l4 3-4 3M14 5l-4 14" /></>,
-    file: <><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z" /><path d="M14 2v6h6" /></>,
-    folder: <><path d="M3 7h5l2 2h11v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" /><path d="M3 7V5a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v2" /></>,
-    git: <><circle cx="6" cy="5" r="2" /><circle cx="18" cy="19" r="2" /><path d="M6 7v10a2 2 0 0 0 2 2h8M18 17V9a2 2 0 0 0-2-2H8" /></>,
-    layers: <><path d="m12 2 9 5-9 5-9-5Z" /><path d="m3 12 9 5 9-5M3 17l9 5 9-5" /></>,
-    search: <><circle cx="11" cy="11" r="7" /><path d="m20 20-4-4" /></>,
-    send: <><path d="m22 2-7 20-4-9-9-4Z" /><path d="M22 2 11 13" /></>,
-    spark: <path d="m12 3-1.6 4.4L6 9l4.4 1.6L12 15l1.6-4.4L18 9l-4.4-1.6ZM5 15l-.8 2.2L2 18l2.2.8L5 21l.8-2.2L8 18l-2.2-.8Z" />,
-    target: <><circle cx="12" cy="12" r="9" /><circle cx="12" cy="12" r="4" /><path d="M12 3v3M21 12h-3M12 21v-3M3 12h3" /></>,
-    terminal: <><path d="m4 17 6-5-6-5M12 19h8" /><rect width="20" height="18" x="2" y="3" rx="2" /></>,
-    time: <><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></>,
-  };
-  return <svg aria-hidden="true" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
-}
+// Item 19's budget: the exercise panels are only fetched when a learner opens
+// the Chains, Locate, or Review tab.
+const LazyCallChainPanel = lazy(async () => ({ default: (await import("./exercises")).CallChainPanel }));
+const LazyLocalizationPanel = lazy(async () => ({ default: (await import("./exercises")).LocalizationPanel }));
+const LazyReviewPanel = lazy(async () => ({ default: (await import("./exercises")).ReviewPanel }));
 
 function Logo() {
   return <div className="logo-mark" aria-label="Trace"><span /><span /><span /></div>;
@@ -85,20 +42,6 @@ function ExternalLink({ href, children, className }: { href: string; children: R
     title={blocked ? `Blocked: ${decision?.reason}` : decision?.decision === "confirm" ? `${decision.host} needs confirmation` : href}
     onClick={() => { void bridge.openLink(href).then(setDecision).catch(() => undefined); }}
   >{children}{decision?.decision === "confirm" && <em className="link-gate">confirm</em>}</button>;
-}
-
-/** The main process owns the index; the renderer only sends a repository reference. */
-function repositoryRef(repository: Repository) {
-  return { id: repository.id, rootPath: repository.rootPath };
-}
-
-/** Electron wraps main-process errors; show the learner only the actionable message. */
-function readableError(cause: unknown) {
-  const raw = cause instanceof Error ? cause.message : String(cause);
-  return raw
-    .replace(/^Error invoking remote method '[^']*':\s*/, "")
-    .replace(/^[A-Za-z]*Error:\s*/, "")
-    .trim();
 }
 
 const indexPhaseLabels: Record<IndexProgress["phase"], string> = {
@@ -410,177 +353,6 @@ function FileExplorer({ repository, lesson, currentFile, query, onQuery, onOpen,
   );
 }
 
-/**
- * Cross-file call chains plus prediction exercises (item 26). The correct answer
- * lives in the main process, so a learner cannot read it out of the DOM.
- */
-function CallChainPanel({ repository, state, onState, onAnchor }: { repository: Repository; state: ChainState; onState: (update: Partial<ChainState>) => void; onAnchor: (path: string, line: number) => void }) {
-  const { chains, exercises, activeChain, choice, grades, status } = state;
-
-  useEffect(() => {
-    if (status !== "idle") return;
-    let active = true;
-    onState({ status: "loading" });
-    void bridge.callChains({ repository: repositoryRef(repository), limit: 8 })
-      .then((result) => {
-        if (!active) return;
-        onState({
-          chains: result.chains,
-          exercises: result.exercises,
-          activeChain: result.chains[0]?.id ?? null,
-          status: result.chains.length ? "ready" : "empty",
-        });
-      })
-      .catch(() => { if (active) onState({ status: "error" }); });
-    return () => { active = false; };
-  }, [onState, repository, status]);
-
-  const chain = chains.find((candidate) => candidate.id === activeChain) ?? chains[0];
-  const chainExercises = exercises.filter((exercise) => exercise.chainId === chain?.id);
-  const submit = async (exercise: PredictionExercise) => {
-    const selected = choice[exercise.id];
-    if (!selected) return;
-    const grade = await bridge.gradePrediction({ repository: repositoryRef(repository), exerciseId: exercise.id, choiceId: selected });
-    onState({ grades: { ...grades, [exercise.id]: grade } });
-  };
-
-  if (status !== "ready" || !chain) {
-    return <div className="call-chain-panel empty" data-status={status}>
-      <Icon name="branch" size={22} />
-      <h3>Cross-file call chains</h3>
-      <p>{status === "error" ? "Call chains are unavailable for this repository." : status === "empty" ? "No resolved chain crosses a file boundary in this index yet." : "Deriving resolved call chains from the index…"}</p>
-    </div>;
-  }
-
-  return <div className="call-chain-panel" data-status="ready" data-chains={chains.length}>
-    <header><span>CROSS-FILE REASONING</span><h2>Predict the call chain</h2><p>Every option is a real symbol from this repository. Predict before you read the source.</p></header>
-    <div className="chain-picker">
-      {chains.map((candidate) => <button key={candidate.id} className={candidate.id === chain.id ? "active" : ""} onClick={() => onState({ activeChain: candidate.id })}>
-        <strong>{candidate.summary}</strong><small>{candidate.crossFileHops} cross-file hop{candidate.crossFileHops === 1 ? "" : "s"} · {candidate.files.length} files</small>
-      </button>)}
-    </div>
-    <ol className="chain-steps" data-summary={chain.summary}>
-      {chain.steps.map((step, index) => <li key={`${step.path}-${step.symbol}-${index}`}>
-        <button onClick={() => onAnchor(step.path, step.line)}>
-          <span>{String(index + 1).padStart(2, "0")}</span>
-          <strong>{step.symbol}()</strong>
-          <small>{step.path}:{step.line}</small>
-          {step.callLine && <em>calls next at :{step.callLine}</em>}
-        </button>
-      </li>)}
-    </ol>
-    {chainExercises.map((exercise) => {
-      const grade = grades[exercise.id];
-      return <section className="chain-exercise" key={exercise.id} data-kind={exercise.kind} data-graded={grade ? String(grade.correct) : "pending"}>
-        <div className="chain-exercise-head"><span>{exercise.kind === "next-call" ? "CALL PREDICTION" : "OUTPUT PREDICTION"}</span><small>{exercise.context}</small></div>
-        <h3>{exercise.prompt}</h3>
-        <div className="chain-options">
-          {exercise.options.map((option) => <label key={option.id} className={choice[exercise.id] === option.id ? "selected" : ""}>
-            <input type="radio" name={exercise.id} checked={choice[exercise.id] === option.id} onChange={() => onState({ choice: { ...choice, [exercise.id]: option.id } })} />
-            <strong>{option.label}</strong><small>{option.detail}</small>
-          </label>)}
-        </div>
-        <div className="chain-actions">
-          <button className="primary" disabled={!choice[exercise.id]} onClick={() => void submit(exercise)}>Check prediction</button>
-          {grade && <button className="ghost" onClick={() => onAnchor(grade.anchor.path, grade.anchor.line)}>Open {grade.anchor.path.split("/").at(-1)}:{grade.anchor.line}</button>}
-        </div>
-        {grade && <div className={`chain-feedback ${grade.correct ? "correct" : "incorrect"}`}>
-          <strong>{grade.correct ? "Correct" : `Not quite — the answer is ${grade.answerLabel}`}</strong>
-          <p>{grade.explanation}</p>
-        </div>}
-      </section>;
-    })}
-  </div>;
-}
-
-/**
- * Localization exercise (item 27). The gold file set never reaches the renderer
- * before submission, and the score separates coverage from navigation efficiency
- * so a learner who opens every file cannot pass by brute force.
- */
-function LocalizationPanel({ repository, trail, state, onState, onOpen }: { repository: Repository; trail: string[]; state: LocalizationState; onState: (update: Partial<LocalizationState>) => void; onOpen: (path: string) => void }) {
-  const { exercise, trailStart, selected, hints, score, error } = state;
-  const [query, setQuery] = useState("");
-
-  const inspected = useMemo(() => [...new Set(trail.slice(trailStart))], [trail, trailStart]);
-  const start = async () => {
-    try {
-      const next = await bridge.localizationExercise({ repository: repositoryRef(repository) });
-      onState({ exercise: next, trailStart: trail.length, selected: [], hints: [], score: null, error: null });
-    } catch (cause) {
-      onState({ error: readableError(cause) });
-    }
-  };
-  const revealHint = async () => {
-    if (!exercise) return;
-    const hint = await bridge.localizationHint({ repository: repositoryRef(repository), exerciseId: exercise.id, used: hints.map((item) => item.id) });
-    if (hint) onState({ hints: [...hints, hint] });
-  };
-  const submit = async () => {
-    if (!exercise) return;
-    onState({ score: await bridge.scoreLocalization({
-      repository: repositoryRef(repository),
-      exerciseId: exercise.id,
-      inspected,
-      selected,
-      hintsUsed: hints.map((item) => item.id),
-    }) });
-  };
-  const toggle = (filePath: string) => onState({ selected: selected.includes(filePath) ? selected.filter((item) => item !== filePath) : [...selected, filePath] });
-  const searchResults = query.trim()
-    ? repository.files.filter((file) => file.path.toLowerCase().includes(query.trim().toLowerCase())).slice(0, 8)
-    : [];
-
-  if (!exercise) {
-    return <div className="localization-panel empty">
-      <Icon name="search" size={22} />
-      <h3>Localization drill</h3>
-      <p>Practice finding the right files fast. Trace measures how much of the repository you had to read, not only whether you found the answer.</p>
-      <button className="primary" onClick={() => void start()}>Start localization exercise</button>
-      {error && <div className="error-banner">{error}</div>}
-    </div>;
-  }
-
-  return <div className="localization-panel" data-exercise={exercise.id} data-gold={exercise.goldCount}>
-    <header><span>LOCALIZATION DRILL</span><h2>Find the responsible files</h2><p className="localization-prompt">{exercise.prompt}</p>
-      <small>{exercise.goldCount} relevant file{exercise.goldCount > 1 ? "s" : ""} among {exercise.repositoryFiles.toLocaleString()} indexed.</small></header>
-    <div className="localization-trail">
-      <strong>Files you have opened <em data-inspected={inspected.length}>{inspected.length}</em></strong>
-      {inspected.length === 0 && <p>Open files from the explorer or search below; every file you read counts toward your efficiency score.</p>}
-      {inspected.map((filePath) => <label key={filePath} className={selected.includes(filePath) ? "selected" : ""}>
-        <input type="checkbox" checked={selected.includes(filePath)} onChange={() => toggle(filePath)} />
-        <code>{filePath}</code>
-      </label>)}
-    </div>
-    <label className="localization-search"><Icon name="search" size={13} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search for a file to open or select" /></label>
-    {searchResults.length > 0 && <div className="localization-results">
-      {searchResults.map((file) => <div key={file.path}>
-        <code>{file.path}</code>
-        <button onClick={() => onOpen(file.path)}>Open</button>
-        <button onClick={() => toggle(file.path)}>{selected.includes(file.path) ? "Unselect" : "Select"}</button>
-      </div>)}
-    </div>}
-    <div className="localization-actions">
-      <button className="ghost" disabled={hints.length >= exercise.hints.length} onClick={() => void revealHint()}>Reveal a hint ({hints.length}/{exercise.hints.length})</button>
-      <button className="primary" disabled={!selected.length} onClick={() => void submit()}>Submit {selected.length} file{selected.length === 1 ? "" : "s"}</button>
-    </div>
-    {hints.map((hint) => <div className="localization-hint" key={hint.id}><Icon name="spark" size={12} /><span>{hint.text}</span><em>-{Math.round(hint.cost * 100)}%</em></div>)}
-    {score && <div className="localization-score" data-grade={score.grade} data-passed={String(score.passed)}>
-      <div className="score-headline"><strong>{Math.round(score.score * 100)}%</strong><span>{score.grade}</span></div>
-      <div className="score-metrics">
-        <div><em data-metric="coverage">{Math.round(score.coverage * 100)}%</em><small>coverage</small></div>
-        <div><em data-metric="precision">{Math.round(score.precision * 100)}%</em><small>precision</small></div>
-        <div><em data-metric="file-efficiency">{Math.round(score.fileEfficiency * 100)}%</em><small>file efficiency</small></div>
-        <div><em data-metric="byte-efficiency">{Math.round(score.byteEfficiency * 100)}%</em><small>context efficiency</small></div>
-      </div>
-      <p>You read {score.inspectedCount} file{score.inspectedCount === 1 ? "" : "s"} ({(score.inspectedBytes / 1024).toFixed(1)} kB) for an optimal set of {score.optimalCount}; {score.wastedInspections} were irrelevant{score.firstHitRank ? `, and your first relevant file was #${score.firstHitRank}` : ""}.</p>
-      {score.missed.length > 0 && <div className="score-missed"><strong>Missed</strong>{score.missed.map((filePath) => <button key={filePath} onClick={() => onOpen(filePath)}>{filePath}</button>)}</div>}
-      {score.falsePositives.length > 0 && <div className="score-extra"><strong>Not relevant</strong>{score.falsePositives.map((filePath) => <code key={filePath}>{filePath}</code>)}</div>}
-      <button className="ghost" onClick={() => void start()}>Try another drill</button>
-    </div>}
-  </div>;
-}
-
 function LessonCanvas({ lesson, diagramOnly, onAnchor }: { lesson: Lesson; diagramOnly?: boolean; onAnchor: (path: string, line: number) => void }) {
   const blocks = (lesson.content ?? []).filter((block) => !diagramOnly || ["diagram", "timeline", "comparison", "callchain"].includes(block.type));
   if (!blocks.length) return <div className="lesson-canvas empty"><Icon name="book" size={26} /><h3>Source-first lesson</h3><p>This lesson is grounded in the active code anchor. Open Code to begin, then use Ask for questions.</p></div>;
@@ -598,7 +370,7 @@ function LessonCanvas({ lesson, diagramOnly, onAnchor }: { lesson: Lesson; diagr
   </div>;
 }
 
-function CodeWorkspace({ repository, lesson, currentFile, content, line, workspaceMode, fontBoost, trail, chainState, onChainState, localizationState, onLocalizationState, onOpen, onSelection, onWorkspaceMode, resolution, resolutionBusy, onResolve }: {
+function CodeWorkspace({ repository, lesson, currentFile, content, line, workspaceMode, fontBoost, trail, chainState, onChainState, localizationState, onLocalizationState, reviewState, onReviewState, onOpen, onSelection, onWorkspaceMode, resolution, resolutionBusy, onResolve }: {
   repository: Repository;
   lesson: Lesson;
   currentFile: RepoFile | null;
@@ -611,6 +383,8 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
   onChainState: (update: Partial<ChainState>) => void;
   localizationState: LocalizationState;
   onLocalizationState: (update: Partial<LocalizationState>) => void;
+  reviewState: ReviewState;
+  onReviewState: (update: Partial<ReviewState>) => void;
   onOpen: (file: RepoFile, line?: number) => void;
   onSelection: (selection: CodeSelection | null) => void;
   onWorkspaceMode: (mode: WorkspaceMode) => void;
@@ -692,6 +466,7 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
           <button className={workspaceMode === "code" ? "active" : ""} onClick={() => onWorkspaceMode("code")}><Icon name="code" size={12} />Code</button>
           <button className={workspaceMode === "chains" ? "active" : ""} onClick={() => onWorkspaceMode("chains")}><Icon name="branch" size={12} />Chains</button>
           <button className={workspaceMode === "locate" ? "active" : ""} onClick={() => onWorkspaceMode("locate")}><Icon name="search" size={12} />Locate</button>
+          <button className={workspaceMode === "review" ? "active" : ""} onClick={() => onWorkspaceMode("review")}><Icon name="target" size={12} />Review</button>
           <button className={workspaceMode === "notes" ? "active" : ""} onClick={() => onWorkspaceMode("notes")}><Icon name="file" size={12} />Notes</button>
           <span />
           {workspaceMode === "code" && <div className="editor-actions"><span>Ln {line}</span><span>{currentFile?.language ?? "text"}</span></div>}
@@ -699,8 +474,9 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
         {workspaceMode === "code" && <><div className="editor-tabs">{currentFile ? <div className="editor-tab active"><Icon name="file" size={13} />{currentFile.name}<span>×</span></div> : <div className="editor-tab active">No file selected</div>}</div><div className="breadcrumb"><Icon name="code" size={13} />{currentFile?.path.split("/").map((part, index, parts) => <span key={`${part}-${index}`}>{part}{index < parts.length - 1 && <Icon name="chevron" size={11} />}</span>)}</div></>}
         {workspaceMode === "lesson" && <LessonCanvas lesson={lesson} onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }} />}
         {workspaceMode === "diagram" && <LessonCanvas lesson={lesson} diagramOnly onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }} />}
-        {workspaceMode === "chains" && <CallChainPanel repository={repository} state={chainState} onState={onChainState} onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }} />}
-        {workspaceMode === "locate" && <LocalizationPanel repository={repository} trail={trail} state={localizationState} onState={onLocalizationState} onOpen={(filePath) => { const file = repository.files.find((item) => item.path === filePath); if (file) { onWorkspaceMode("code"); onOpen(file, 1); } }} />}
+        {workspaceMode === "chains" && <Suspense fallback={<div className="panel-loading">Loading exercises…</div>}><LazyCallChainPanel repository={repository} state={chainState} onState={onChainState} onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }} /></Suspense>}
+        {workspaceMode === "locate" && <Suspense fallback={<div className="panel-loading">Loading exercises…</div>}><LazyLocalizationPanel repository={repository} trail={trail} state={localizationState} onState={onLocalizationState} onOpen={(filePath) => { const file = repository.files.find((item) => item.path === filePath); if (file) { onWorkspaceMode("code"); onOpen(file, 1); } }} /></Suspense>}
+        {workspaceMode === "review" && <Suspense fallback={<div className="panel-loading">Loading exercises…</div>}><LazyReviewPanel repository={repository} trail={trail} state={reviewState} onState={onReviewState} onOpen={(filePath) => { const file = repository.files.find((item) => item.path === filePath); if (file) { onWorkspaceMode("code"); onOpen(file, 1); } }} /></Suspense>}
         {workspaceMode === "notes" && <div className="lesson-notes"><span>PRIVATE LEARNING NOTES</span><h3>{lesson.title}</h3><textarea value={notes} onChange={(event) => { setNotes(event.target.value); localStorage.setItem(`trace:notes:${repository.id}:${lesson.id}`, event.target.value); }} placeholder="Capture an insight, question, or source reference…" /><small>Stored locally for this repository and lesson.</small></div>}
         <div className={`editor-wrap ${workspaceMode === "code" ? "" : "hidden"}`}>
           {monacoReady ? <Suspense fallback={<div className="editor-loading">Loading local editor…</div>}><LazyEditor
@@ -960,6 +736,7 @@ export default function App() {
   const [inspectionTrail, setInspectionTrail] = useState<string[]>([]);
   const [chainState, setChainState] = useState<ChainState>(emptyChainState);
   const [localizationState, setLocalizationState] = useState<LocalizationState>(emptyLocalizationState);
+  const [reviewState, setReviewState] = useState<ReviewState>(emptyReviewState);
   const [resolution, setResolution] = useState<SymbolResolution | null>(null);
   const [resolutionBusy, setResolutionBusy] = useState(false);
 
@@ -990,6 +767,7 @@ export default function App() {
 
   const updateChainState = useCallback((update: Partial<ChainState>) => setChainState((previous) => ({ ...previous, ...update })), []);
   const updateLocalizationState = useCallback((update: Partial<LocalizationState>) => setLocalizationState((previous) => ({ ...previous, ...update })), []);
+  const updateReviewState = useCallback((update: Partial<ReviewState>) => setReviewState((previous) => ({ ...previous, ...update })), []);
 
   const loadSource = useCallback(async (repo: Repository, file: RepoFile, targetLine = 1) => {
     // The navigation trail is what the localization drill scores for efficiency.
@@ -1012,6 +790,7 @@ export default function App() {
     setRepository(repo);
     setChainState(emptyChainState);
     setLocalizationState(emptyLocalizationState);
+    setReviewState(emptyReviewState);
     setInspectionTrail([]);
     setCourse(nextCourse);
     setSkillGraph(nextGraph);
@@ -1244,7 +1023,7 @@ export default function App() {
       </header>
       <div className="workspace-grid">
         <CourseSidebar course={course} skillGraph={skillGraph} knowledgeGraph={knowledgeGraph} learnerState={learnerState} activeSkill={activeSkill} selectedLesson={selectedLesson} completed={completed} onSelect={selectLesson} onSelectSkill={selectSkill} onFamiliar={(node) => setLearnerState(addEvidence(learnerState, skillGraph, node.id, { kind: "self-report", strength: 0.62, detail: `Marked familiar: ${node.title}` }))} onChallenge={(node) => { const lesson = flattenLessons(course).find((item) => item.id === node.lessonId); if (lesson) void selectLesson(lesson).then(() => setMode("quiz")); }} onToggleComplete={toggleComplete} onEnhance={enhanceCourse} enhancing={courseBusy} enhanceElapsed={courseElapsed} provider={provider} canEnhance={agents[provider].available} />
-        <CodeWorkspace repository={repository} lesson={selectedLesson} currentFile={currentFile} content={content} line={line} workspaceMode={workspaceMode} fontBoost={fontBoosts[fontScale]} trail={inspectionTrail} chainState={chainState} onChainState={updateChainState} localizationState={localizationState} onLocalizationState={updateLocalizationState} onOpen={openFile} onSelection={setSelection} onWorkspaceMode={changeWorkspaceMode} resolution={resolution} resolutionBusy={resolutionBusy} onResolve={resolveAtCursor} />
+        <CodeWorkspace repository={repository} lesson={selectedLesson} currentFile={currentFile} content={content} line={line} workspaceMode={workspaceMode} fontBoost={fontBoosts[fontScale]} trail={inspectionTrail} chainState={chainState} onChainState={updateChainState} localizationState={localizationState} onLocalizationState={updateLocalizationState} reviewState={reviewState} onReviewState={updateReviewState} onOpen={openFile} onSelection={setSelection} onWorkspaceMode={changeWorkspaceMode} resolution={resolution} resolutionBusy={resolutionBusy} onResolve={resolveAtCursor} />
         <TutorPanel repository={repository} lesson={selectedLesson} skill={activeSkill} nextSkill={nextSkill} learnerState={learnerState} provider={provider} agents={agents} mode={mode} messages={messages} askMessages={askMessages} busy={agentBusy} currentFile={currentFile} selection={selection} guideStage={guideStage} onGuideStage={updateGuideStage} onWorkspaceMode={changeWorkspaceMode} onNextSkill={selectSkill} onProvider={setProvider} onMode={setMode} onAsk={ask} onSaveMemory={saveMemory} onQuizEvidence={() => updateEvidence("quiz", 0.55, `Submitted quiz answer for ${selectedLesson.title}`)} onDone={() => toggleComplete(selectedLesson)} complete={completed.has(selectedLesson.id)} practiceSession={practiceSession} practiceReport={practiceReport} practiceBusy={practiceBusy} onCreatePractice={createPractice} onInspectPractice={inspectPractice} onOpenPractice={() => { if (practiceSession) void bridge.openPractice(practiceSession.id); }} onRemovePractice={removePractice} />
       </div>
       {diagnosticOpen && <DiagnosticOverlay graph={skillGraph} onComplete={finishDiagnostic} onSkip={() => finishDiagnostic()} />}

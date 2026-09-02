@@ -263,6 +263,59 @@ try {
   assert.equal(localizationAudit.perfect.grade, "excellent");
   assert.match(localizationAudit.missing ?? "", /not active for this repository/);
 
+  // Item 28: three-stage RACE grading built from the real repository.
+  const raceAudit = await page.evaluate(async () => {
+    const repository = { id: window.traceWorkspace.repository.id, rootPath: window.traceWorkspace.repository.rootPath };
+    const task = await window.trace.raceTask({ repository });
+    const score = await window.trace.scoreLocalization({
+      repository,
+      exerciseId: task.localizationExerciseId,
+      inspected: [],
+      selected: [],
+    });
+    const gold = score.goldFiles;
+    const definitionFile = gold[0].split("/").pop();
+    const strong = await window.trace.gradeRace({
+      repository,
+      taskId: task.id,
+      understanding: `The ${task.symbol} function in ${gold[0]} returns the wrong result for some inputs, and the caller in ${gold[1]} expects the corrected value, so the observed output is wrong where the documented behaviour says it should be correct.`,
+      plan: `1. Change ${definitionFile} where ${task.symbol} is defined so the value is correct.\n2. Check the callers in ${gold[1].split("/").pop()} for assumptions about the old result.\n3. Add a regression test that reproduces the report and run the test suite to verify it.`,
+      files: gold,
+      inspected: gold,
+    });
+    const weak = await window.trace.gradeRace({
+      repository,
+      taskId: task.id,
+      understanding: "it is broken somewhere and does not work right at all for anyone using it",
+      plan: "fix it and ship it as soon as possible without breaking anything else in the repository",
+      files: ["README.md"],
+      inspected: ["README.md"],
+    });
+    let stale = null;
+    try {
+      await window.trace.gradeRace({ repository, taskId: "race-nope", understanding: "x", plan: "y", files: [] });
+    } catch (error) {
+      stale = error.message;
+    }
+    return { task, strong, weak, stale };
+  });
+  assert.equal(raceAudit.task.version, 1);
+  assert.deepEqual(Object.keys(raceAudit.task.rubric), ["understanding", "plan"]);
+  assert.equal(raceAudit.task.rubric.understanding.length, 5);
+  // The renderer receives criteria descriptions but never the grading predicates.
+  assert.equal(raceAudit.task.rubric.plan.some((item) => "test" in item), false);
+  assert.equal("stages" in raceAudit.task, false);
+  // A source-grounded submission beats a vague one on every stage.
+  assert.ok(raceAudit.strong.stageScores.understanding >= 0.8, JSON.stringify(raceAudit.strong.stageScores));
+  assert.ok(raceAudit.strong.stageScores.plan >= 0.8, JSON.stringify(raceAudit.strong.stageScores));
+  assert.equal(raceAudit.strong.stageScores.localization, 1);
+  assert.ok(["expert", "competent"].includes(raceAudit.strong.band), raceAudit.strong.band);
+  assert.ok(raceAudit.weak.overall < 0.35, String(raceAudit.weak.overall));
+  assert.equal(raceAudit.weak.band, "novice");
+  assert.ok(raceAudit.strong.overall > raceAudit.weak.overall + 0.5);
+  assert.ok(["understanding", "localization", "plan"].includes(raceAudit.weak.weakestStage));
+  assert.match(raceAudit.stale ?? "", /not active for this repository/);
+
   // Item 17: real-repository import resolution plus the optional language-server bridge.
   const languageServers = await page.evaluate(() => window.trace.detectLanguageServers());
   assert.ok(Object.keys(languageServers).length >= 6, JSON.stringify(languageServers));
@@ -367,6 +420,7 @@ try {
     screenshot: path.join(artifactDirectory, "flashinfer-electron.png"),
     callChains: { count: chainAudit.chainCount, longest: chainAudit.chains[0]?.summary, options: chainAudit.optionCount },
     localization: { symbol: localizationAudit.exercise.symbol, goldFiles: localizationAudit.guess.goldFiles, perfectScore: localizationAudit.perfect.score },
+    race: { strong: raceAudit.strong.stageScores, weak: raceAudit.weak.stageScores, bands: [raceAudit.strong.band, raceAudit.weak.band] },
   }, null, 2));
 } finally {
   await electronApp.close();

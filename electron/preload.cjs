@@ -24,6 +24,8 @@ contextBridge.exposeInMainWorld("trace", {
   localizationExercise: (request) => ipcRenderer.invoke("exercise:localization", request),
   localizationHint: (request) => ipcRenderer.invoke("exercise:localization-hint", request),
   scoreLocalization: (request) => ipcRenderer.invoke("exercise:localization-score", request),
+  raceTask: (request) => ipcRenderer.invoke("grade:race-task", request),
+  gradeRace: (request) => ipcRenderer.invoke("grade:race", request),
   askAgent: (request) => ipcRenderer.invoke("agents:ask", request),
   enhanceCourse: (request) => ipcRenderer.invoke("course:enhance", request),
   loadLearning: (request) => ipcRenderer.invoke("learning:load", request),

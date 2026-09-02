@@ -1,4 +1,4 @@
-import type { CallChain, CallChainStep, ContextPack, LocalizationExercise, ContextSection, KnowledgeGraphEdge, KnowledgeGraphNode, KnowledgeGraphSummary, LearnerState, LinkClassification, PredictionExercise, TraceBridge } from "./types";
+import type { CallChain, CallChainStep, ContextPack, LocalizationExercise, RaceStageResult, RaceTask, ContextSection, KnowledgeGraphEdge, KnowledgeGraphNode, KnowledgeGraphSummary, LearnerState, LinkClassification, PredictionExercise, TraceBridge } from "./types";
 import { nanoCourse, nanoLearnerState, nanoRepository, nanoSkillGraph, nanoSourceByPath } from "./nano-demo";
 
 export const demoRepository = nanoRepository;
@@ -166,6 +166,72 @@ function buildDemoLocalization(): DemoLocalization {
   };
 }
 
+// RACE grading mirror (item 28): the same three stages, weights, and length
+// factor as the main process, driven by the demo repository's own source.
+const demoStageWeights = { understanding: 0.3, localization: 0.35, plan: 0.35 };
+
+function demoRaceCriteria(exercise: DemoLocalization) {
+  const definitionFile = exercise.definition.path.split("/").at(-1)!;
+  const callerFiles = exercise.goldFiles.filter((filePath) => filePath !== exercise.definition.path);
+  const callerNames = callerFiles.map((filePath) => filePath.split("/").at(-1)!.toLowerCase());
+  const source = nanoSourceByPath[exercise.definition.path] ?? "";
+  const signature = source.split("\n").find((line) => line.includes(`def ${exercise.symbol}(`)) ?? "";
+  const parameters = signature.slice(signature.indexOf("(") + 1, signature.lastIndexOf(")"))
+    .split(",").map((part) => part.trim().split(/[:=\s]/)[0]).filter((name) => /^[A-Za-z_]\w*$/.test(name) && name !== "self");
+  const has = (text: string, needles: string[]) => needles.some((needle) => text.toLowerCase().includes(needle.toLowerCase()));
+  return {
+    understanding: [
+      { id: "names-symbol", description: `Names the failing function \`${exercise.symbol}\`.`, weight: 0.3, evidence: `${exercise.definition.path}:${exercise.definition.line}`, test: (text: string) => has(text, [exercise.symbol]) },
+      { id: "names-module", description: "Identifies the module or file that owns the behavior.", weight: 0.2, evidence: exercise.definition.path, test: (text: string) => has(text, [definitionFile, exercise.definition.path]) },
+      { id: "names-input", description: parameters.length ? `Refers to an actual input (${parameters.join(", ")}).` : "Describes the inputs the function receives.", weight: 0.2, evidence: exercise.definition.path, test: (text: string) => (parameters.length ? has(text, parameters) : /input|argument|parameter/i.test(text)) },
+      { id: "names-caller", description: "Connects the defect to a caller that depends on it.", weight: 0.15, evidence: callerFiles[0] ?? exercise.definition.path, test: (text: string) => has(text, callerNames) },
+      { id: "expected-vs-actual", description: "Contrasts the expected behavior with the observed behavior.", weight: 0.15, evidence: "issue report", test: (text: string) => /\b(expected|should|instead|actually|but|rather than|incorrect|wrong)\b/i.test(text) },
+    ],
+    plan: [
+      { id: "target-file", description: `Changes the file that defines \`${exercise.symbol}\`.`, weight: 0.3, evidence: exercise.definition.path, test: (text: string) => has(text, [definitionFile, exercise.definition.path]) },
+      { id: "validation", description: "States how the change will be validated.", weight: 0.2, evidence: "repository tests", test: (text: string) => /\b(test|tests|pytest|unittest|assert|regression|verify|reproduce)\b/i.test(text) },
+      { id: "check-callers", description: "Checks the callers that would be affected.", weight: 0.2, evidence: callerFiles[0] ?? exercise.definition.path, test: (text: string) => has(text, callerNames) || /\bcaller|call site|dependent|downstream\b/i.test(text) },
+      { id: "ordered-steps", description: "Breaks the work into at least three ordered steps.", weight: 0.15, evidence: "plan structure", test: (text: string) => text.split("\n").filter((line) => /^\s*(\d+[.)]|[-*•])\s+\S/.test(line)).length >= 3 || (text.match(/\b(first|then|next|after that|finally)\b/gi) ?? []).length >= 3 },
+      { id: "bounded-scope", description: "Stays inside the affected modules instead of proposing a rewrite.", weight: 0.15, evidence: exercise.definition.path.split("/")[0], test: (text: string) => !/\b(rewrite|refactor everything|redesign the whole|rearchitect)\b/i.test(text) },
+    ],
+  };
+}
+
+function demoGradeText(criteria: ReturnType<typeof demoRaceCriteria>["plan"], text: string): RaceStageResult {
+  const wordCount = text.trim().split(/\s+/).filter(Boolean).length;
+  const lengthFactor = Math.min(1, wordCount / 25);
+  const results = criteria.map((item) => ({ id: item.id, description: item.description, weight: item.weight, met: wordCount > 0 && item.test(text), evidence: item.evidence }));
+  const rawScore = results.filter((result) => result.met).reduce((sum, result) => sum + result.weight, 0);
+  return {
+    score: Math.max(0, Math.min(1, rawScore * lengthFactor)),
+    rawScore,
+    lengthFactor,
+    wordCount,
+    criteria: results,
+    met: results.filter((result) => result.met).map((result) => result.id),
+    missed: results.filter((result) => !result.met).map((result) => result.id),
+  };
+}
+
+function demoRaceTask(): RaceTask & { exercise: DemoLocalization } {
+  const exercise = buildDemoLocalization();
+  const criteria = demoRaceCriteria(exercise);
+  const callerCount = exercise.goldFiles.length - 1;
+  return {
+    id: `race-demo-${exercise.symbol}`,
+    version: 1,
+    symbol: exercise.symbol,
+    issue: `Issue: calls to \`${exercise.symbol}()\` return an unexpected result for some inputs. ${callerCount} caller file${callerCount === 1 ? "" : "s"} depend${callerCount === 1 ? "s" : ""} on it. Before writing any code, (1) restate what is going wrong in this repository's own terms, (2) name the files involved, and (3) describe a bounded plan to fix and validate it.`,
+    localizationExerciseId: exercise.id,
+    weights: demoStageWeights,
+    rubric: {
+      understanding: criteria.understanding.map(({ id, description, weight }) => ({ id, description, weight })),
+      plan: criteria.plan.map(({ id, description, weight }) => ({ id, description, weight })),
+    },
+    exercise,
+  };
+}
+
 function demoPack(request: Parameters<TraceBridge["askAgent"]>[0]): ContextPack {
   const context = request.context;
   const modeBudget = { lean: 2400, balanced: 5200, deep: 10000 }[context.mode];
@@ -314,6 +380,43 @@ export const browserBridge: TraceBridge = {
       falsePositives: selected.filter((filePath) => !gold.has(filePath)),
       goldFiles: exercise.goldFiles,
       definition: exercise.definition,
+    };
+  },
+  async raceTask() {
+    const { exercise, ...task } = demoRaceTask();
+    void exercise;
+    return task;
+  },
+  async gradeRace(request) {
+    const task = demoRaceTask();
+    const criteria = demoRaceCriteria(task.exercise);
+    const understanding = demoGradeText(criteria.understanding, request.understanding);
+    const plan = demoGradeText(criteria.plan, request.plan);
+    const localization = await browserBridge.scoreLocalization({
+      repository: request.repository,
+      exerciseId: task.exercise.id,
+      inspected: request.inspected ?? [],
+      selected: request.files,
+      hintsUsed: request.hintsUsed,
+    });
+    const stageScores = { understanding: understanding.score, localization: localization.f1, plan: plan.score };
+    const overall = Object.entries(demoStageWeights).reduce((sum, [stage, weight]) => sum + weight * stageScores[stage as keyof typeof stageScores], 0);
+    const band = (score: number): "expert" | "competent" | "emerging" | "novice" => (score >= 0.85 ? "expert" : score >= 0.65 ? "competent" : score >= 0.4 ? "emerging" : "novice");
+    const weakest = (Object.entries(stageScores).sort((left, right) => left[1] - right[1])[0][0]) as keyof typeof stageScores;
+    return {
+      taskId: task.id,
+      version: 1,
+      stages: { understanding, localization, plan },
+      stageScores,
+      stageBands: Object.fromEntries(Object.entries(stageScores).map(([stage, score]) => [stage, band(score)])),
+      overall,
+      band: band(overall),
+      weakestStage: weakest,
+      nextStep: {
+        understanding: "Re-read the definition and restate the defect using the real parameter and caller names.",
+        localization: "Follow the call edges out of the definition before answering; name every file that would have to change.",
+        plan: "Write an ordered plan that names the file to change, the callers to check, and the test that proves it.",
+      }[weakest],
     };
   },
   async askAgent(request) {

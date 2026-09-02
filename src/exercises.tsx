@@ -1,0 +1,266 @@
+import { useEffect, useMemo, useState } from "react";
+import { Icon, bridge, readableError, repositoryRef } from "./shell";
+import type { PredictionExercise, Repository } from "./types";
+import type { ChainState, LocalizationState, ReviewState } from "./exercise-state";
+
+/**
+ * Exercise panels (items 26-28).
+ *
+ * These are loaded lazily: a learner who never opens Chains, Locate, or Review
+ * never downloads them, which keeps the application entry chunk inside the
+ * budget enforced by the bundle test.
+ *
+ * All exercise state is owned by `App` and passed in, so switching workspace
+ * tabs or jumping into the editor never discards work in progress.
+ */
+
+
+/**
+ * Cross-file call chains plus prediction exercises (item 26). The correct answer
+ * lives in the main process, so a learner cannot read it out of the DOM.
+ */
+export function CallChainPanel({ repository, state, onState, onAnchor }: { repository: Repository; state: ChainState; onState: (update: Partial<ChainState>) => void; onAnchor: (path: string, line: number) => void }) {
+  const { chains, exercises, activeChain, choice, grades, status } = state;
+
+  useEffect(() => {
+    if (status !== "idle") return;
+    let active = true;
+    onState({ status: "loading" });
+    void bridge.callChains({ repository: repositoryRef(repository), limit: 8 })
+      .then((result) => {
+        if (!active) return;
+        onState({
+          chains: result.chains,
+          exercises: result.exercises,
+          activeChain: result.chains[0]?.id ?? null,
+          status: result.chains.length ? "ready" : "empty",
+        });
+      })
+      .catch(() => { if (active) onState({ status: "error" }); });
+    return () => { active = false; };
+  }, [onState, repository, status]);
+
+  const chain = chains.find((candidate) => candidate.id === activeChain) ?? chains[0];
+  const chainExercises = exercises.filter((exercise) => exercise.chainId === chain?.id);
+  const submit = async (exercise: PredictionExercise) => {
+    const selected = choice[exercise.id];
+    if (!selected) return;
+    const grade = await bridge.gradePrediction({ repository: repositoryRef(repository), exerciseId: exercise.id, choiceId: selected });
+    onState({ grades: { ...grades, [exercise.id]: grade } });
+  };
+
+  if (status !== "ready" || !chain) {
+    return <div className="call-chain-panel empty" data-status={status}>
+      <Icon name="branch" size={22} />
+      <h3>Cross-file call chains</h3>
+      <p>{status === "error" ? "Call chains are unavailable for this repository." : status === "empty" ? "No resolved chain crosses a file boundary in this index yet." : "Deriving resolved call chains from the index…"}</p>
+    </div>;
+  }
+
+  return <div className="call-chain-panel" data-status="ready" data-chains={chains.length}>
+    <header><span>CROSS-FILE REASONING</span><h2>Predict the call chain</h2><p>Every option is a real symbol from this repository. Predict before you read the source.</p></header>
+    <div className="chain-picker">
+      {chains.map((candidate) => <button key={candidate.id} className={candidate.id === chain.id ? "active" : ""} onClick={() => onState({ activeChain: candidate.id })}>
+        <strong>{candidate.summary}</strong><small>{candidate.crossFileHops} cross-file hop{candidate.crossFileHops === 1 ? "" : "s"} · {candidate.files.length} files</small>
+      </button>)}
+    </div>
+    <ol className="chain-steps" data-summary={chain.summary}>
+      {chain.steps.map((step, index) => <li key={`${step.path}-${step.symbol}-${index}`}>
+        <button onClick={() => onAnchor(step.path, step.line)}>
+          <span>{String(index + 1).padStart(2, "0")}</span>
+          <strong>{step.symbol}()</strong>
+          <small>{step.path}:{step.line}</small>
+          {step.callLine && <em>calls next at :{step.callLine}</em>}
+        </button>
+      </li>)}
+    </ol>
+    {chainExercises.map((exercise) => {
+      const grade = grades[exercise.id];
+      return <section className="chain-exercise" key={exercise.id} data-kind={exercise.kind} data-graded={grade ? String(grade.correct) : "pending"}>
+        <div className="chain-exercise-head"><span>{exercise.kind === "next-call" ? "CALL PREDICTION" : "OUTPUT PREDICTION"}</span><small>{exercise.context}</small></div>
+        <h3>{exercise.prompt}</h3>
+        <div className="chain-options">
+          {exercise.options.map((option) => <label key={option.id} className={choice[exercise.id] === option.id ? "selected" : ""}>
+            <input type="radio" name={exercise.id} checked={choice[exercise.id] === option.id} onChange={() => onState({ choice: { ...choice, [exercise.id]: option.id } })} />
+            <strong>{option.label}</strong><small>{option.detail}</small>
+          </label>)}
+        </div>
+        <div className="chain-actions">
+          <button className="primary" disabled={!choice[exercise.id]} onClick={() => void submit(exercise)}>Check prediction</button>
+          {grade && <button className="ghost" onClick={() => onAnchor(grade.anchor.path, grade.anchor.line)}>Open {grade.anchor.path.split("/").at(-1)}:{grade.anchor.line}</button>}
+        </div>
+        {grade && <div className={`chain-feedback ${grade.correct ? "correct" : "incorrect"}`}>
+          <strong>{grade.correct ? "Correct" : `Not quite — the answer is ${grade.answerLabel}`}</strong>
+          <p>{grade.explanation}</p>
+        </div>}
+      </section>;
+    })}
+  </div>;
+}
+
+/**
+ * Localization exercise (item 27). The gold file set never reaches the renderer
+ * before submission, and the score separates coverage from navigation efficiency
+ * so a learner who opens every file cannot pass by brute force.
+ */
+export function LocalizationPanel({ repository, trail, state, onState, onOpen }: { repository: Repository; trail: string[]; state: LocalizationState; onState: (update: Partial<LocalizationState>) => void; onOpen: (path: string) => void }) {
+  const { exercise, trailStart, selected, hints, score, error } = state;
+  const [query, setQuery] = useState("");
+
+  const inspected = useMemo(() => [...new Set(trail.slice(trailStart))], [trail, trailStart]);
+  const start = async () => {
+    try {
+      const next = await bridge.localizationExercise({ repository: repositoryRef(repository) });
+      onState({ exercise: next, trailStart: trail.length, selected: [], hints: [], score: null, error: null });
+    } catch (cause) {
+      onState({ error: readableError(cause) });
+    }
+  };
+  const revealHint = async () => {
+    if (!exercise) return;
+    const hint = await bridge.localizationHint({ repository: repositoryRef(repository), exerciseId: exercise.id, used: hints.map((item) => item.id) });
+    if (hint) onState({ hints: [...hints, hint] });
+  };
+  const submit = async () => {
+    if (!exercise) return;
+    onState({ score: await bridge.scoreLocalization({
+      repository: repositoryRef(repository),
+      exerciseId: exercise.id,
+      inspected,
+      selected,
+      hintsUsed: hints.map((item) => item.id),
+    }) });
+  };
+  const toggle = (filePath: string) => onState({ selected: selected.includes(filePath) ? selected.filter((item) => item !== filePath) : [...selected, filePath] });
+  const searchResults = query.trim()
+    ? repository.files.filter((file) => file.path.toLowerCase().includes(query.trim().toLowerCase())).slice(0, 8)
+    : [];
+
+  if (!exercise) {
+    return <div className="localization-panel empty">
+      <Icon name="search" size={22} />
+      <h3>Localization drill</h3>
+      <p>Practice finding the right files fast. Trace measures how much of the repository you had to read, not only whether you found the answer.</p>
+      <button className="primary" onClick={() => void start()}>Start localization exercise</button>
+      {error && <div className="error-banner">{error}</div>}
+    </div>;
+  }
+
+  return <div className="localization-panel" data-exercise={exercise.id} data-gold={exercise.goldCount}>
+    <header><span>LOCALIZATION DRILL</span><h2>Find the responsible files</h2><p className="localization-prompt">{exercise.prompt}</p>
+      <small>{exercise.goldCount} relevant file{exercise.goldCount > 1 ? "s" : ""} among {exercise.repositoryFiles.toLocaleString()} indexed.</small></header>
+    <div className="localization-trail">
+      <strong>Files you have opened <em data-inspected={inspected.length}>{inspected.length}</em></strong>
+      {inspected.length === 0 && <p>Open files from the explorer or search below; every file you read counts toward your efficiency score.</p>}
+      {inspected.map((filePath) => <label key={filePath} className={selected.includes(filePath) ? "selected" : ""}>
+        <input type="checkbox" checked={selected.includes(filePath)} onChange={() => toggle(filePath)} />
+        <code>{filePath}</code>
+      </label>)}
+    </div>
+    <label className="localization-search"><Icon name="search" size={13} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search for a file to open or select" /></label>
+    {searchResults.length > 0 && <div className="localization-results">
+      {searchResults.map((file) => <div key={file.path}>
+        <code>{file.path}</code>
+        <button onClick={() => onOpen(file.path)}>Open</button>
+        <button onClick={() => toggle(file.path)}>{selected.includes(file.path) ? "Unselect" : "Select"}</button>
+      </div>)}
+    </div>}
+    <div className="localization-actions">
+      <button className="ghost" disabled={hints.length >= exercise.hints.length} onClick={() => void revealHint()}>Reveal a hint ({hints.length}/{exercise.hints.length})</button>
+      <button className="primary" disabled={!selected.length} onClick={() => void submit()}>Submit {selected.length} file{selected.length === 1 ? "" : "s"}</button>
+    </div>
+    {hints.map((hint) => <div className="localization-hint" key={hint.id}><Icon name="spark" size={12} /><span>{hint.text}</span><em>-{Math.round(hint.cost * 100)}%</em></div>)}
+    {score && <div className="localization-score" data-grade={score.grade} data-passed={String(score.passed)}>
+      <div className="score-headline"><strong>{Math.round(score.score * 100)}%</strong><span>{score.grade}</span></div>
+      <div className="score-metrics">
+        <div><em data-metric="coverage">{Math.round(score.coverage * 100)}%</em><small>coverage</small></div>
+        <div><em data-metric="precision">{Math.round(score.precision * 100)}%</em><small>precision</small></div>
+        <div><em data-metric="file-efficiency">{Math.round(score.fileEfficiency * 100)}%</em><small>file efficiency</small></div>
+        <div><em data-metric="byte-efficiency">{Math.round(score.byteEfficiency * 100)}%</em><small>context efficiency</small></div>
+      </div>
+      <p>You read {score.inspectedCount} file{score.inspectedCount === 1 ? "" : "s"} ({(score.inspectedBytes / 1024).toFixed(1)} kB) for an optimal set of {score.optimalCount}; {score.wastedInspections} were irrelevant{score.firstHitRank ? `, and your first relevant file was #${score.firstHitRank}` : ""}.</p>
+      {score.missed.length > 0 && <div className="score-missed"><strong>Missed</strong>{score.missed.map((filePath) => <button key={filePath} onClick={() => onOpen(filePath)}>{filePath}</button>)}</div>}
+      {score.falsePositives.length > 0 && <div className="score-extra"><strong>Not relevant</strong>{score.falsePositives.map((filePath) => <code key={filePath}>{filePath}</code>)}</div>}
+      <button className="ghost" onClick={() => void start()}>Try another drill</button>
+    </div>}
+  </div>;
+}
+
+/**
+ * RACE-style review (item 28): understanding, localization, and plan are graded
+ * as three separate stages so a learner sees exactly which one is weak.
+ */
+export function ReviewPanel({ repository, trail, state, onState, onOpen }: { repository: Repository; trail: string[]; state: ReviewState; onState: (update: Partial<ReviewState>) => void; onOpen: (path: string) => void }) {
+  const { task, understanding, plan, files, report, error } = state;
+  const start = async () => {
+    try {
+      const next = await bridge.raceTask({ repository: repositoryRef(repository) });
+      onState({ task: next, report: null, error: null });
+    } catch (cause) {
+      onState({ error: readableError(cause) });
+    }
+  };
+  const submit = async () => {
+    if (!task) return;
+    onState({ report: await bridge.gradeRace({
+      repository: repositoryRef(repository),
+      taskId: task.id,
+      understanding,
+      plan,
+      files,
+      inspected: [...new Set(trail)],
+    }) });
+  };
+  const toggleFile = (filePath: string) => onState({ files: files.includes(filePath) ? files.filter((item) => item !== filePath) : [...files, filePath] });
+
+  if (!task) {
+    return <div className="review-panel empty">
+      <Icon name="target" size={22} />
+      <h3>Graded review</h3>
+      <p>Restate the issue, localize it, and plan the fix. Each stage is graded on its own rubric, built from this repository&rsquo;s source.</p>
+      <button className="primary" onClick={() => void start()}>Start graded review</button>
+      {error && <div className="error-banner">{error}</div>}
+    </div>;
+  }
+
+  const stageOrder: Array<"understanding" | "localization" | "plan"> = ["understanding", "localization", "plan"];
+  return <div className="review-panel" data-task={task.id}>
+    <header><span>GRADED REVIEW &middot; RACE</span><h2>Three stages, three rubrics</h2><p className="review-issue">{task.issue}</p></header>
+    <section className="review-stage" data-stage="understanding">
+      <h3>1 &middot; Understanding <em>{Math.round((task.weights.understanding ?? 0) * 100)}%</em></h3>
+      <textarea value={understanding} onChange={(event) => onState({ understanding: event.target.value })} placeholder="Restate the defect using the repository's own names: the function, its file, its inputs, and who depends on it…" />
+      <ul className="review-rubric">{task.rubric.understanding.map((item) => <li key={item.id} data-criterion={item.id} data-met={report ? String(report.stages.understanding.met.includes(item.id)) : "pending"}>{item.description}</li>)}</ul>
+    </section>
+    <section className="review-stage" data-stage="localization">
+      <h3>2 &middot; Localization <em>{Math.round((task.weights.localization ?? 0) * 100)}%</em></h3>
+      <p className="review-hint">Select every file that must be read or changed. Files you have opened appear first.</p>
+      <div className="review-files">
+        {[...new Set([...trail, ...files])].map((filePath) => <label key={filePath} className={files.includes(filePath) ? "selected" : ""}>
+          <input type="checkbox" checked={files.includes(filePath)} onChange={() => toggleFile(filePath)} />
+          <code>{filePath}</code>
+        </label>)}
+        {trail.length === 0 && <p className="review-hint">Open files from the explorer to add them here.</p>}
+      </div>
+    </section>
+    <section className="review-stage" data-stage="plan">
+      <h3>3 &middot; Plan <em>{Math.round((task.weights.plan ?? 0) * 100)}%</em></h3>
+      <textarea value={plan} onChange={(event) => onState({ plan: event.target.value })} placeholder={"1. Change …\n2. Check the callers …\n3. Validate with …"} />
+      <ul className="review-rubric">{task.rubric.plan.map((item) => <li key={item.id} data-criterion={item.id} data-met={report ? String(report.stages.plan.met.includes(item.id)) : "pending"}>{item.description}</li>)}</ul>
+    </section>
+    <div className="review-actions">
+      <button className="primary" disabled={!understanding.trim() && !plan.trim() && !files.length} onClick={() => void submit()}>Grade my review</button>
+      <button className="ghost" onClick={() => void start()}>Reset</button>
+    </div>
+    {report && <div className="review-report" data-band={report.band} data-weakest={report.weakestStage}>
+      <div className="score-headline"><strong>{Math.round(report.overall * 100)}%</strong><span>{report.band}</span></div>
+      <div className="score-metrics">
+        {stageOrder.map((stage) => <div key={stage}>
+          <em data-stage-score={stage}>{Math.round(report.stageScores[stage] * 100)}%</em>
+          <small>{stage} &middot; {report.stageBands[stage]}</small>
+        </div>)}
+      </div>
+      <p className="review-next"><strong>Weakest stage: {report.weakestStage}.</strong> {report.nextStep}</p>
+      {report.stages.localization.missed.length > 0 && <div className="score-missed"><strong>Files you missed</strong>{report.stages.localization.missed.map((filePath) => <button key={filePath} onClick={() => onOpen(filePath)}>{filePath}</button>)}</div>}
+    </div>}
+  </div>;
+}
