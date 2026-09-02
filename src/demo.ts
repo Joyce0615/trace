@@ -1,4 +1,4 @@
-import type { CallChain, CallChainStep, ContextPack, ContextSection, KnowledgeGraphEdge, KnowledgeGraphNode, KnowledgeGraphSummary, LearnerState, LinkClassification, PredictionExercise, TraceBridge } from "./types";
+import type { CallChain, CallChainStep, ContextPack, LocalizationExercise, ContextSection, KnowledgeGraphEdge, KnowledgeGraphNode, KnowledgeGraphSummary, LearnerState, LinkClassification, PredictionExercise, TraceBridge } from "./types";
 import { nanoCourse, nanoLearnerState, nanoRepository, nanoSkillGraph, nanoSourceByPath } from "./nano-demo";
 
 export const demoRepository = nanoRepository;
@@ -125,6 +125,47 @@ function buildDemoExercises(chains: CallChain[]): PredictionExercise[] {
   });
 }
 
+// Localization mirror (item 27): the gold set stays out of the exercise payload.
+type DemoLocalization = LocalizationExercise & { goldFiles: string[]; hintTexts: Record<string, string>; definition: { path: string; line: number; symbol: string } };
+
+function buildDemoLocalization(): DemoLocalization {
+  const edges = (nanoRepository.callEdges ?? []).filter((edge) => edge.resolved && edge.targetPath);
+  const byTarget = new Map<string, Set<string>>();
+  for (const edge of edges) {
+    const key = `${edge.targetPath}#${edge.callee}`;
+    byTarget.set(key, new Set([...(byTarget.get(key) ?? []), edge.path]));
+  }
+  const importance = new Map(nanoRepository.files.map((file) => [file.path, file.importance ?? 0]));
+  const candidate = [...byTarget.entries()]
+    .map(([key, callers]) => {
+      const targetPath = key.slice(0, key.lastIndexOf("#"));
+      return { targetPath, symbol: key.slice(key.lastIndexOf("#") + 1), callers: [...callers].filter((caller) => caller !== targetPath) };
+    })
+    .filter((entry) => entry.callers.length >= 1)
+    .sort((left, right) => right.callers.length - left.callers.length
+      || (importance.get(right.targetPath) ?? 0) - (importance.get(left.targetPath) ?? 0)
+      || left.targetPath.localeCompare(right.targetPath))[0];
+  const definition = nanoRepository.symbols.find((symbol) => symbol.name === candidate.symbol && symbol.path === candidate.targetPath);
+  const goldFiles = [candidate.targetPath, ...candidate.callers].slice(0, 4);
+  const language = nanoRepository.files.find((file) => file.path === candidate.targetPath)?.language ?? "plaintext";
+  return {
+    id: `locate-demo-${candidate.symbol}`,
+    version: 1,
+    symbol: candidate.symbol,
+    prompt: `A caller reports that \`${candidate.symbol}()\` returns the wrong result. Without reading the whole repository, find every file you would need to open to diagnose it: the file that defines \`${candidate.symbol}\` and the files that call it.`,
+    goldCount: goldFiles.length,
+    repositoryFiles: nanoRepository.files.length,
+    hints: [{ id: "language", cost: 0.05 }, { id: "directory", cost: 0.1 }, { id: "filename", cost: 0.2 }],
+    goldFiles,
+    hintTexts: {
+      language: `The definition is written in ${language}, and ${goldFiles.length} files are relevant in total.`,
+      directory: `Start under \`${candidate.targetPath.split("/")[0]}/\`.`,
+      filename: `The definition lives in a file named \`${candidate.targetPath.split("/").at(-1)}\`.`,
+    },
+    definition: { path: candidate.targetPath, line: definition?.line ?? 1, symbol: candidate.symbol },
+  };
+}
+
 function demoPack(request: Parameters<TraceBridge["askAgent"]>[0]): ContextPack {
   const context = request.context;
   const modeBudget = { lean: 2400, balanced: 5200, deep: 10000 }[context.mode];
@@ -225,6 +266,54 @@ export const browserBridge: TraceBridge = {
       answerLabel: answer.label,
       explanation: answer.explanation,
       anchor: exercise.anchor,
+    };
+  },
+  async localizationExercise() {
+    const { goldFiles, hintTexts, definition, ...exercise } = buildDemoLocalization();
+    void goldFiles; void hintTexts; void definition;
+    return exercise;
+  },
+  async localizationHint(request) {
+    const exercise = buildDemoLocalization();
+    const hint = exercise.hints.find((candidate) => !(request.used ?? []).includes(candidate.id));
+    return hint ? { id: hint.id, cost: hint.cost, text: exercise.hintTexts[hint.id] } : null;
+  },
+  async scoreLocalization(request) {
+    const exercise = buildDemoLocalization();
+    const gold = new Set(exercise.goldFiles);
+    const sizes = new Map(nanoRepository.files.map((file) => [file.path, file.size]));
+    const selected = [...new Set(request.selected)];
+    const inspected = [...new Set(request.inspected)];
+    const hintsUsed = [...new Set(request.hintsUsed ?? [])];
+    const hits = selected.filter((filePath) => gold.has(filePath));
+    const coverage = gold.size ? Math.min(1, hits.length / gold.size) : 0;
+    const precision = selected.length ? Math.min(1, hits.length / selected.length) : 0;
+    const f1 = coverage + precision > 0 ? (2 * coverage * precision) / (coverage + precision) : 0;
+    const inspectedBytes = inspected.reduce((sum, filePath) => sum + (sizes.get(filePath) ?? 0), 0);
+    const relevantBytes = inspected.filter((filePath) => gold.has(filePath)).reduce((sum, filePath) => sum + (sizes.get(filePath) ?? 0), 0);
+    const fileEfficiency = inspected.length ? Math.min(1, gold.size / Math.max(inspected.length, gold.size)) : 0;
+    const byteEfficiency = inspectedBytes > 0 ? relevantBytes / inspectedBytes : 0;
+    const hintPenalty = hintsUsed.reduce((sum, id) => sum + (exercise.hints.find((hint) => hint.id === id)?.cost ?? 0), 0);
+    const score = Math.max(0, Math.min(1, (0.5 * f1 + 0.3 * fileEfficiency + 0.2 * byteEfficiency) * (1 - hintPenalty)));
+    const firstHit = request.inspected.findIndex((filePath) => gold.has(filePath));
+    return {
+      exerciseId: exercise.id,
+      coverage, precision, f1, fileEfficiency, byteEfficiency, score,
+      passed: coverage >= 0.75 && precision >= 0.75,
+      grade: score >= 0.8 ? "excellent" : score >= 0.6 ? "solid" : score >= 0.35 ? "developing" : "scattered",
+      inspectedCount: inspected.length,
+      inspectedBytes,
+      relevantBytes,
+      optimalCount: gold.size,
+      wastedInspections: inspected.filter((filePath) => !gold.has(filePath)).length,
+      firstHitRank: firstHit >= 0 ? firstHit + 1 : null,
+      hintsUsed,
+      hintPenalty,
+      hits,
+      missed: exercise.goldFiles.filter((filePath) => !selected.includes(filePath)),
+      falsePositives: selected.filter((filePath) => !gold.has(filePath)),
+      goldFiles: exercise.goldFiles,
+      definition: exercise.definition,
     };
   },
   async askAgent(request) {

@@ -216,6 +216,22 @@ export const IPC_SCHEMAS = {
     exerciseId: s.string({ maxLength: 128 }),
     choiceId: s.string({ maxLength: 128 }),
   }),
+  "exercise:localization": s.object({
+    repository: repositoryReference,
+    symbol: s.string({ maxLength: 200, optional: true }),
+  }),
+  "exercise:localization-hint": s.object({
+    repository: repositoryReference,
+    exerciseId: s.string({ maxLength: 128 }),
+    used: s.array(s.string({ maxLength: 64 }), { maxItems: 8, optional: true }),
+  }),
+  "exercise:localization-score": s.object({
+    repository: repositoryReference,
+    exerciseId: s.string({ maxLength: 128 }),
+    inspected: s.array(s.string({ maxLength: 1_024 }), { maxItems: 500 }),
+    selected: s.array(s.string({ maxLength: 1_024 }), { maxItems: 100 }),
+    hintsUsed: s.array(s.string({ maxLength: 64 }), { maxItems: 8, optional: true }),
+  }),
   "agents:ask": s.object({
     provider: s.literal(["codex", "claude"]),
     rootPath: s.string({ maxLength: 4_096 }),

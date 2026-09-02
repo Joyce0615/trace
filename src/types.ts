@@ -440,6 +440,47 @@ export interface SymbolResolution {
   };
 }
 
+export interface LocalizationExercise {
+  id: string;
+  version: number;
+  symbol: string;
+  prompt: string;
+  goldCount: number;
+  repositoryFiles: number;
+  hints: Array<{ id: string; cost: number }>;
+}
+
+export interface LocalizationHint {
+  id: string;
+  text: string;
+  cost: number;
+}
+
+export interface LocalizationScore {
+  exerciseId: string;
+  coverage: number;
+  precision: number;
+  f1: number;
+  fileEfficiency: number;
+  byteEfficiency: number;
+  score: number;
+  passed: boolean;
+  grade: "excellent" | "solid" | "developing" | "scattered";
+  inspectedCount: number;
+  inspectedBytes: number;
+  relevantBytes: number;
+  optimalCount: number;
+  wastedInspections: number;
+  firstHitRank: number | null;
+  hintsUsed: string[];
+  hintPenalty: number;
+  hits: string[];
+  missed: string[];
+  falsePositives: string[];
+  goldFiles: string[];
+  definition: CodeAnchor;
+}
+
 export interface AgentState {
   codex: { available: boolean; version: string | null };
   claude: { available: boolean; version: string | null };
@@ -483,6 +524,9 @@ export interface TraceBridge {
   resolveSymbol(request: { repository: RepositoryRef; path: string; line: number; column?: number; symbol?: string }): Promise<SymbolResolution>;
   callChains(request: { repository: RepositoryRef; limit?: number }): Promise<{ version: number; chains: CallChain[]; exercises: PredictionExercise[] }>;
   gradePrediction(request: { repository: RepositoryRef; exerciseId: string; choiceId: string }): Promise<PredictionGrade>;
+  localizationExercise(request: { repository: RepositoryRef; symbol?: string }): Promise<LocalizationExercise>;
+  localizationHint(request: { repository: RepositoryRef; exerciseId: string; used?: string[] }): Promise<LocalizationHint | null>;
+  scoreLocalization(request: { repository: RepositoryRef; exerciseId: string; inspected: string[]; selected: string[]; hintsUsed?: string[] }): Promise<LocalizationScore>;
   askAgent(request: {
     provider: "codex" | "claude";
     rootPath: string;

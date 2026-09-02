@@ -14,12 +14,14 @@ import { buildKnowledgeGraph, loadKnowledgeGraph, neighborhood, saveKnowledgeGra
 import { registerValidatedHandlers } from "./ipc-schema.mjs";
 import { classifyExternalLink, confirmationPrompt, isInternalNavigation, repositoryOrigins } from "./link-policy.mjs";
 import { CALL_CHAIN_VERSION, buildCallChainExercises, buildCallChains, gradeCallChainAnswer, publicExercise } from "./call-chain.mjs";
+import { buildLocalizationExercise, nextHint, publicLocalizationExercise, scoreLocalization } from "./localization.mjs";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const openedRepositories = new Map();
 const knowledgeGraphs = new Map();
 const indexingRequests = new Map();
 const callChainSets = new Map();
+const localizationExercises = new Map();
 
 function openedRepository(candidate) {
   const repository = candidate?.id ? openedRepositories.get(candidate.id) : null;
@@ -248,6 +250,30 @@ const ipcHandlers = {
     const exercise = callChainSets.get(repository.id)?.get(request.exerciseId);
     if (!exercise) throw new Error("That prediction exercise is not active for this repository.");
     return gradeCallChainAnswer(exercise, request.choiceId);
+  },
+
+  "exercise:localization": (_event, request) => {
+    const repository = openedRepository(request.repository);
+    const exercise = buildLocalizationExercise(repository, { symbol: request.symbol });
+    if (!exercise) throw new Error("This repository has no resolved cross-file caller to localize.");
+    const active = localizationExercises.get(repository.id) ?? new Map();
+    active.set(exercise.id, exercise);
+    localizationExercises.set(repository.id, active);
+    return publicLocalizationExercise(exercise);
+  },
+
+  "exercise:localization-hint": (_event, request) => {
+    const repository = openedRepository(request.repository);
+    const exercise = localizationExercises.get(repository.id)?.get(request.exerciseId);
+    if (!exercise) throw new Error("That localization exercise is not active for this repository.");
+    return nextHint(exercise, request.used ?? []);
+  },
+
+  "exercise:localization-score": (_event, request) => {
+    const repository = openedRepository(request.repository);
+    const exercise = localizationExercises.get(repository.id)?.get(request.exerciseId);
+    if (!exercise) throw new Error("That localization exercise is not active for this repository.");
+    return scoreLocalization(exercise, request, repository);
   },
 
   "agents:ask": async (_event, request) => {

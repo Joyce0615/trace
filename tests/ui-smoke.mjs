@@ -136,6 +136,39 @@ try {
   await page.locator(".monaco-editor").waitFor({ timeout: 20_000 });
   await page.getByText("nanovllm/engine/llm_engine.py", { exact: false }).first().waitFor();
 
+  // Item 27: localization drill scores coverage separately from context efficiency.
+  await page.locator(".content-tabs").getByRole("button", { name: "Locate" }).click();
+  await page.getByRole("button", { name: "Start localization exercise" }).click();
+  const drill = page.locator(".localization-panel[data-exercise]");
+  await drill.waitFor();
+  assert.equal(await drill.getAttribute("data-gold"), "2");
+  const prompt = await drill.locator(".localization-prompt").innerText();
+  assert.match(prompt, /`generate\(\)`/);
+  // The gold paths must not be present in the DOM before submission.
+  assert.equal(await drill.evaluate((element) => element.outerHTML.includes("llm_engine.py")), false);
+  // Open one relevant and one irrelevant file; both count toward efficiency.
+  await drill.locator(".localization-search input").fill("nanovllm/engine/llm_engine.py");
+  await drill.locator(".localization-results button", { hasText: "Open" }).first().click();
+  await page.locator(".content-tabs").getByRole("button", { name: "Locate" }).click();
+  await drill.locator(".localization-search input").fill("nanovllm/models/qwen3.py");
+  await drill.locator(".localization-results button", { hasText: "Open" }).first().click();
+  await page.locator(".content-tabs").getByRole("button", { name: "Locate" }).click();
+  assert.equal(await drill.locator(".localization-trail em").getAttribute("data-inspected"), "2");
+  // Selecting only the definition file gives partial coverage and full precision.
+  await drill.locator(".localization-trail label", { hasText: "nanovllm/engine/llm_engine.py" }).click();
+  await drill.getByRole("button", { name: /^Submit 1 file$/ }).click();
+  await drill.locator(".localization-score").waitFor();
+  assert.equal(await drill.locator('[data-metric="coverage"]').innerText(), "50%");
+  assert.equal(await drill.locator('[data-metric="precision"]').innerText(), "100%");
+  assert.equal(await drill.locator(".localization-score").getAttribute("data-passed"), "false");
+  assert.match(await drill.locator(".score-missed button").innerText(), /nanovllm\/llm\.py/);
+  // A revealed hint is progressive and priced.
+  await drill.getByRole("button", { name: /Reveal a hint \(0\/3\)/ }).click();
+  await drill.locator(".localization-hint").waitFor();
+  assert.match(await drill.locator(".localization-hint span").innerText(), /written in python/);
+  assert.equal(await drill.locator(".localization-hint em").innerText(), "-5%");
+  await page.screenshot({ path: path.join(artifactDirectory, "localization-drill.png") });
+
   await page.getByRole("button", { name: "Ask", exact: true }).click();
   await page.getByText("Ask without losing your place.").waitFor();
   await page.locator(".tutor-input textarea").fill("Where is Scheduler defined?");

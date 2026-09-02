@@ -206,6 +206,63 @@ try {
   assert.match(chainAudit.grades[0].explanation, /\.(py|cu|cuh|h|cpp|c|ts|js|rs|go):\d+/);
   assert.match(chainAudit.bogus.error ?? "", /not active for this repository/);
 
+  // Item 27: localization drill built from the real index, scored in main.
+  const localizationAudit = await page.evaluate(async () => {
+    const repository = { id: window.traceWorkspace.repository.id, rootPath: window.traceWorkspace.repository.rootPath };
+    const exercise = await window.trace.localizationExercise({ repository });
+    const hints = [];
+    let used = [];
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const hint = await window.trace.localizationHint({ repository, exerciseId: exercise.id, used });
+      if (!hint) break;
+      hints.push(hint);
+      used = [...used, hint.id];
+    }
+    const files = window.traceWorkspace.repository.files.map((file) => file.path);
+    // A deliberately wrong guess reveals the gold set only after submission.
+    const guess = await window.trace.scoreLocalization({
+      repository,
+      exerciseId: exercise.id,
+      inspected: files.slice(0, 20),
+      selected: [files[0]],
+    });
+    const perfect = await window.trace.scoreLocalization({
+      repository,
+      exerciseId: exercise.id,
+      inspected: guess.goldFiles,
+      selected: guess.goldFiles,
+    });
+    let missing = null;
+    try {
+      await window.trace.scoreLocalization({ repository, exerciseId: "locate-nope", inspected: [], selected: [] });
+    } catch (error) {
+      missing = error.message;
+    }
+    return { exercise, hints, guess, perfect, missing, payload: JSON.stringify(exercise) };
+  });
+  assert.equal(localizationAudit.exercise.version, 1);
+  assert.ok(localizationAudit.exercise.goldCount >= 2, JSON.stringify(localizationAudit.exercise));
+  assert.ok(localizationAudit.exercise.repositoryFiles > 1_000);
+  // The gold set never reaches the renderer before the answer is submitted.
+  assert.equal("goldFiles" in localizationAudit.exercise, false);
+  assert.equal("definition" in localizationAudit.exercise, false);
+  assert.equal(/\.(py|cu|cuh|h|cpp)\b/.test(localizationAudit.payload), false, localizationAudit.payload);
+  assert.deepEqual(localizationAudit.hints.map((hint) => hint.id), ["language", "directory", "filename"]);
+  assert.ok(localizationAudit.hints.every((hint) => typeof hint.text === "string" && hint.text.length > 0));
+  // A near-random guess scores badly on both coverage and efficiency.
+  assert.ok(localizationAudit.guess.coverage < 1, JSON.stringify(localizationAudit.guess));
+  assert.equal(localizationAudit.guess.passed, false);
+  assert.ok(localizationAudit.guess.fileEfficiency < 0.5, String(localizationAudit.guess.fileEfficiency));
+  assert.ok(localizationAudit.guess.goldFiles.length >= 2);
+  assert.ok(localizationAudit.guess.goldFiles.every((filePath) => typeof filePath === "string" && filePath.length > 0));
+  // Submitting exactly the gold set is a perfect, passing run.
+  assert.equal(localizationAudit.perfect.coverage, 1);
+  assert.equal(localizationAudit.perfect.precision, 1);
+  assert.equal(localizationAudit.perfect.fileEfficiency, 1);
+  assert.equal(localizationAudit.perfect.passed, true);
+  assert.equal(localizationAudit.perfect.grade, "excellent");
+  assert.match(localizationAudit.missing ?? "", /not active for this repository/);
+
   // Item 17: real-repository import resolution plus the optional language-server bridge.
   const languageServers = await page.evaluate(() => window.trace.detectLanguageServers());
   assert.ok(Object.keys(languageServers).length >= 6, JSON.stringify(languageServers));
@@ -309,6 +366,7 @@ try {
     repositoryPath,
     screenshot: path.join(artifactDirectory, "flashinfer-electron.png"),
     callChains: { count: chainAudit.chainCount, longest: chainAudit.chains[0]?.summary, options: chainAudit.optionCount },
+    localization: { symbol: localizationAudit.exercise.symbol, goldFiles: localizationAudit.guess.goldFiles, perfectScore: localizationAudit.perfect.score },
   }, null, 2));
 } finally {
   await electronApp.close();

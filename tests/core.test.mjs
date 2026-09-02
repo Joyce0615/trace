@@ -18,6 +18,7 @@ import { PROMPT_ISOLATION_VERSION, buildIsolatedPrompt, createNonce, detectInjec
 import { tutorPrompt } from "../electron/agents.mjs";
 import { SECRET_SCANNER_VERSION, anonymizePath, redact, redactValue, scanText, shannonEntropy, summarizeFindings } from "../electron/secret-scanner.mjs";
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
+import { LOCALIZATION_VERSION, buildLocalizationExercise, nextHint, publicLocalizationExercise, scoreLocalization } from "../electron/localization.mjs";
 import { CALL_CHAIN_VERSION, buildCallChainExercises, buildCallChains, extractReturnExpressions, gradeCallChainAnswer, publicExercise, symbolBodyRange } from "../electron/call-chain.mjs";
 import { detectLanguageServers, resolveImportsStatically, resolveSymbol, serverForLanguage, shutdownLanguageServers } from "../electron/language-server.mjs";
 import { answerFromLocalIndex, buildContextPack, loadCachedResponse, saveCachedResponse } from "../electron/context-engine.mjs";
@@ -721,7 +722,8 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
   const preload = ["repository:choose", "repository:open", "repository:cancel", "repository:limits", "repository:read-file",
     "links:classify", "links:open", "links:last-decision",
     "agents:detect", "index:language-servers", "index:resolve", "graph:summary", "graph:neighborhood",
-    "lessons:call-chains", "lessons:grade-prediction", "agents:ask",
+    "lessons:call-chains", "lessons:grade-prediction",
+    "exercise:localization", "exercise:localization-hint", "exercise:localization-score", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
   assert.throws(() => schemaFor("repository:evil"), /is not a registered IPC channel/);
@@ -1258,4 +1260,102 @@ test("cross-file call chains generate grounded prediction exercises", async (con
       assert.ok(step.anchor.line >= 1);
     }
   }
+});
+
+test("localization exercises score coverage, precision, and context efficiency", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-locate-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "src"), { recursive: true });
+  await writeFile(path.join(rootPath, "src", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "src", "tokens.py"), "def tokenize(text):\n    return text.split()\n");
+  await writeFile(path.join(rootPath, "src", "reader.py"), "from src.tokens import tokenize\n\n\ndef read(text):\n    return tokenize(text)\n");
+  await writeFile(path.join(rootPath, "src", "writer.py"), "from src.tokens import tokenize\n\n\ndef write(text):\n    return len(tokenize(text))\n");
+  // A large irrelevant file makes byte efficiency measurably different from file efficiency.
+  await writeFile(path.join(rootPath, "src", "noise.py"), `def noise():\n    return 1\n${"# filler\n".repeat(400)}`);
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const exercise = buildLocalizationExercise(repository);
+  assert.equal(LOCALIZATION_VERSION, 1);
+  assert.ok(exercise, "expected a localization exercise");
+  // The gold set is the definition plus every cross-file caller.
+  assert.equal(exercise.symbol, "tokenize");
+  assert.deepEqual([...exercise.goldFiles].sort(), ["src/reader.py", "src/tokens.py", "src/writer.py"]);
+  assert.equal(exercise.definition.path, "src/tokens.py");
+  assert.equal(exercise.definition.line, 1);
+  // The prompt names the symbol but never the answer paths.
+  assert.match(exercise.prompt, /`tokenize\(\)`/);
+  for (const goldFile of exercise.goldFiles) assert.equal(exercise.prompt.includes(goldFile), false);
+
+  // The renderer projection carries no gold files and no hint text.
+  const shipped = publicLocalizationExercise(exercise);
+  assert.equal(shipped.goldCount, 3);
+  assert.equal("goldFiles" in shipped, false);
+  assert.equal("definition" in shipped, false);
+  assert.equal(JSON.stringify(shipped).includes("tokens.py"), false);
+  assert.deepEqual(shipped.hints.map((hint) => hint.id), ["language", "directory", "filename"]);
+  assert.equal(shipped.hints.some((hint) => "text" in hint), false);
+
+  // A perfect run: read exactly the gold files, select exactly the gold files.
+  const perfect = scoreLocalization(exercise, { inspected: exercise.goldFiles, selected: exercise.goldFiles }, repository);
+  assert.equal(perfect.coverage, 1);
+  assert.equal(perfect.precision, 1);
+  assert.equal(perfect.fileEfficiency, 1);
+  assert.equal(perfect.byteEfficiency, 1);
+  assert.equal(perfect.score, 1);
+  assert.equal(perfect.passed, true);
+  assert.equal(perfect.grade, "excellent");
+  assert.equal(perfect.wastedInspections, 0);
+  assert.equal(perfect.firstHitRank, 1);
+  assert.deepEqual(perfect.missed, []);
+
+  // Brute force: reading every file finds the answer but scores badly on efficiency.
+  const bruteForce = scoreLocalization(
+    exercise,
+    { inspected: repository.files.map((file) => file.path), selected: repository.files.map((file) => file.path) },
+    repository,
+  );
+  assert.equal(bruteForce.coverage, 1);
+  assert.ok(bruteForce.precision < 0.75, "selecting every file must cost precision");
+  assert.ok(bruteForce.fileEfficiency < perfect.fileEfficiency);
+  assert.ok(bruteForce.byteEfficiency < 0.5, `reading the large noise file must dominate the byte cost: ${bruteForce.byteEfficiency}`);
+  assert.ok(bruteForce.score < perfect.score);
+  assert.equal(bruteForce.passed, false, "brute force must not pass on precision");
+  assert.ok(bruteForce.wastedInspections >= 2);
+
+  // Byte efficiency is genuinely independent of file efficiency.
+  const twoSmall = scoreLocalization(exercise, { inspected: ["src/tokens.py", "src/reader.py", "src/writer.py", "src/__init__.py"], selected: exercise.goldFiles }, repository);
+  const twoLarge = scoreLocalization(exercise, { inspected: ["src/tokens.py", "src/reader.py", "src/writer.py", "src/noise.py"], selected: exercise.goldFiles }, repository);
+  assert.equal(twoSmall.fileEfficiency, twoLarge.fileEfficiency);
+  assert.ok(twoSmall.byteEfficiency > twoLarge.byteEfficiency, "a large irrelevant read must cost more than a small one");
+
+  // A partial answer reports exactly what was missed and what was wrong.
+  const partial = scoreLocalization(exercise, { inspected: ["src/noise.py", "src/tokens.py"], selected: ["src/tokens.py", "src/noise.py"] }, repository);
+  assert.ok(Math.abs(partial.coverage - 1 / 3) < 1e-9);
+  assert.equal(partial.precision, 0.5);
+  assert.equal(partial.firstHitRank, 2);
+  assert.deepEqual(partial.missed.sort(), ["src/reader.py", "src/writer.py"]);
+  assert.deepEqual(partial.falsePositives, ["src/noise.py"]);
+  assert.equal(partial.passed, false);
+
+  // Hints are progressive and discount the score, and they never skip ahead.
+  assert.equal(nextHint(exercise, []).id, "language");
+  assert.equal(nextHint(exercise, ["language"]).id, "directory");
+  assert.equal(nextHint(exercise, ["language", "directory", "filename"]), null);
+  const hinted = scoreLocalization(exercise, { inspected: exercise.goldFiles, selected: exercise.goldFiles, hintsUsed: ["language", "directory"] }, repository);
+  assert.equal(Math.round(hinted.hintPenalty * 100), 15);
+  assert.ok(Math.abs(hinted.score - 0.85) < 1e-9, String(hinted.score));
+  // An unknown hint id cannot be used to fabricate a penalty or a discount.
+  assert.deepEqual(scoreLocalization(exercise, { inspected: [], selected: [], hintsUsed: ["free-answer"] }, repository).hintsUsed, []);
+
+  // An empty submission scores zero without throwing.
+  const empty = scoreLocalization(exercise, { inspected: [], selected: [] }, repository);
+  assert.equal(empty.score, 0);
+  assert.equal(empty.firstHitRank, null);
+  assert.equal(empty.grade, "scattered");
+
+  // A repository with no cross-file caller has nothing to localize.
+  assert.equal(buildLocalizationExercise({ files: [], symbols: [], callEdges: [] }), null);
+  assert.equal(publicLocalizationExercise(null), null);
 });
