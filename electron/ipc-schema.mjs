@@ -242,6 +242,15 @@ export const IPC_SCHEMAS = {
     inspected: s.array(s.string({ maxLength: 1_024 }), { maxItems: 500, optional: true }),
     hintsUsed: s.array(s.string({ maxLength: 64 }), { maxItems: 8, optional: true }),
   }),
+  "trace:runtimes": null,
+  "trace:run": s.object({
+    repository: repositoryReference,
+    language: s.literal(["python"]),
+    snippet: s.string({ maxLength: 8_000, minLength: 1 }),
+    timeoutMs: s.number({ integer: true, min: 500, max: 60_000, optional: true }),
+    maxEvents: s.number({ integer: true, min: 1, max: 20_000, optional: true }),
+    includeLines: s.boolean({ optional: true }),
+  }),
   "agents:ask": s.object({
     provider: s.literal(["codex", "claude"]),
     rootPath: s.string({ maxLength: 4_096 }),

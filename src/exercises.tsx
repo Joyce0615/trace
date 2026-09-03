@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { Icon, bridge, readableError, repositoryRef } from "./shell";
 import type { PredictionExercise, Repository } from "./types";
-import type { ChainState, LocalizationState, ReviewState } from "./exercise-state";
+import type { ChainState, LocalizationState, ReviewState, TraceState } from "./exercise-state";
 
 /**
- * Exercise panels (items 26-28).
+ * Exercise panels (items 26-29).
  *
  * These are loaded lazily: a learner who never opens Chains, Locate, or Review
  * never downloads them, which keeps the application entry chunk inside the
@@ -96,6 +96,79 @@ export function CallChainPanel({ repository, state, onState, onAnchor }: { repos
       </section>;
     })}
   </div>;
+}
+
+/**
+ * Dynamic execution trace (item 29). A static chain says what *could* run; this
+ * runs a learner-authored snippet under a real interpreter and maps every
+ * recorded event back to a repository-relative `path:line`.
+ */
+export function ExecutionTracePanel({ repository, state, onState, onAnchor }: { repository: Repository; state: TraceState; onState: (update: Partial<TraceState>) => void; onAnchor: (path: string, line: number) => void }) {
+  const { runtimes, snippet, result, busy, error } = state;
+
+  useEffect(() => {
+    if (runtimes) return;
+    let active = true;
+    void bridge.traceRuntimes()
+      .then((detected) => { if (active) onState({ runtimes: detected }); })
+      .catch(() => { if (active) onState({ runtimes: {} }); });
+    return () => { active = false; };
+  }, [onState, runtimes]);
+
+  const python = runtimes?.python;
+  const run = async () => {
+    onState({ busy: true, error: null });
+    try {
+      onState({ result: await bridge.runTrace({ repository: repositoryRef(repository), language: "python", snippet }), busy: false });
+    } catch (cause) {
+      onState({ error: readableError(cause), busy: false });
+    }
+  };
+
+  const summary = result?.summary ?? null;
+  const trace = result?.trace ?? null;
+  return <section className="execution-trace" data-runtime={python?.available ? "available" : "unavailable"} data-status={trace?.status ?? "idle"}>
+    <div className="trace-head">
+      <span>DYNAMIC EXECUTION TRACE</span>
+      <small>{python?.available ? `${python.command} · ${python.version}` : "No Python runtime detected on this machine."}</small>
+    </div>
+    <p className="trace-note">Trace runs this snippet in the repository root and records only the frames that belong to this repository. It never runs anything you did not type.</p>
+    {result?.suggestions?.length ? <div className="trace-suggestions">
+      {result.suggestions.map((suggestion) => <button key={suggestion.path} onClick={() => onState({ snippet: suggestion.snippet })}>{suggestion.module}</button>)}
+    </div> : null}
+    <textarea className="trace-snippet" value={snippet} onChange={(event) => onState({ snippet: event.target.value })} placeholder={"from package.module import entry\nprint(entry(1))"} />
+    <div className="trace-actions">
+      <button className="primary" disabled={busy || !snippet.trim()} onClick={() => void run()}>{busy ? "Running…" : "Run and trace"}</button>
+      {trace?.durationMs !== undefined && <small>{trace.durationMs} ms · exit {trace.exitCode}</small>}
+    </div>
+    {error && <div className="error-banner">{error}</div>}
+    {trace && trace.status !== "ok" && <div className="trace-problem" data-status={trace.status}>
+      <strong>{trace.status === "unavailable" ? "Runtime unavailable" : trace.status === "timeout" ? "Run timed out" : trace.status === "error" ? "The snippet raised" : "Run failed"}</strong>
+      <pre>{trace.reason ?? trace.error ?? trace.stderr ?? ""}</pre>
+    </div>}
+    {trace?.stdout ? <pre className="trace-stdout">{trace.stdout}</pre> : null}
+    {summary && <div className="trace-summary">
+      <div className="score-metrics">
+        <div><em data-trace-metric="calls">{summary.callCount}</em><small>calls recorded</small></div>
+        <div><em data-trace-metric="files">{summary.files.length}</em><small>files entered</small></div>
+        <div><em data-trace-metric="confirmed">{summary.confirmedStaticEdges}</em><small>static edges confirmed</small></div>
+        <div><em data-trace-metric="dynamic">{summary.dynamicOnlyEdges}</em><small>dynamic-only edges</small></div>
+      </div>
+      <ol className="trace-transitions">
+        {summary.transitions.slice(0, 10).map((transition) => <li key={`${transition.from.path}-${transition.from.name}-${transition.to.path}-${transition.to.name}`} data-static={String(transition.inStaticGraph)}>
+          <button onClick={() => onAnchor(transition.to.path, transition.to.line)}>
+            <strong>{transition.from.name}() → {transition.to.name}()</strong>
+            <small>{transition.to.path}:{transition.to.line}</small>
+            <em>{transition.inStaticGraph ? "in static graph" : "dynamic only"}</em>
+          </button>
+        </li>)}
+      </ol>
+      {summary.returnValues.length > 0 && <div className="trace-returns">
+        <strong>Observed return values</strong>
+        {summary.returnValues.slice(-5).map((entry, index) => <code key={`${entry.path}-${entry.line}-${index}`}>{entry.function} → {entry.value}</code>)}
+      </div>}
+    </div>}
+  </section>;
 }
 
 /**

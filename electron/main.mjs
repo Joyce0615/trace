@@ -16,6 +16,7 @@ import { classifyExternalLink, confirmationPrompt, isInternalNavigation, reposit
 import { CALL_CHAIN_VERSION, buildCallChainExercises, buildCallChains, gradeCallChainAnswer, publicExercise } from "./call-chain.mjs";
 import { buildLocalizationExercise, nextHint, publicLocalizationExercise, scoreLocalization } from "./localization.mjs";
 import { buildRaceTask, gradeRaceSubmission, publicRaceTask } from "./race-grader.mjs";
+import { detectRuntimes, runExecutionTrace, suggestTraceSnippets, summarizeTrace } from "./execution-trace.mjs";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const openedRepositories = new Map();
@@ -302,6 +303,20 @@ const ipcHandlers = {
     const task = raceTasks.get(repository.id);
     if (!task || task.id !== request.taskId) throw new Error("That grading task is not active for this repository.");
     return gradeRaceSubmission(task, request, repository);
+  },
+
+  "trace:runtimes": async (_event) => detectRuntimes(),
+
+  "trace:run": async (_event, request) => {
+    const repository = openedRepository(request.repository);
+    // Running repository code is always learner-initiated and bounded; the
+    // result carries the run status even when the snippet fails.
+    const trace = await runExecutionTrace(repository, request);
+    return {
+      trace: { ...trace, events: (trace.events ?? []).slice(0, 500) },
+      summary: trace.events?.length ? summarizeTrace(trace, repository) : null,
+      suggestions: suggestTraceSnippets(repository, 4),
+    };
   },
 
   "agents:ask": async (_event, request) => {

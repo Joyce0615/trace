@@ -419,6 +419,23 @@ export const browserBridge: TraceBridge = {
       }[weakest],
     };
   },
+  async traceRuntimes() {
+    // The browser demo cannot start an interpreter; the desktop app can.
+    return { python: { id: "python", command: null, available: false, version: null } };
+  },
+  async runTrace(request) {
+    return {
+      trace: {
+        supported: true,
+        language: request.language,
+        status: "unavailable" as const,
+        reason: "Execution tracing runs a real interpreter, so it is only available in the Trace desktop app.",
+        events: [],
+      },
+      summary: null,
+      suggestions: [{ path: "nanovllm/engine/llm_engine.py", module: "nanovllm.engine.llm_engine", symbol: "step", snippet: "import nanovllm.engine.llm_engine" }],
+    };
+  },
   async askAgent(request) {
     await new Promise((resolve) => setTimeout(resolve, 550));
     const pack = demoPack(request);

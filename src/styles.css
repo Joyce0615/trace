@@ -506,3 +506,36 @@ button { color: inherit; }
 .review-report .score-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .review-next { color: #8d97a5; font-size: calc(10px + var(--font-boost)); }
 .review-next strong { color: #c8ad72; }
+
+/* Item 29: dynamic execution traces connected back to source. */
+.chains-column { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; }
+.chains-column .call-chain-panel { overflow: visible; flex: 0 0 auto; }
+.execution-trace { padding: 18px 26px 30px; display: flex; flex-direction: column; gap: 10px; border-top: 1px solid #1a2130; }
+.trace-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.trace-head span { color: #7fd8b6; font-size: calc(9px + var(--font-boost)); letter-spacing: .14em; }
+.trace-head small { color: #616b7c; font-family: "SFMono-Regular", Menlo, monospace; font-size: calc(9px + var(--font-boost)); }
+.trace-note { color: #7c8798; font-size: calc(10px + var(--font-boost)); }
+.trace-suggestions { display: flex; flex-wrap: wrap; gap: 6px; }
+.trace-suggestions button { padding: 3px 10px; border: 1px solid #262d3d; border-radius: 12px; background: none; color: #93a0b1; font-family: "SFMono-Regular", Menlo, monospace; font-size: calc(9px + var(--font-boost)); cursor: pointer; }
+.trace-snippet { min-height: 76px; padding: 9px 11px; border: 1px solid #1c2230; border-radius: 8px; background: #0c1017; color: #c9d1dd; font-family: "SFMono-Regular", Menlo, monospace; font-size: calc(11px + var(--font-boost)); resize: vertical; outline: none; }
+.trace-snippet:focus { border-color: #2f6f57; }
+.trace-actions { display: flex; align-items: center; gap: 10px; }
+.trace-actions .primary { padding: 7px 15px; border: 0; border-radius: 8px; background: var(--green); color: #0b0e14; font-size: calc(11px + var(--font-boost)); font-weight: 600; cursor: pointer; }
+.trace-actions .primary:disabled { opacity: .45; cursor: not-allowed; }
+.trace-actions small { color: #616b7c; font-family: "SFMono-Regular", Menlo, monospace; font-size: calc(9px + var(--font-boost)); }
+.trace-problem { padding: 9px 11px; border: 1px solid #4a2f2f; border-radius: 8px; background: #1a1113; color: #dfa2a2; font-size: calc(10px + var(--font-boost)); }
+.trace-problem[data-status="unavailable"] { border-color: #3a3222; background: #16130d; color: #c8ad72; }
+.trace-problem strong { display: block; margin-bottom: 3px; }
+.trace-problem pre, .trace-stdout { white-space: pre-wrap; word-break: break-word; font-family: "SFMono-Regular", Menlo, monospace; font-size: calc(9px + var(--font-boost)); }
+.trace-stdout { padding: 8px 10px; border: 1px solid #1c2230; border-radius: 8px; background: #0c1017; color: #9fb0c4; max-height: 120px; overflow-y: auto; }
+.trace-summary { display: flex; flex-direction: column; gap: 9px; }
+.trace-transitions { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.trace-transitions button { width: 100%; display: grid; grid-template-columns: minmax(0, auto) minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 7px 10px; border: 1px solid #1b2130; border-radius: 8px; background: #0e121a; color: #c3cad6; cursor: pointer; text-align: left; }
+.trace-transitions li[data-static="false"] button { border-color: #3d3a24; }
+.trace-transitions strong { font-size: calc(11px + var(--font-boost)); font-weight: 600; }
+.trace-transitions small { color: #6a7484; font-family: "SFMono-Regular", Menlo, monospace; font-size: calc(9px + var(--font-boost)); overflow: hidden; text-overflow: ellipsis; }
+.trace-transitions em { font-style: normal; font-size: calc(9px + var(--font-boost)); color: #7c8b6f; }
+.trace-transitions li[data-static="false"] em { color: #c8ad72; }
+.trace-returns { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+.trace-returns strong { color: #b3bcc9; font-size: calc(10px + var(--font-boost)); }
+.trace-returns code { padding: 2px 7px; border: 1px solid #1c2230; border-radius: 6px; background: #0c1017; color: #9fb0c4; font-family: "SFMono-Regular", Menlo, monospace; font-size: calc(9px + var(--font-boost)); }

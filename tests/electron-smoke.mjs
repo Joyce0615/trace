@@ -316,6 +316,52 @@ try {
   assert.ok(["understanding", "localization", "plan"].includes(raceAudit.weak.weakestStage));
   assert.match(raceAudit.stale ?? "", /not active for this repository/);
 
+  // Item 29: a real interpreter run, traced and mapped back to repository source.
+  const traceAudit = await page.evaluate(async () => {
+    const repository = { id: window.traceWorkspace.repository.id, rootPath: window.traceWorkspace.repository.rootPath };
+    const runtimes = await window.trace.traceRuntimes();
+    const target = "flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_w4a16_activations.py";
+    const ran = await window.trace.runTrace({
+      repository,
+      language: "python",
+      snippet: [
+        "import importlib.util",
+        `spec = importlib.util.spec_from_file_location("traced_mod", "${target}")`,
+        "module = importlib.util.module_from_spec(spec)",
+        "spec.loader.exec_module(module)",
+        "print(module.moe_activation_w1_rows('silu', 4))",
+      ].join("\n"),
+    });
+    // A snippet that needs an uninstalled dependency is reported truthfully.
+    const failing = await window.trace.runTrace({ repository, language: "python", snippet: "import flashinfer" });
+    return { runtimes, ran, failing, target };
+  });
+  assert.equal(traceAudit.runtimes.python.available, true, JSON.stringify(traceAudit.runtimes));
+  assert.match(traceAudit.runtimes.python.version, /Python 3/);
+  assert.equal(traceAudit.ran.trace.status, "ok", JSON.stringify({ error: traceAudit.ran.trace.error, stderr: traceAudit.ran.trace.stderr }));
+  assert.equal(traceAudit.ran.trace.stdout.trim(), "8");
+  assert.ok(traceAudit.ran.summary.callCount >= 3, JSON.stringify(traceAudit.ran.summary?.functions));
+  // Every traced frame is a real file in the open repository.
+  const indexedPaths = new Set(await page.evaluate(() => window.traceWorkspace.repository.files.map((file) => file.path)));
+  for (const entry of traceAudit.ran.summary.functions) {
+    assert.ok(indexedPaths.has(entry.path), `traced frame outside the index: ${entry.path}`);
+  }
+  assert.ok(traceAudit.ran.summary.files.includes(traceAudit.target), traceAudit.ran.summary.files.join(","));
+  // The recorded chain really is nested, and the observed return value is real.
+  const chainNames = traceAudit.ran.summary.transitions.map((item) => `${item.from.name}->${item.to.name}`);
+  assert.ok(chainNames.includes("moe_activation_w1_rows->is_gated_moe_activation"), chainNames.join(","));
+  assert.ok(chainNames.includes("is_gated_moe_activation->normalize_moe_activation"), chainNames.join(","));
+  assert.ok(traceAudit.ran.summary.returnValues.some((entry) => entry.function === "moe_activation_w1_rows" && entry.value === "8"));
+  assert.ok(traceAudit.ran.summary.maxDepth >= 2);
+  // A missing third-party dependency is a reported result, not an exception.
+  assert.equal(traceAudit.failing.trace.status, "error");
+  assert.match(traceAudit.failing.trace.error, /ModuleNotFoundError/);
+  // Frames that ran before the failure are still recorded and still anchored.
+  assert.equal(traceAudit.failing.summary.status, "error");
+  assert.ok(traceAudit.failing.summary.exceptionCount >= 1, JSON.stringify(traceAudit.failing.summary.exceptionCount));
+  assert.ok(traceAudit.failing.summary.files.every((filePath) => indexedPaths.has(filePath)), traceAudit.failing.summary.files.join(","));
+  assert.ok(traceAudit.failing.suggestions.length >= 1);
+
   // Item 17: real-repository import resolution plus the optional language-server bridge.
   const languageServers = await page.evaluate(() => window.trace.detectLanguageServers());
   assert.ok(Object.keys(languageServers).length >= 6, JSON.stringify(languageServers));
@@ -421,6 +467,7 @@ try {
     callChains: { count: chainAudit.chainCount, longest: chainAudit.chains[0]?.summary, options: chainAudit.optionCount },
     localization: { symbol: localizationAudit.exercise.symbol, goldFiles: localizationAudit.guess.goldFiles, perfectScore: localizationAudit.perfect.score },
     race: { strong: raceAudit.strong.stageScores, weak: raceAudit.weak.stageScores, bands: [raceAudit.strong.band, raceAudit.weak.band] },
+    executionTrace: { runtime: traceAudit.runtimes.python.version, calls: traceAudit.ran.summary.callCount, transitions: traceAudit.ran.summary.transitions.length, confirmed: traceAudit.ran.summary.confirmedStaticEdges, dynamicOnly: traceAudit.ran.summary.dynamicOnlyEdges },
   }, null, 2));
 } finally {
   await electronApp.close();

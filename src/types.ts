@@ -516,6 +516,68 @@ export interface RaceReport {
   nextStep: string;
 }
 
+export interface TraceRuntime {
+  id: string;
+  command: string | null;
+  available: boolean;
+  version: string | null;
+}
+
+export interface TraceEvent {
+  kind: "call" | "return" | "line" | "exception";
+  path: string | null;
+  line: number;
+  function: string;
+  definitionLine?: number;
+  depth: number;
+  callerPath: string | null;
+  callerLine: number | null;
+  callerFunction: string | null;
+  at: number;
+  value: string | null;
+}
+
+export interface ExecutionTrace {
+  supported: boolean;
+  language: string;
+  version?: number;
+  runtime?: string;
+  status: "ok" | "error" | "timeout" | "failed" | "unavailable" | "unsupported" | "invalid";
+  reason?: string;
+  error?: string | null;
+  truncated?: boolean;
+  durationMs?: number;
+  exitCode?: number;
+  stdout?: string;
+  stderr?: string;
+  events: TraceEvent[];
+}
+
+export interface TraceSummary {
+  version: number;
+  status: string;
+  eventCount: number;
+  callCount: number;
+  returnCount: number;
+  exceptionCount: number;
+  maxDepth: number;
+  durationMs: number;
+  truncated: boolean;
+  files: string[];
+  functions: Array<{ path: string; name: string; line: number; calls: number; indexed: boolean }>;
+  transitions: Array<{ from: { path: string; name: string; line: number | null }; to: { path: string; name: string; line: number }; count: number; crossFile: boolean; inStaticGraph: boolean }>;
+  confirmedStaticEdges: number;
+  dynamicOnlyEdges: number;
+  unindexedFunctions: number;
+  returnValues: Array<{ path: string | null; line: number; function: string; value: string | null }>;
+}
+
+export interface TraceRunResult {
+  trace: ExecutionTrace;
+  summary: TraceSummary | null;
+  suggestions: Array<{ path: string; module: string; symbol: string; snippet: string }>;
+}
+
 export interface AgentState {
   codex: { available: boolean; version: string | null };
   claude: { available: boolean; version: string | null };
@@ -564,6 +626,8 @@ export interface TraceBridge {
   scoreLocalization(request: { repository: RepositoryRef; exerciseId: string; inspected: string[]; selected: string[]; hintsUsed?: string[] }): Promise<LocalizationScore>;
   raceTask(request: { repository: RepositoryRef }): Promise<RaceTask>;
   gradeRace(request: { repository: RepositoryRef; taskId: string; understanding: string; plan: string; files: string[]; inspected?: string[]; hintsUsed?: string[] }): Promise<RaceReport>;
+  traceRuntimes(): Promise<Record<string, TraceRuntime>>;
+  runTrace(request: { repository: RepositoryRef; language: "python"; snippet: string; timeoutMs?: number; maxEvents?: number; includeLines?: boolean }): Promise<TraceRunResult>;
   askAgent(request: {
     provider: "codex" | "claude";
     rootPath: string;

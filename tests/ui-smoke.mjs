@@ -200,6 +200,17 @@ try {
   assert.match(await review.locator(".review-next").innerText(), /call edges/);
   await page.screenshot({ path: path.join(artifactDirectory, "graded-review.png") });
 
+  // Item 29: the browser demo cannot start an interpreter and says so honestly.
+  await page.locator(".content-tabs").getByRole("button", { name: "Chains" }).click();
+  const tracePanel = page.locator(".execution-trace");
+  await tracePanel.waitFor();
+  assert.equal(await tracePanel.getAttribute("data-runtime"), "unavailable");
+  await tracePanel.locator(".trace-snippet").fill("import nanovllm.engine.llm_engine");
+  await tracePanel.getByRole("button", { name: "Run and trace" }).click();
+  await tracePanel.locator('.trace-problem[data-status="unavailable"]').waitFor();
+  assert.match(await tracePanel.locator(".trace-problem pre").innerText(), /only available in the Trace desktop app/);
+  assert.equal(await tracePanel.locator(".trace-summary").count(), 0);
+
   await page.getByRole("button", { name: "Ask", exact: true }).click();
   await page.getByText("Ask without losing your place.").waitFor();
   await page.locator(".tutor-input textarea").fill("Where is Scheduler defined?");

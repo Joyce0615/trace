@@ -18,6 +18,7 @@ import { PROMPT_ISOLATION_VERSION, buildIsolatedPrompt, createNonce, detectInjec
 import { tutorPrompt } from "../electron/agents.mjs";
 import { SECRET_SCANNER_VERSION, anonymizePath, redact, redactValue, scanText, shannonEntropy, summarizeFindings } from "../electron/secret-scanner.mjs";
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
+import { EXECUTION_TRACE_VERSION, detectRuntimes, runExecutionTrace, suggestTraceSnippets, summarizeTrace, traceSupported, traceTimelineBlock } from "../electron/execution-trace.mjs";
 import { RACE_GRADER_VERSION, buildRaceTask, gradeRaceSubmission, publicRaceTask, signatureParameters } from "../electron/race-grader.mjs";
 import { LOCALIZATION_VERSION, buildLocalizationExercise, nextHint, publicLocalizationExercise, scoreLocalization } from "../electron/localization.mjs";
 import { CALL_CHAIN_VERSION, buildCallChainExercises, buildCallChains, extractReturnExpressions, gradeCallChainAnswer, publicExercise, symbolBodyRange } from "../electron/call-chain.mjs";
@@ -735,7 +736,7 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
     "agents:detect", "index:language-servers", "index:resolve", "graph:summary", "graph:neighborhood",
     "lessons:call-chains", "lessons:grade-prediction",
     "exercise:localization", "exercise:localization-hint", "exercise:localization-score",
-    "grade:race-task", "grade:race", "agents:ask",
+    "grade:race-task", "grade:race", "trace:runtimes", "trace:run", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
   assert.throws(() => schemaFor("repository:evil"), /is not a registered IPC channel/);
@@ -1490,4 +1491,122 @@ test("RACE grading scores understanding, localization, and plan separately", asy
   assert.equal(empty.stages.understanding.wordCount, 0);
   assert.equal(buildRaceTask(repository, null), null);
   assert.equal(publicRaceTask(null), null);
+});
+
+test("execution traces connect real runtime events back to source", async (context) => {
+  const runtimes = await detectRuntimes({ refresh: true });
+  if (!runtimes.python?.available) {
+    context.skip("No python runtime is installed, so execution tracing cannot be verified here.");
+    return;
+  }
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-exec-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "app"), { recursive: true });
+  await writeFile(path.join(rootPath, "app", "__init__.py"), "");
+  // `dispatch` reaches `helper` through a table, which no name-based static
+  // index can see: the trace must discover that edge dynamically.
+  await writeFile(
+    path.join(rootPath, "app", "core.py"),
+    'def helper(value):\n    return value * 2\n\n\ndef dispatch(name, value):\n    return TABLE[name](value)\n\n\nTABLE = {"double": helper}\n',
+  );
+  await writeFile(
+    path.join(rootPath, "app", "runner.py"),
+    'from app.core import dispatch, helper\n\n\ndef run(value):\n    direct = helper(value)\n    return dispatch("double", direct)\n',
+  );
+  await writeFile(path.join(rootPath, "app", "boom.py"), "def explode():\n    raise ValueError('kaboom')\n");
+  await writeFile(path.join(rootPath, "app", "slow.py"), "import time\n\n\ndef sleep_forever():\n    time.sleep(30)\n");
+  await writeFile(path.join(rootPath, "app", "loop.py"), "def spin(count):\n    return sum(step(index) for index in range(count))\n\n\ndef step(index):\n    return index\n");
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  assert.equal(EXECUTION_TRACE_VERSION, 1);
+  assert.equal(traceSupported("python"), true);
+  assert.equal(traceSupported("rust"), false);
+  assert.match(runtimes.python.version, /Python 3/);
+
+  const trace = await runExecutionTrace(repository, { language: "python", snippet: "from app.runner import run\nprint(run(3))" });
+  assert.equal(trace.status, "ok", JSON.stringify({ error: trace.error, stderr: trace.stderr }));
+  assert.equal(trace.exitCode, 0);
+  assert.equal(trace.stdout.trim(), "12");
+  assert.ok(trace.events.length >= 6, `expected recorded events, got ${trace.events.length}`);
+
+  // Every recorded event maps to a repository-relative path that really exists.
+  for (const event of trace.events) {
+    assert.ok(repository.files.some((file) => file.path === event.path), `event outside the repository: ${event.path}`);
+    assert.ok(event.line >= 1);
+    assert.ok(["call", "return", "exception"].includes(event.kind));
+  }
+  // Standard-library frames are filtered out at the tracer.
+  assert.equal(trace.events.some((event) => /site-packages|lib\/python/.test(event.path ?? "")), false);
+
+  const summary = summarizeTrace(trace, repository);
+  assert.equal(summary.status, "ok");
+  assert.equal(summary.callCount, summary.returnCount);
+  assert.deepEqual([...summary.files].sort(), ["app/__init__.py", "app/core.py", "app/runner.py"]);
+  assert.equal(summary.functions.find((entry) => entry.name === "helper").calls, 2, "helper runs twice: directly and through the table");
+  assert.equal(summary.functions.find((entry) => entry.name === "helper").indexed, true);
+  assert.ok(summary.maxDepth >= 2);
+  assert.ok(summary.durationMs > 0);
+
+  // The trace confirms the static edges and finds the one static analysis missed.
+  const staticEdge = summary.transitions.find((item) => item.from.name === "run" && item.to.name === "helper");
+  assert.ok(staticEdge, JSON.stringify(summary.transitions));
+  assert.equal(staticEdge.inStaticGraph, true);
+  assert.equal(staticEdge.crossFile, true);
+  const dynamicEdge = summary.transitions.find((item) => item.from.name === "dispatch" && item.to.name === "helper");
+  assert.ok(dynamicEdge, "the table dispatch edge was not recorded");
+  assert.equal(dynamicEdge.inStaticGraph, false);
+  assert.equal(repository.callEdges.some((edge) => edge.caller === "dispatch" && edge.callee === "helper" && edge.resolved), false, "the static index must genuinely lack this edge");
+  assert.equal(summary.confirmedStaticEdges, 2);
+  assert.equal(summary.dynamicOnlyEdges, 1);
+  // Observed return values are real, and the anchors point at the callee.
+  assert.ok(summary.returnValues.some((entry) => entry.function === "helper" && entry.value === "6"));
+  assert.ok(summary.returnValues.some((entry) => entry.function === "run" && entry.value === "12"));
+  assert.equal(dynamicEdge.to.line, 1);
+
+  // The timeline block is source-anchored for the lesson canvas.
+  const block = traceTimelineBlock(summary);
+  assert.equal(block.type, "timeline");
+  assert.ok(block.steps.length >= 3);
+  for (const step of block.steps) {
+    assert.ok(repository.files.some((file) => file.path === step.anchor.path), `dangling trace anchor ${step.anchor.path}`);
+  }
+
+  // A raising snippet is a result, not a crash: the real traceback is captured.
+  const failing = await runExecutionTrace(repository, { language: "python", snippet: "from app.boom import explode\nexplode()" });
+  assert.equal(failing.status, "error");
+  assert.match(failing.error, /ValueError: kaboom/);
+  assert.ok(failing.events.some((event) => event.kind === "exception" && event.path === "app/boom.py"));
+  assert.equal(summarizeTrace(failing, repository).exceptionCount >= 1, true);
+
+  // A runaway snippet is stopped by the timeout rather than hanging the app.
+  const slow = await runExecutionTrace(repository, { language: "python", snippet: "from app.slow import sleep_forever\nsleep_forever()", timeoutMs: 1_200 });
+  assert.equal(slow.status, "timeout");
+  assert.match(slow.reason, /1200 ms/);
+
+  // The event cap is enforced and reported instead of returning an unbounded trace.
+  const capped = await runExecutionTrace(repository, { language: "python", snippet: "from app.loop import spin\nprint(spin(200))", maxEvents: 40 });
+  assert.equal(capped.truncated, true);
+  assert.ok(capped.events.length <= 40, String(capped.events.length));
+
+  // Guard rails: unsupported language, empty snippet, oversized snippet.
+  assert.equal((await runExecutionTrace(repository, { language: "rust", snippet: "fn main() {}" })).status, "unsupported");
+  assert.equal((await runExecutionTrace(repository, { language: "python", snippet: "   " })).status, "invalid");
+  assert.match((await runExecutionTrace(repository, { language: "python", snippet: "x=1\n".repeat(4_000) })).status, /invalid/);
+
+  // Captured output is redacted before it can be shown or persisted.
+  await writeFile(path.join(rootPath, "app", "leak.py"), 'def leak():\n    return "ghp_' + "a".repeat(36) + '"\n');
+  const leaking = await runExecutionTrace(repository, { language: "python", snippet: "from app.leak import leak\nprint(leak())" });
+  assert.equal(leaking.status, "ok");
+  assert.equal(JSON.stringify(leaking).includes("ghp_" + "a".repeat(36)), false, "a secret survived the trace redaction");
+  assert.match(JSON.stringify(leaking), /REDACTED:github-token/);
+
+  // Snippet suggestions point at real modules in this repository.
+  const suggestions = suggestTraceSnippets(repository, 3);
+  assert.ok(suggestions.length >= 1);
+  for (const suggestion of suggestions) {
+    assert.ok(repository.files.some((file) => file.path === suggestion.path));
+    assert.match(suggestion.snippet, new RegExp(`import ${suggestion.module.replace(/\./g, "\\.")}`));
+  }
 });

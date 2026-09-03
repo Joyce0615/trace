@@ -1,4 +1,4 @@
-import type { CallChain, LocalizationExercise, LocalizationHint, LocalizationScore, PredictionExercise, PredictionGrade, RaceReport, RaceTask } from "./types";
+import type { CallChain, LocalizationExercise, LocalizationHint, LocalizationScore, PredictionExercise, PredictionGrade, RaceReport, RaceTask, TraceRunResult, TraceRuntime } from "./types";
 
 /**
  * Exercise state shapes.
@@ -34,6 +34,16 @@ export type ReviewState = {
   report: RaceReport | null;
   error: string | null;
 };
+
+export type TraceState = {
+  runtimes: Record<string, TraceRuntime> | null;
+  snippet: string;
+  result: TraceRunResult | null;
+  busy: boolean;
+  error: string | null;
+};
+
+export const emptyTraceState: TraceState = { runtimes: null, snippet: "", result: null, busy: false, error: null };
 
 export const emptyChainState: ChainState = { chains: [], exercises: [], activeChain: null, choice: {}, grades: {}, status: "idle" };
 export const emptyLocalizationState: LocalizationState = { exercise: null, trailStart: 0, selected: [], hints: [], score: null, error: null };
