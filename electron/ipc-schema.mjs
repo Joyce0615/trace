@@ -251,6 +251,16 @@ export const IPC_SCHEMAS = {
     maxEvents: s.number({ integer: true, min: 1, max: 20_000, optional: true }),
     includeLines: s.boolean({ optional: true }),
   }),
+  "graph:architecture": s.object({
+    repository: repositoryReference,
+    moduleDepth: s.number({ integer: true, min: 1, max: 4, optional: true }),
+  }),
+  "graph:symbol-flow": s.object({
+    repository: repositoryReference,
+    path: s.string({ maxLength: 4_096 }),
+    symbol: s.string({ maxLength: 200 }),
+    line: s.number({ integer: true, min: 1, max: 10_000_000, optional: true }),
+  }),
   "agents:ask": s.object({
     provider: s.literal(["codex", "claude"]),
     rootPath: s.string({ maxLength: 4_096 }),

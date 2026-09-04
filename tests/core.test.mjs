@@ -18,6 +18,7 @@ import { PROMPT_ISOLATION_VERSION, buildIsolatedPrompt, createNonce, detectInjec
 import { tutorPrompt } from "../electron/agents.mjs";
 import { SECRET_SCANNER_VERSION, anonymizePath, redact, redactValue, scanText, shannonEntropy, summarizeFindings } from "../electron/secret-scanner.mjs";
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
+import { ARCHITECTURE_VERSION, architectureDiagramBlock, buildArchitecture, dataFlow, moduleFor, symbolNeighborhood } from "../electron/architecture.mjs";
 import { EXECUTION_TRACE_VERSION, detectRuntimes, runExecutionTrace, suggestTraceSnippets, summarizeTrace, traceSupported, traceTimelineBlock } from "../electron/execution-trace.mjs";
 import { RACE_GRADER_VERSION, buildRaceTask, gradeRaceSubmission, publicRaceTask, signatureParameters } from "../electron/race-grader.mjs";
 import { LOCALIZATION_VERSION, buildLocalizationExercise, nextHint, publicLocalizationExercise, scoreLocalization } from "../electron/localization.mjs";
@@ -736,7 +737,8 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
     "agents:detect", "index:language-servers", "index:resolve", "graph:summary", "graph:neighborhood",
     "lessons:call-chains", "lessons:grade-prediction",
     "exercise:localization", "exercise:localization-hint", "exercise:localization-score",
-    "grade:race-task", "grade:race", "trace:runtimes", "trace:run", "agents:ask",
+    "grade:race-task", "grade:race", "trace:runtimes", "trace:run",
+    "graph:architecture", "graph:symbol-flow", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
   assert.throws(() => schemaFor("repository:evil"), /is not a registered IPC channel/);
@@ -1609,4 +1611,112 @@ test("execution traces connect real runtime events back to source", async (conte
     assert.ok(repository.files.some((file) => file.path === suggestion.path));
     assert.match(suggestion.snippet, new RegExp(`import ${suggestion.module.replace(/\./g, "\\.")}`));
   }
+});
+
+test("architecture view derives layers, boundaries, and data flow", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-arch-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  for (const directory of ["app/api", "app/service", "app/util", "app/loop"]) {
+    await mkdir(path.join(rootPath, directory), { recursive: true });
+    await writeFile(path.join(rootPath, directory, "__init__.py"), "");
+  }
+  await writeFile(
+    path.join(rootPath, "app/api", "handler.py"),
+    "from app.service.engine import process\nfrom app.util.text import clean\n\n\ndef handle(request, verbose=False):\n    payload = clean(request)\n    result = process(payload)\n    return result\n",
+  );
+  await writeFile(
+    path.join(rootPath, "app/service", "engine.py"),
+    "from app.util.text import clean\n\n\ndef process(payload):\n    normalized = clean(payload)\n    return normalized\n",
+  );
+  await writeFile(path.join(rootPath, "app/util", "text.py"), "def clean(value):\n    return value.strip()\n");
+  // A genuine import cycle between two modules, which must break layering.
+  await writeFile(path.join(rootPath, "app/loop", "left.py"), "from app.loop.right import beta\n\n\ndef alpha():\n    return beta()\n");
+  await writeFile(path.join(rootPath, "app/loop", "right.py"), "import app.loop.left\n\n\ndef beta():\n    return 2\n");
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const architecture = buildArchitecture(repository, { moduleDepth: 2 });
+
+  assert.equal(ARCHITECTURE_VERSION, 1);
+  assert.equal(moduleFor("app/api/handler.py", 2), "app/api");
+  assert.equal(moduleFor("README.md", 2), "<root>");
+  const moduleIds = architecture.modules.map((entry) => entry.id);
+  for (const expected of ["app/api", "app/service", "app/util", "app/loop"]) {
+    assert.ok(moduleIds.includes(expected), moduleIds.join(", "));
+  }
+
+  // Layers follow the dependency direction: api -> service -> util.
+  const layerOf = new Map(architecture.modules.map((entry) => [entry.id, entry.layer]));
+  assert.equal(layerOf.get("app/api"), 0);
+  assert.ok(layerOf.get("app/service") > layerOf.get("app/api"), JSON.stringify([...layerOf]));
+  assert.ok(layerOf.get("app/util") > layerOf.get("app/service"));
+
+  // Fan-in and fan-out are aggregated from resolved imports only.
+  const util = architecture.modules.find((entry) => entry.id === "app/util");
+  assert.equal(util.fanIn, 2, "app/util is imported by app/api and app/service");
+  assert.equal(util.fanOut, 0);
+  assert.equal(architecture.modules.find((entry) => entry.id === "app/api").fanOut, 2);
+  const edge = architecture.edges.find((item) => item.from === "app/api" && item.to === "app/util");
+  assert.equal(edge.weight, 1);
+  assert.equal(edge.examples[0].path, "app/api/handler.py");
+  assert.ok(repository.files.some((file) => file.path === edge.examples[0].targetPath));
+
+  // The mutual import inside app/loop is a real cycle and stays inside one module.
+  assert.equal(architecture.stats.acyclic, true, "a cycle within one module is not a module-level cycle");
+  assert.equal(architecture.violations.some((item) => item.kind === "upward"), false);
+
+  // A cycle *between* modules is detected and reported.
+  await writeFile(path.join(rootPath, "app/util", "back.py"), "from app.service.engine import process\n\n\ndef helper():\n    return process(1)\n");
+  const cyclic = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const cyclicArchitecture = buildArchitecture(cyclic, { moduleDepth: 2 });
+  assert.equal(cyclicArchitecture.stats.acyclic, false);
+  assert.equal(cyclicArchitecture.stats.cycleCount, 1);
+  assert.deepEqual(cyclicArchitecture.cycles[0].modules, ["app/service", "app/util"]);
+  const cycleViolations = cyclicArchitecture.violations.filter((item) => item.kind === "cycle");
+  assert.equal(cycleViolations.length, 2, JSON.stringify(cyclicArchitecture.violations));
+  assert.match(cycleViolations[0].detail, /import each other/);
+  // Modules inside a cycle share one layer, so the cycle cannot inflate depth.
+  const cyclicLayers = new Map(cyclicArchitecture.modules.map((entry) => [entry.id, entry.layer]));
+  assert.equal(cyclicLayers.get("app/service"), cyclicLayers.get("app/util"));
+  assert.ok(cyclicArchitecture.modules.find((entry) => entry.id === "app/util").cycleId);
+
+  // Callers and callees come from resolved call edges, with cross-file flags.
+  const neighborhood = symbolNeighborhood(repository, { path: "app/util/text.py", symbol: "clean" });
+  assert.equal(neighborhood.fanIn, 2);
+  assert.deepEqual(neighborhood.callers.map((caller) => caller.symbol).sort(), ["handle", "process"]);
+  assert.ok(neighborhood.callers.every((caller) => caller.crossFile));
+  const handler = symbolNeighborhood(repository, { path: "app/api/handler.py", symbol: "handle" });
+  assert.deepEqual(handler.callees.map((callee) => callee.symbol).sort(), ["clean", "process"]);
+  assert.equal(handler.fanIn, 0, "nothing calls the entry handler");
+
+  // Data flow follows parameters through assignments into the return.
+  const source = await readFile(path.join(rootPath, "app/api", "handler.py"), "utf8");
+  const flow = dataFlow(source, { path: "app/api/handler.py", symbol: "handle", line: 5 }, "python");
+  assert.deepEqual(flow.parameters.map((parameter) => parameter.name), ["request", "verbose"]);
+  assert.equal(flow.parameters.find((parameter) => parameter.name === "request").reachesReturn, true);
+  assert.equal(flow.parameters.find((parameter) => parameter.name === "verbose").reachesReturn, false);
+  assert.deepEqual(flow.unusedParameters, ["verbose"]);
+  assert.deepEqual(flow.steps.map((step) => step.target), ["payload", "result"]);
+  assert.deepEqual(flow.steps[0].dependsOn, ["request"]);
+  assert.deepEqual(flow.steps[1].parameters, ["request"], "the taint carries through payload into result");
+  assert.deepEqual(flow.steps[0].calls, ["clean"]);
+  assert.equal(flow.returns.length, 1);
+  assert.deepEqual(flow.returns[0].parameters, ["request"]);
+  assert.equal(flow.returns[0].line, 8);
+
+  // The architecture renders as a source-anchored diagram block.
+  const block = architectureDiagramBlock(architecture);
+  assert.equal(block.type, "diagram");
+  assert.ok(block.nodes.length >= 3);
+  assert.match(block.caption, /modules across \d+ layers/);
+  for (const diagramEdge of block.edges) {
+    assert.ok(block.nodes.some((node) => node.id === diagramEdge.from));
+    assert.ok(block.nodes.some((node) => node.id === diagramEdge.to));
+  }
+
+  // An empty repository degrades instead of throwing.
+  const empty = buildArchitecture({ files: [], symbols: [], imports: [] });
+  assert.equal(empty.stats.moduleCount, 0);
+  assert.equal(empty.stats.acyclic, true);
 });

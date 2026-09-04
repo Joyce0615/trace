@@ -17,6 +17,7 @@ import { CALL_CHAIN_VERSION, buildCallChainExercises, buildCallChains, gradeCall
 import { buildLocalizationExercise, nextHint, publicLocalizationExercise, scoreLocalization } from "./localization.mjs";
 import { buildRaceTask, gradeRaceSubmission, publicRaceTask } from "./race-grader.mjs";
 import { detectRuntimes, runExecutionTrace, suggestTraceSnippets, summarizeTrace } from "./execution-trace.mjs";
+import { buildArchitecture, dataFlow, symbolNeighborhood } from "./architecture.mjs";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const openedRepositories = new Map();
@@ -317,6 +318,34 @@ const ipcHandlers = {
       summary: trace.events?.length ? summarizeTrace(trace, repository) : null,
       suggestions: suggestTraceSnippets(repository, 4),
     };
+  },
+
+  "graph:architecture": (_event, request) => {
+    const repository = openedRepository(request.repository);
+    const architecture = buildArchitecture(repository, { moduleDepth: request.moduleDepth });
+    // Bounded payload: the renderer draws the top of the graph and asks for more.
+    return {
+      ...architecture,
+      modules: architecture.modules.slice(0, 60),
+      edges: architecture.edges.slice(0, 200),
+      violations: architecture.violations.slice(0, 40),
+    };
+  },
+
+  "graph:symbol-flow": async (_event, request) => {
+    const repository = openedRepository(request.repository);
+    const file = repository.files.find((candidate) => candidate.path === request.path);
+    if (!file) throw new Error("That file is not part of the indexed repository.");
+    const definition = repository.symbols.find((symbol) => symbol.path === request.path && symbol.name === request.symbol)
+      ?? { path: request.path, name: request.symbol, line: request.line ?? 1 };
+    const neighborhood = symbolNeighborhood(repository, { path: request.path, symbol: request.symbol, line: definition.line });
+    let flow = null;
+    try {
+      flow = dataFlow(await readRepositoryFile(repository.rootPath, request.path), { ...definition, symbol: request.symbol }, file.language);
+    } catch {
+      // A file that cannot be read still yields callers and callees.
+    }
+    return { ...neighborhood, definition: { path: definition.path, line: definition.line, symbol: request.symbol }, flow };
   },
 
   "agents:ask": async (_event, request) => {

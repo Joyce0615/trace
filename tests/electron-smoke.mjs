@@ -362,6 +362,49 @@ try {
   assert.ok(traceAudit.failing.summary.files.every((filePath) => indexedPaths.has(filePath)), traceAudit.failing.summary.files.join(","));
   assert.ok(traceAudit.failing.suggestions.length >= 1);
 
+  // Item 30: module boundaries, layers, callers/callees, and data flow.
+  const architectureAudit = await page.evaluate(async () => {
+    const repository = { id: window.traceWorkspace.repository.id, rootPath: window.traceWorkspace.repository.rootPath };
+    const architecture = await window.trace.architecture({ repository, moduleDepth: 2 });
+    const busiest = architecture.modules.slice().sort((left, right) => right.fanIn - left.fanIn)[0];
+    // Pick a symbol that really has callers in this repository.
+    const edge = window.traceWorkspace.repository.callEdges.find((candidate) => candidate.resolved && candidate.targetPath && candidate.caller);
+    const flow = await window.trace.symbolFlow({ repository, path: edge.targetPath, symbol: edge.callee, line: edge.targetLine });
+    return { architecture, busiest, flow, edge };
+  });
+  const architecture = architectureAudit.architecture;
+  assert.equal(architecture.version, 1);
+  assert.ok(architecture.stats.moduleCount >= 10, JSON.stringify(architecture.stats));
+  assert.ok(architecture.stats.layerCount >= 2, JSON.stringify(architecture.stats));
+  assert.ok(architecture.stats.edgeCount > 0);
+  // Every layer is populated and every module belongs to exactly one layer.
+  assert.equal(architecture.layers.every((layer) => layer.modules.length > 0), true);
+  const layerAssignments = architecture.modules.map((module) => module.layer);
+  assert.equal(layerAssignments.every((layer) => Number.isInteger(layer) && layer >= 0), true);
+  // Every module edge is backed by a real import in a real file.
+  const indexedFiles = new Set(await page.evaluate(() => window.traceWorkspace.repository.files.map((file) => file.path)));
+  for (const edge of architecture.edges.slice(0, 20)) {
+    assert.ok(edge.weight >= 1);
+    assert.ok(edge.examples.length >= 1);
+    assert.ok(indexedFiles.has(edge.examples[0].path), edge.examples[0].path);
+    assert.ok(indexedFiles.has(edge.examples[0].targetPath), edge.examples[0].targetPath);
+  }
+  // Modules inside an import cycle share a layer with the rest of their cycle.
+  for (const cycle of architecture.cycles) {
+    const layers = new Set(cycle.modules.map((id) => architecture.modules.find((module) => module.id === id)?.layer));
+    assert.equal(layers.size, 1, `${cycle.id} spans layers ${[...layers].join(",")}`);
+  }
+  assert.equal(architecture.violations.every((violation) => ["cycle", "upward", "skip"].includes(violation.kind)), true);
+  // Callers, callees, and data flow for a symbol that really has a caller.
+  const flow = architectureAudit.flow;
+  assert.equal(flow.target.symbol, architectureAudit.edge.callee);
+  assert.ok(flow.fanIn >= 1, JSON.stringify({ fanIn: flow.fanIn, callers: flow.callers.length }));
+  assert.ok(flow.callers.every((caller) => indexedFiles.has(caller.path) && caller.line >= 1));
+  assert.ok(flow.callees.every((callee) => indexedFiles.has(callee.path) && callee.line >= 1));
+  assert.ok(flow.flow, "data flow must be computed from the real source");
+  assert.equal(Array.isArray(flow.flow.parameters), true);
+  assert.equal(flow.flow.path, architectureAudit.edge.targetPath);
+
   // Item 17: real-repository import resolution plus the optional language-server bridge.
   const languageServers = await page.evaluate(() => window.trace.detectLanguageServers());
   assert.ok(Object.keys(languageServers).length >= 6, JSON.stringify(languageServers));
@@ -467,6 +510,7 @@ try {
     callChains: { count: chainAudit.chainCount, longest: chainAudit.chains[0]?.summary, options: chainAudit.optionCount },
     localization: { symbol: localizationAudit.exercise.symbol, goldFiles: localizationAudit.guess.goldFiles, perfectScore: localizationAudit.perfect.score },
     race: { strong: raceAudit.strong.stageScores, weak: raceAudit.weak.stageScores, bands: [raceAudit.strong.band, raceAudit.weak.band] },
+    architecture: { modules: architecture.stats.moduleCount, layers: architecture.stats.layerCount, cycles: architecture.stats.cycleCount, violations: architecture.stats.violationCount, busiest: architectureAudit.busiest.id },
     executionTrace: { runtime: traceAudit.runtimes.python.version, calls: traceAudit.ran.summary.callCount, transitions: traceAudit.ran.summary.transitions.length, confirmed: traceAudit.ran.summary.confirmedStaticEdges, dynamicOnly: traceAudit.ran.summary.dynamicOnlyEdges },
   }, null, 2));
 } finally {

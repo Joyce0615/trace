@@ -1,4 +1,4 @@
-import type { CallChain, CallChainStep, ContextPack, LocalizationExercise, RaceStageResult, RaceTask, ContextSection, KnowledgeGraphEdge, KnowledgeGraphNode, KnowledgeGraphSummary, LearnerState, LinkClassification, PredictionExercise, TraceBridge } from "./types";
+import type { Architecture, ArchitectureModule, DataFlow, CallChain, CallChainStep, ContextPack, LocalizationExercise, RaceStageResult, RaceTask, ContextSection, KnowledgeGraphEdge, KnowledgeGraphNode, KnowledgeGraphSummary, LearnerState, LinkClassification, PredictionExercise, TraceBridge } from "./types";
 import { nanoCourse, nanoLearnerState, nanoRepository, nanoSkillGraph, nanoSourceByPath } from "./nano-demo";
 
 export const demoRepository = nanoRepository;
@@ -232,6 +232,123 @@ function demoRaceTask(): RaceTask & { exercise: DemoLocalization } {
   };
 }
 
+// Architecture mirror (item 30): module aggregation and layering over the demo
+// repository, using the same rules as the main process.
+function demoModuleFor(filePath: string, depth = 2) {
+  const parts = filePath.split("/");
+  return parts.length === 1 ? "<root>" : parts.slice(0, Math.min(depth, parts.length - 1)).join("/");
+}
+
+function buildDemoArchitecture(depth = 2): Architecture {
+  const modules = new Map<string, ArchitectureModule>();
+  for (const file of nanoRepository.files) {
+    const id = demoModuleFor(file.path, depth);
+    const entry = modules.get(id) ?? { id, files: 0, bytes: 0, languages: {}, symbols: 0, importance: 0, fanIn: 0, fanOut: 0, external: [], layer: 0, cycleId: null };
+    entry.files += 1;
+    entry.bytes += file.size;
+    entry.languages[file.language] = (entry.languages[file.language] ?? 0) + 1;
+    entry.importance = Math.max(entry.importance, file.importance ?? 0);
+    modules.set(id, entry);
+  }
+  for (const symbol of nanoRepository.symbols) {
+    const entry = modules.get(demoModuleFor(symbol.path, depth));
+    if (entry) entry.symbols += 1;
+  }
+  const edgeMap = new Map<string, { from: string; to: string; weight: number; examples: Array<{ path: string; line: number; specifier: string; targetPath: string }> }>();
+  for (const item of nanoRepository.imports ?? []) {
+    const from = demoModuleFor(item.path, depth);
+    if (!item.targetPath) {
+      const entry = modules.get(from);
+      if (entry && !entry.external.includes(item.specifier.split(/[./]/)[0])) entry.external.push(item.specifier.split(/[./]/)[0]);
+      continue;
+    }
+    const to = demoModuleFor(item.targetPath, depth);
+    if (from === to || !modules.has(from) || !modules.has(to)) continue;
+    const key = `${from}->${to}`;
+    const edge = edgeMap.get(key) ?? { from, to, weight: 0, examples: [] };
+    edge.weight += 1;
+    if (edge.examples.length < 3) edge.examples.push({ path: item.path, line: item.line, specifier: item.specifier, targetPath: item.targetPath! });
+    edgeMap.set(key, edge);
+  }
+  const edges = [...edgeMap.values()];
+  for (const entry of modules.values()) {
+    entry.fanOut = edges.filter((edge) => edge.from === entry.id).length;
+    entry.fanIn = edges.filter((edge) => edge.to === entry.id).length;
+  }
+  // Same rules as the main process: condense import cycles first, then layer by
+  // longest path over the acyclic condensation. Reachability is enough here
+  // because the demo repository has only a handful of modules.
+  const ids = [...modules.keys()];
+  const reaches = new Map<string, Set<string>>(ids.map((id) => [id, new Set(edges.filter((edge) => edge.from === id).map((edge) => edge.to))]));
+  for (const middle of ids) {
+    for (const from of ids) {
+      if (!reaches.get(from)!.has(middle)) continue;
+      for (const to of reaches.get(middle)!) reaches.get(from)!.add(to);
+    }
+  }
+  const componentOf = new Map<string, string>();
+  for (const id of ids) {
+    if (componentOf.has(id)) continue;
+    const members = ids.filter((other) => other === id || (reaches.get(id)!.has(other) && reaches.get(other)!.has(id)));
+    const key = members.slice().sort().join("|");
+    for (const member of members) componentOf.set(member, key);
+  }
+  const componentKeys = [...new Set(componentOf.values())];
+  const componentLayer = new Map<string, number>(componentKeys.map((key) => [key, 0]));
+  for (let pass = 0; pass < componentKeys.length; pass += 1) {
+    for (const edge of edges) {
+      const from = componentOf.get(edge.from)!;
+      const to = componentOf.get(edge.to)!;
+      if (from === to) continue;
+      componentLayer.set(to, Math.max(componentLayer.get(to) ?? 0, (componentLayer.get(from) ?? 0) + 1));
+    }
+  }
+  const layerOf = new Map<string, number>(ids.map((id) => [id, componentLayer.get(componentOf.get(id)!) ?? 0]));
+  const cycles = componentKeys
+    .filter((key) => key.includes("|"))
+    .map((key, position) => ({ id: `cycle-${position}`, modules: key.split("|"), size: key.split("|").length }));
+  const cycleIdOf = new Map<string, string>();
+  for (const cycle of cycles) for (const member of cycle.modules) cycleIdOf.set(member, cycle.id);
+  const moduleList = [...modules.values()]
+    .map((entry) => ({ ...entry, layer: layerOf.get(entry.id) ?? 0, cycleId: cycleIdOf.get(entry.id) ?? null }))
+    .sort((left, right) => left.layer - right.layer || right.importance - left.importance || left.id.localeCompare(right.id));
+  const layers: Array<{ layer: number; modules: string[] }> = [];
+  for (const entry of moduleList) {
+    layers[entry.layer] = layers[entry.layer] ?? { layer: entry.layer, modules: [] };
+    layers[entry.layer].modules.push(entry.id);
+  }
+  const violations = edges
+    .map((edge) => {
+      const from = layerOf.get(edge.from) ?? 0;
+      const to = layerOf.get(edge.to) ?? 0;
+      if (componentOf.get(edge.from) === componentOf.get(edge.to)) {
+        return { ...edge, kind: "cycle" as const, detail: `${edge.from} and ${edge.to} import each other, directly or transitively.` };
+      }
+      if (to < from) return { ...edge, kind: "upward" as const, detail: `${edge.from} (layer ${from}) imports ${edge.to} (layer ${to}), against the dependency direction.` };
+      if (to - from > 1) return { ...edge, kind: "skip" as const, detail: `${edge.from} reaches past layer ${from + 1} straight into ${edge.to} (layer ${to}).` };
+      return null;
+    })
+    .filter((item): item is NonNullable<typeof item> => item !== null)
+    .sort((left, right) => right.weight - left.weight);
+  return {
+    version: 1,
+    moduleDepth: depth,
+    modules: moduleList,
+    edges: edges.sort((left, right) => right.weight - left.weight),
+    layers: layers.filter(Boolean),
+    cycles,
+    violations,
+    stats: {
+      moduleCount: moduleList.length,
+      edgeCount: edges.length,
+      layerCount: layers.filter(Boolean).length,
+      cycleCount: cycles.length,
+      violationCount: violations.length,
+      acyclic: cycles.length === 0,
+    },
+  };
+}
+
 function demoPack(request: Parameters<TraceBridge["askAgent"]>[0]): ContextPack {
   const context = request.context;
   const modeBudget = { lean: 2400, balanced: 5200, deep: 10000 }[context.mode];
@@ -434,6 +551,66 @@ export const browserBridge: TraceBridge = {
       },
       summary: null,
       suggestions: [{ path: "nanovllm/engine/llm_engine.py", module: "nanovllm.engine.llm_engine", symbol: "step", snippet: "import nanovllm.engine.llm_engine" }],
+    };
+  },
+  async architecture(request) {
+    return buildDemoArchitecture(request.moduleDepth ?? 2);
+  },
+  async symbolFlow(request) {
+    const edges = (nanoRepository.callEdges ?? []).filter((edge) => edge.resolved && edge.targetPath);
+    const definition = nanoRepository.symbols.find((symbol) => symbol.path === request.path && symbol.name === request.symbol);
+    const source = nanoSourceByPath[request.path] ?? "";
+    const lines = source.split("\n");
+    const headerIndex = lines.findIndex((line) => line.includes(`def ${request.symbol}(`));
+    const callers = edges
+      .filter((edge) => edge.targetPath === request.path && edge.callee === request.symbol && edge.caller)
+      .map((edge) => ({ path: edge.path, symbol: edge.caller!, line: edge.line, crossFile: edge.path !== request.path }));
+    const callees = edges
+      .filter((edge) => edge.path === request.path && edge.caller === request.symbol)
+      .map((edge) => ({ path: edge.targetPath!, symbol: edge.callee, line: edge.targetLine ?? 1, callLine: edge.line, crossFile: edge.targetPath !== request.path }));
+    // Lexical parameter-to-return flow over the demo source.
+    const parameters = headerIndex >= 0
+      ? lines[headerIndex].slice(lines[headerIndex].indexOf("(") + 1, lines[headerIndex].lastIndexOf(")"))
+        .split(",").map((part) => part.trim().split(/[:=\s]/)[0]).filter((name) => /^[A-Za-z_]\w*$/.test(name) && name !== "self")
+      : [];
+    const tainted = new Map(parameters.map((name) => [name, [name]]));
+    const steps: DataFlow["steps"] = [];
+    const returns: DataFlow["returns"] = [];
+    if (headerIndex >= 0) {
+      const indent = lines[headerIndex].length - lines[headerIndex].trimStart().length;
+      for (let cursor = headerIndex + 1; cursor < lines.length; cursor += 1) {
+        const raw = lines[cursor];
+        if (raw.trim() && raw.length - raw.trimStart().length <= indent) break;
+        const text = raw.trim();
+        const returnMatch = text.match(/^return\s+(.+?)\s*;?$/);
+        const assignMatch = text.match(/^([A-Za-z_]\w*)\s*=\s*(.+?)\s*;?$/);
+        const expression = returnMatch?.[1] ?? assignMatch?.[2];
+        if (!expression) continue;
+        const identifiers = [...new Set(expression.match(/[A-Za-z_]\w*/g) ?? [])];
+        const dependsOn = identifiers.filter((name) => tainted.has(name));
+        const origins = [...new Set(dependsOn.flatMap((name) => tainted.get(name) ?? []))];
+        if (returnMatch) { returns.push({ line: cursor + 1, expression, dependsOn, parameters: origins }); continue; }
+        if (dependsOn.length) tainted.set(assignMatch![1], origins);
+        steps.push({ line: cursor + 1, target: assignMatch![1], expression, dependsOn, parameters: origins, calls: identifiers.filter((name) => new RegExp(`\\b${name}\\s*\\(`).test(expression)) });
+      }
+    }
+    const reaching = new Set(returns.flatMap((item) => item.parameters));
+    return {
+      target: { path: request.path, symbol: request.symbol, line: definition?.line ?? 1 },
+      definition: { path: request.path, line: definition?.line ?? 1, symbol: request.symbol },
+      callers,
+      callees,
+      fanIn: new Set(callers.map((item) => `${item.path}#${item.symbol}`)).size,
+      fanOut: new Set(callees.map((item) => `${item.path}#${item.symbol}`)).size,
+      flow: {
+        path: request.path,
+        symbol: request.symbol,
+        line: headerIndex + 1,
+        parameters: parameters.map((name) => ({ name, reachesReturn: reaching.has(name) })),
+        steps,
+        returns,
+        unusedParameters: parameters.filter((name) => !reaching.has(name) && !steps.some((step) => step.parameters.includes(name))),
+      },
     };
   },
   async askAgent(request) {

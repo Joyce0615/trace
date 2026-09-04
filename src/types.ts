@@ -578,6 +578,60 @@ export interface TraceRunResult {
   suggestions: Array<{ path: string; module: string; symbol: string; snippet: string }>;
 }
 
+export interface ArchitectureModule {
+  id: string;
+  files: number;
+  bytes: number;
+  languages: Record<string, number>;
+  symbols: number;
+  importance: number;
+  fanIn: number;
+  fanOut: number;
+  external: string[];
+  layer: number;
+  cycleId: string | null;
+}
+
+export interface ArchitectureEdge {
+  from: string;
+  to: string;
+  weight: number;
+  examples: Array<{ path: string; line: number; specifier: string; targetPath: string }>;
+  kind?: "cycle" | "upward" | "skip";
+  detail?: string;
+}
+
+export interface Architecture {
+  version: number;
+  moduleDepth: number;
+  modules: ArchitectureModule[];
+  edges: ArchitectureEdge[];
+  layers: Array<{ layer: number; modules: string[] }>;
+  cycles: Array<{ id: string; modules: string[]; size: number }>;
+  violations: ArchitectureEdge[];
+  stats: { moduleCount: number; edgeCount: number; layerCount: number; cycleCount: number; violationCount: number; acyclic: boolean };
+}
+
+export interface DataFlow {
+  path: string;
+  symbol: string;
+  line: number;
+  parameters: Array<{ name: string; reachesReturn: boolean }>;
+  steps: Array<{ line: number; target: string; expression: string; dependsOn: string[]; parameters: string[]; calls: string[] }>;
+  returns: Array<{ line: number; expression: string; dependsOn: string[]; parameters: string[] }>;
+  unusedParameters: string[];
+}
+
+export interface SymbolFlow {
+  target: { path: string; symbol: string; line: number };
+  definition: CodeAnchor;
+  callers: Array<{ path: string; symbol: string; line: number; crossFile: boolean }>;
+  callees: Array<{ path: string; symbol: string; line: number; callLine: number; crossFile: boolean }>;
+  fanIn: number;
+  fanOut: number;
+  flow: DataFlow | null;
+}
+
 export interface AgentState {
   codex: { available: boolean; version: string | null };
   claude: { available: boolean; version: string | null };
@@ -628,6 +682,8 @@ export interface TraceBridge {
   gradeRace(request: { repository: RepositoryRef; taskId: string; understanding: string; plan: string; files: string[]; inspected?: string[]; hintsUsed?: string[] }): Promise<RaceReport>;
   traceRuntimes(): Promise<Record<string, TraceRuntime>>;
   runTrace(request: { repository: RepositoryRef; language: "python"; snippet: string; timeoutMs?: number; maxEvents?: number; includeLines?: boolean }): Promise<TraceRunResult>;
+  architecture(request: { repository: RepositoryRef; moduleDepth?: number }): Promise<Architecture>;
+  symbolFlow(request: { repository: RepositoryRef; path: string; symbol: string; line?: number }): Promise<SymbolFlow>;
   askAgent(request: {
     provider: "codex" | "claude";
     rootPath: string;

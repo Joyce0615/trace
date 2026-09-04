@@ -28,6 +28,8 @@ contextBridge.exposeInMainWorld("trace", {
   gradeRace: (request) => ipcRenderer.invoke("grade:race", request),
   traceRuntimes: () => ipcRenderer.invoke("trace:runtimes"),
   runTrace: (request) => ipcRenderer.invoke("trace:run", request),
+  architecture: (request) => ipcRenderer.invoke("graph:architecture", request),
+  symbolFlow: (request) => ipcRenderer.invoke("graph:symbol-flow", request),
   askAgent: (request) => ipcRenderer.invoke("agents:ask", request),
   enhanceCourse: (request) => ipcRenderer.invoke("course:enhance", request),
   loadLearning: (request) => ipcRenderer.invoke("learning:load", request),

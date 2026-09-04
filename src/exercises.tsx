@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { Icon, bridge, readableError, repositoryRef } from "./shell";
 import type { PredictionExercise, Repository } from "./types";
-import type { ChainState, LocalizationState, ReviewState, TraceState } from "./exercise-state";
+import type { ArchitectureState, ChainState, LocalizationState, ReviewState, TraceState } from "./exercise-state";
 
 /**
- * Exercise panels (items 26-29).
+ * Exercise and visualization panels (items 26-30).
  *
  * These are loaded lazily: a learner who never opens Chains, Locate, or Review
  * never downloads them, which keeps the application entry chunk inside the
@@ -168,6 +168,108 @@ export function ExecutionTracePanel({ repository, state, onState, onAnchor }: { 
         {summary.returnValues.slice(-5).map((entry, index) => <code key={`${entry.path}-${entry.line}-${index}`}>{entry.function} → {entry.value}</code>)}
       </div>}
     </div>}
+  </section>;
+}
+
+/**
+ * Architecture view (item 30): module boundaries, layers, import cycles, and the
+ * callers/callees/data flow of the symbol the learner is reading.
+ */
+export function ArchitecturePanel({ repository, currentFile, symbol, state, onState, onAnchor }: {
+  repository: Repository;
+  currentFile: string | null;
+  symbol: { path: string; name: string; line: number } | null;
+  state: ArchitectureState;
+  onState: (update: Partial<ArchitectureState>) => void;
+  onAnchor: (path: string, line: number) => void;
+}) {
+  const { architecture, flow, status, activeModule } = state;
+
+  useEffect(() => {
+    if (status !== "idle") return;
+    let active = true;
+    onState({ status: "loading" });
+    void bridge.architecture({ repository: repositoryRef(repository), moduleDepth: 2 })
+      .then((result) => { if (active) onState({ architecture: result, status: "ready" }); })
+      .catch(() => { if (active) onState({ status: "error" }); });
+    return () => { active = false; };
+  }, [onState, repository, status]);
+
+  useEffect(() => {
+    if (!symbol) return;
+    let active = true;
+    void bridge.symbolFlow({ repository: repositoryRef(repository), path: symbol.path, symbol: symbol.name, line: symbol.line })
+      .then((result) => { if (active) onState({ flow: result }); })
+      .catch(() => { if (active) onState({ flow: null }); });
+    return () => { active = false; };
+  }, [onState, repository, symbol]);
+
+  if (status !== "ready" || !architecture) {
+    return <section className="architecture-panel empty" data-status={status}>
+      <Icon name="layers" size={22} />
+      <p>{status === "error" ? "The architecture view is unavailable for this repository." : "Aggregating module boundaries…"}</p>
+    </section>;
+  }
+
+  const modulesById = new Map(architecture.modules.map((entry) => [entry.id, entry]));
+  return <section className="architecture-panel" data-status="ready" data-layers={architecture.stats.layerCount} data-cycles={architecture.stats.cycleCount}>
+    <div className="architecture-head">
+      <span>ARCHITECTURE</span>
+      <strong>{architecture.stats.moduleCount} modules · {architecture.stats.layerCount} layers · {architecture.stats.edgeCount} module imports</strong>
+      <small data-acyclic={String(architecture.stats.acyclic)}>{architecture.stats.acyclic ? "No import cycles" : `${architecture.stats.cycleCount} import cycle${architecture.stats.cycleCount === 1 ? "" : "s"}`}</small>
+    </div>
+    <div className="layer-grid">
+      {architecture.layers.map((layer) => <div className="layer-column" key={layer.layer} data-layer={layer.layer}>
+        <header>Layer {layer.layer}<em>{layer.modules.length}</em></header>
+        {layer.modules.slice(0, 8).map((id) => {
+          const entry = modulesById.get(id);
+          return <button
+            key={id}
+            className={`module-card ${activeModule === id ? "active" : ""} ${entry?.cycleId ? "cyclic" : ""}`}
+            data-module={id}
+            onClick={() => onState({ activeModule: activeModule === id ? null : id })}
+          >
+            <strong>{id}</strong>
+            <small>{entry?.files ?? 0} files · in {entry?.fanIn ?? 0} / out {entry?.fanOut ?? 0}</small>
+            {entry?.external.length ? <em>{entry.external.slice(0, 3).join(", ")}</em> : null}
+          </button>;
+        })}
+      </div>)}
+    </div>
+    {activeModule && <div className="module-detail" data-module={activeModule}>
+      <strong>{activeModule}</strong>
+      <div className="module-edges">
+        {architecture.edges.filter((edge) => edge.from === activeModule).slice(0, 6).map((edge) => <button key={`out-${edge.to}`} onClick={() => onAnchor(edge.examples[0].path, edge.examples[0].line)}>→ {edge.to} <small>{edge.weight}</small></button>)}
+        {architecture.edges.filter((edge) => edge.to === activeModule).slice(0, 6).map((edge) => <button key={`in-${edge.from}`} onClick={() => onAnchor(edge.examples[0].path, edge.examples[0].line)}>← {edge.from} <small>{edge.weight}</small></button>)}
+      </div>
+    </div>}
+    {architecture.violations.length > 0 && <div className="boundary-violations" data-count={architecture.violations.length}>
+      <strong>Boundary findings</strong>
+      {architecture.violations.slice(0, 5).map((violation) => <button key={`${violation.from}-${violation.to}`} data-kind={violation.kind} onClick={() => onAnchor(violation.examples[0].path, violation.examples[0].line)}>
+        <em>{violation.kind}</em>{violation.detail}
+      </button>)}
+    </div>}
+    {flow && <div className="symbol-flow" data-symbol={flow.target.symbol}>
+      <div className="flow-head"><strong>{flow.target.symbol}()</strong><small>{flow.definition.path}:{flow.definition.line}</small><em>in {flow.fanIn} / out {flow.fanOut}</em></div>
+      <div className="flow-columns">
+        <div className="flow-column" data-column="callers">
+          <header>Callers</header>
+          {flow.callers.length === 0 && <p>No resolved caller in this index.</p>}
+          {flow.callers.slice(0, 6).map((caller) => <button key={`${caller.path}-${caller.line}`} onClick={() => onAnchor(caller.path, caller.line)}>{caller.symbol}()<small>{caller.path}:{caller.line}</small></button>)}
+        </div>
+        <div className="flow-column" data-column="callees">
+          <header>Callees</header>
+          {flow.callees.length === 0 && <p>This function calls nothing that resolves inside the repository.</p>}
+          {flow.callees.slice(0, 6).map((callee) => <button key={`${callee.path}-${callee.symbol}`} onClick={() => onAnchor(callee.path, callee.line)}>{callee.symbol}()<small>{callee.path}:{callee.line}</small></button>)}
+        </div>
+        <div className="flow-column" data-column="dataflow">
+          <header>Data flow</header>
+          {flow.flow?.parameters.length ? flow.flow.parameters.map((parameter) => <span key={parameter.name} className={parameter.reachesReturn ? "reaches" : "stops"} data-parameter={parameter.name}>{parameter.name}<small>{parameter.reachesReturn ? "reaches return" : "does not reach return"}</small></span>) : <p>No parameters to follow.</p>}
+          {flow.flow?.steps.slice(0, 4).map((step) => <button key={step.line} onClick={() => onAnchor(flow.definition.path, step.line)}><code>{step.target} ← {step.expression.slice(0, 46)}</code><small>:{step.line}</small></button>)}
+        </div>
+      </div>
+    </div>}
+    {!flow && currentFile && <p className="architecture-hint">Open a file with an indexed symbol to see its callers, callees, and data flow.</p>}
   </section>;
 }
 

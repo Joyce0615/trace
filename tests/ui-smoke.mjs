@@ -211,6 +211,43 @@ try {
   assert.match(await tracePanel.locator(".trace-problem pre").innerText(), /only available in the Trace desktop app/);
   assert.equal(await tracePanel.locator(".trace-summary").count(), 0);
 
+  // Item 30: module layers, boundaries, and the current symbol's callers/callees.
+  await page.locator(".content-tabs").getByRole("button", { name: "Code" }).click();
+  await page.locator(".explorer-search input").fill("engine/llm_engine.py");
+  await page.locator(".file-row").first().click();
+  await page.locator(".symbol-section button", { hasText: "step" }).first().click();
+  await page.locator(".explorer-search input").fill("");
+  await page.locator(".content-tabs").getByRole("button", { name: "Diagram" }).click();
+  const architecture = page.locator('.architecture-panel[data-status="ready"]');
+  await architecture.waitFor();
+  assert.ok(Number(await architecture.getAttribute("data-layers")) >= 2, await architecture.getAttribute("data-layers"));
+  const layerColumns = await architecture.locator(".layer-column").count();
+  assert.ok(layerColumns >= 2, String(layerColumns));
+  // nano-vllm really does have a package/engine import cycle, and the view says so
+  // instead of inventing a layer for it: both modules share one layer.
+  assert.equal(await architecture.getAttribute("data-cycles"), "1");
+  const engineLayer = await architecture.locator('.module-card[data-module="nanovllm/engine"]').evaluate((element) => element.closest(".layer-column")?.getAttribute("data-layer"));
+  const rootLayer = await architecture.locator('.module-card[data-module="nanovllm"]').evaluate((element) => element.closest(".layer-column")?.getAttribute("data-layer"));
+  assert.equal(engineLayer, rootLayer, `cyclic modules must share a layer: ${rootLayer} vs ${engineLayer}`);
+  assert.ok(await architecture.locator(".module-card.cyclic").count() >= 2);
+  const modelsLayer = await architecture.locator('.module-card[data-module="nanovllm/models"]').evaluate((element) => element.closest(".layer-column")?.getAttribute("data-layer"));
+  assert.ok(Number(modelsLayer) > Number(engineLayer), `${engineLayer} -> ${modelsLayer}`);
+  await architecture.locator('.boundary-violations button[data-kind="cycle"]').first().waitFor();
+  await architecture.locator('.module-card[data-module="nanovllm/engine"]').click();
+  await architecture.locator('.module-detail[data-module="nanovllm/engine"]').waitFor();
+  assert.ok(await architecture.locator(".module-edges button").count() >= 1);
+  // Callers, callees, and data flow for the symbol under the cursor.
+  const flow = architecture.locator(".symbol-flow");
+  await flow.waitFor();
+  assert.equal(await flow.getAttribute("data-symbol"), "step");
+  assert.deepEqual(
+    (await flow.locator('[data-column="callees"] button').allInnerTexts()).map((text) => text.split("(")[0]).sort(),
+    ["postprocess", "run", "schedule"],
+  );
+  assert.ok((await flow.locator('[data-column="callers"] button').allInnerTexts()).some((text) => text.startsWith("generate")));
+  await flow.locator('[data-parameter="self"]').waitFor({ state: "detached" }).catch(() => undefined);
+  await page.screenshot({ path: path.join(artifactDirectory, "architecture.png") });
+
   await page.getByRole("button", { name: "Ask", exact: true }).click();
   await page.getByText("Ask without losing your place.").waitFor();
   await page.locator(".tutor-input textarea").fill("Where is Scheduler defined?");

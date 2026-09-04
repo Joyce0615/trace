@@ -1,7 +1,7 @@
 import type { OnMount } from "@monaco-editor/react";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { demoCourse, demoLearnerState, demoRepository, demoSkillGraph } from "./demo";
-import { emptyChainState, emptyLocalizationState, emptyReviewState, emptyTraceState, type ChainState, type LocalizationState, type ReviewState, type TraceState } from "./exercise-state";
+import { emptyArchitectureState, emptyChainState, emptyLocalizationState, emptyReviewState, emptyTraceState, type ArchitectureState, type ChainState, type LocalizationState, type ReviewState, type TraceState } from "./exercise-state";
 import { Icon, bridge, readableError, repositoryRef } from "./shell";
 import { addEvidence, completeDiagnostic, personalizeSkillGraph, skillForLesson } from "./learning";
 import type { AgentState, ContextMode, ContextPack, ContextScope, Course, IndexProgress, KnowledgeGraphSummary, LearnerProfile, LinkClassification, LearnerState, LearningMemory, Lesson, LessonContentBlock, PracticeReport, PracticeSession, Repository, RepoFile, SkillGraph, SkillNode, SymbolResolution } from "./types";
@@ -19,6 +19,7 @@ const LazyCallChainPanel = lazy(async () => ({ default: (await import("./exercis
 const LazyLocalizationPanel = lazy(async () => ({ default: (await import("./exercises")).LocalizationPanel }));
 const LazyReviewPanel = lazy(async () => ({ default: (await import("./exercises")).ReviewPanel }));
 const LazyExecutionTracePanel = lazy(async () => ({ default: (await import("./exercises")).ExecutionTracePanel }));
+const LazyArchitecturePanel = lazy(async () => ({ default: (await import("./exercises")).ArchitecturePanel }));
 
 function Logo() {
   return <div className="logo-mark" aria-label="Trace"><span /><span /><span /></div>;
@@ -371,7 +372,7 @@ function LessonCanvas({ lesson, diagramOnly, onAnchor }: { lesson: Lesson; diagr
   </div>;
 }
 
-function CodeWorkspace({ repository, lesson, currentFile, content, line, workspaceMode, fontBoost, trail, chainState, onChainState, localizationState, onLocalizationState, reviewState, onReviewState, traceState, onTraceState, onOpen, onSelection, onWorkspaceMode, resolution, resolutionBusy, onResolve }: {
+function CodeWorkspace({ repository, lesson, currentFile, content, line, workspaceMode, fontBoost, trail, chainState, onChainState, localizationState, onLocalizationState, reviewState, onReviewState, traceState, onTraceState, architectureState, onArchitectureState, onOpen, onSelection, onWorkspaceMode, resolution, resolutionBusy, onResolve }: {
   repository: Repository;
   lesson: Lesson;
   currentFile: RepoFile | null;
@@ -388,6 +389,8 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
   onReviewState: (update: Partial<ReviewState>) => void;
   traceState: TraceState;
   onTraceState: (update: Partial<TraceState>) => void;
+  architectureState: ArchitectureState;
+  onArchitectureState: (update: Partial<ArchitectureState>) => void;
   onOpen: (file: RepoFile, line?: number) => void;
   onSelection: (selection: CodeSelection | null) => void;
   onWorkspaceMode: (mode: WorkspaceMode) => void;
@@ -396,6 +399,12 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
   onResolve: () => void;
 }) {
   const [query, setQuery] = useState("");
+  // The architecture view follows whatever symbol the learner is currently reading.
+  const architectureSymbol = useMemo(() => {
+    const candidates = repository.symbols.filter((symbol) => symbol.path === currentFile?.path);
+    const chosen = [...candidates].reverse().find((symbol) => symbol.line <= line) ?? candidates[0] ?? null;
+    return chosen ? { path: chosen.path, name: chosen.name, line: chosen.line } : null;
+  }, [currentFile?.path, line, repository.symbols]);
   const [notes, setNotes] = useState(() => localStorage.getItem(`trace:notes:${repository.id}:${lesson.id}`) ?? "");
   const [monacoReady, setMonacoReady] = useState(false);
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
@@ -476,7 +485,17 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
         </div>
         {workspaceMode === "code" && <><div className="editor-tabs">{currentFile ? <div className="editor-tab active"><Icon name="file" size={13} />{currentFile.name}<span>×</span></div> : <div className="editor-tab active">No file selected</div>}</div><div className="breadcrumb"><Icon name="code" size={13} />{currentFile?.path.split("/").map((part, index, parts) => <span key={`${part}-${index}`}>{part}{index < parts.length - 1 && <Icon name="chevron" size={11} />}</span>)}</div></>}
         {workspaceMode === "lesson" && <LessonCanvas lesson={lesson} onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }} />}
-        {workspaceMode === "diagram" && <LessonCanvas lesson={lesson} diagramOnly onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }} />}
+        {workspaceMode === "diagram" && <div className="diagram-column">
+          <LessonCanvas lesson={lesson} diagramOnly onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }} />
+          <Suspense fallback={<div className="panel-loading">Loading architecture…</div>}><LazyArchitecturePanel
+            repository={repository}
+            currentFile={currentFile?.path ?? null}
+            symbol={architectureSymbol}
+            state={architectureState}
+            onState={onArchitectureState}
+            onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }}
+          /></Suspense>
+        </div>}
         {workspaceMode === "chains" && <Suspense fallback={<div className="panel-loading">Loading exercises…</div>}><div className="chains-column"><LazyCallChainPanel repository={repository} state={chainState} onState={onChainState} onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }} /><LazyExecutionTracePanel repository={repository} state={traceState} onState={onTraceState} onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }} /></div></Suspense>}
         {workspaceMode === "locate" && <Suspense fallback={<div className="panel-loading">Loading exercises…</div>}><LazyLocalizationPanel repository={repository} trail={trail} state={localizationState} onState={onLocalizationState} onOpen={(filePath) => { const file = repository.files.find((item) => item.path === filePath); if (file) { onWorkspaceMode("code"); onOpen(file, 1); } }} /></Suspense>}
         {workspaceMode === "review" && <Suspense fallback={<div className="panel-loading">Loading exercises…</div>}><LazyReviewPanel repository={repository} trail={trail} state={reviewState} onState={onReviewState} onOpen={(filePath) => { const file = repository.files.find((item) => item.path === filePath); if (file) { onWorkspaceMode("code"); onOpen(file, 1); } }} /></Suspense>}
@@ -741,6 +760,7 @@ export default function App() {
   const [localizationState, setLocalizationState] = useState<LocalizationState>(emptyLocalizationState);
   const [reviewState, setReviewState] = useState<ReviewState>(emptyReviewState);
   const [traceState, setTraceState] = useState<TraceState>(emptyTraceState);
+  const [architectureState, setArchitectureState] = useState<ArchitectureState>(emptyArchitectureState);
   const [resolution, setResolution] = useState<SymbolResolution | null>(null);
   const [resolutionBusy, setResolutionBusy] = useState(false);
 
@@ -773,6 +793,7 @@ export default function App() {
   const updateLocalizationState = useCallback((update: Partial<LocalizationState>) => setLocalizationState((previous) => ({ ...previous, ...update })), []);
   const updateReviewState = useCallback((update: Partial<ReviewState>) => setReviewState((previous) => ({ ...previous, ...update })), []);
   const updateTraceState = useCallback((update: Partial<TraceState>) => setTraceState((previous) => ({ ...previous, ...update })), []);
+  const updateArchitectureState = useCallback((update: Partial<ArchitectureState>) => setArchitectureState((previous) => ({ ...previous, ...update })), []);
 
   const loadSource = useCallback(async (repo: Repository, file: RepoFile, targetLine = 1) => {
     // The navigation trail is what the localization drill scores for efficiency.
@@ -797,6 +818,7 @@ export default function App() {
     setLocalizationState(emptyLocalizationState);
     setReviewState(emptyReviewState);
     setTraceState(emptyTraceState);
+    setArchitectureState(emptyArchitectureState);
     setInspectionTrail([]);
     setCourse(nextCourse);
     setSkillGraph(nextGraph);
@@ -1029,7 +1051,7 @@ export default function App() {
       </header>
       <div className="workspace-grid">
         <CourseSidebar course={course} skillGraph={skillGraph} knowledgeGraph={knowledgeGraph} learnerState={learnerState} activeSkill={activeSkill} selectedLesson={selectedLesson} completed={completed} onSelect={selectLesson} onSelectSkill={selectSkill} onFamiliar={(node) => setLearnerState(addEvidence(learnerState, skillGraph, node.id, { kind: "self-report", strength: 0.62, detail: `Marked familiar: ${node.title}` }))} onChallenge={(node) => { const lesson = flattenLessons(course).find((item) => item.id === node.lessonId); if (lesson) void selectLesson(lesson).then(() => setMode("quiz")); }} onToggleComplete={toggleComplete} onEnhance={enhanceCourse} enhancing={courseBusy} enhanceElapsed={courseElapsed} provider={provider} canEnhance={agents[provider].available} />
-        <CodeWorkspace repository={repository} lesson={selectedLesson} currentFile={currentFile} content={content} line={line} workspaceMode={workspaceMode} fontBoost={fontBoosts[fontScale]} trail={inspectionTrail} chainState={chainState} onChainState={updateChainState} localizationState={localizationState} onLocalizationState={updateLocalizationState} reviewState={reviewState} onReviewState={updateReviewState} traceState={traceState} onTraceState={updateTraceState} onOpen={openFile} onSelection={setSelection} onWorkspaceMode={changeWorkspaceMode} resolution={resolution} resolutionBusy={resolutionBusy} onResolve={resolveAtCursor} />
+        <CodeWorkspace repository={repository} lesson={selectedLesson} currentFile={currentFile} content={content} line={line} workspaceMode={workspaceMode} fontBoost={fontBoosts[fontScale]} trail={inspectionTrail} chainState={chainState} onChainState={updateChainState} localizationState={localizationState} onLocalizationState={updateLocalizationState} reviewState={reviewState} onReviewState={updateReviewState} traceState={traceState} onTraceState={updateTraceState} architectureState={architectureState} onArchitectureState={updateArchitectureState} onOpen={openFile} onSelection={setSelection} onWorkspaceMode={changeWorkspaceMode} resolution={resolution} resolutionBusy={resolutionBusy} onResolve={resolveAtCursor} />
         <TutorPanel repository={repository} lesson={selectedLesson} skill={activeSkill} nextSkill={nextSkill} learnerState={learnerState} provider={provider} agents={agents} mode={mode} messages={messages} askMessages={askMessages} busy={agentBusy} currentFile={currentFile} selection={selection} guideStage={guideStage} onGuideStage={updateGuideStage} onWorkspaceMode={changeWorkspaceMode} onNextSkill={selectSkill} onProvider={setProvider} onMode={setMode} onAsk={ask} onSaveMemory={saveMemory} onQuizEvidence={() => updateEvidence("quiz", 0.55, `Submitted quiz answer for ${selectedLesson.title}`)} onDone={() => toggleComplete(selectedLesson)} complete={completed.has(selectedLesson.id)} practiceSession={practiceSession} practiceReport={practiceReport} practiceBusy={practiceBusy} onCreatePractice={createPractice} onInspectPractice={inspectPractice} onOpenPractice={() => { if (practiceSession) void bridge.openPractice(practiceSession.id); }} onRemovePractice={removePractice} />
       </div>
       {diagnosticOpen && <DiagnosticOverlay graph={skillGraph} onComplete={finishDiagnostic} onSkip={() => finishDiagnostic()} />}
