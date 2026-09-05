@@ -1,4 +1,4 @@
-import type { Architecture, SymbolFlow, CallChain, LocalizationExercise, LocalizationHint, LocalizationScore, PredictionExercise, PredictionGrade, RaceReport, RaceTask, TraceRunResult, TraceRuntime } from "./types";
+import type { Architecture, HistorySummary, Lesson, SymbolFlow, CallChain, LocalizationExercise, LocalizationHint, LocalizationScore, PredictionExercise, PredictionGrade, RaceReport, RaceTask, TraceRunResult, TraceRuntime } from "./types";
 
 /**
  * Exercise state shapes.
@@ -53,6 +53,15 @@ export type ArchitectureState = {
 };
 
 export const emptyArchitectureState: ArchitectureState = { architecture: null, flow: null, activeModule: null, status: "idle" };
+
+export type HistoryState = {
+  summary: HistorySummary | null;
+  lessons: Lesson[];
+  view: "ownership" | "evolution" | "regressions" | "decisions";
+  status: "idle" | "loading" | "ready" | "error";
+};
+
+export const emptyHistoryState: HistoryState = { summary: null, lessons: [], view: "ownership", status: "idle" };
 
 export const emptyChainState: ChainState = { chains: [], exercises: [], activeChain: null, choice: {}, grades: {}, status: "idle" };
 export const emptyLocalizationState: LocalizationState = { exercise: null, trailStart: 0, selected: [], hints: [], score: null, error: null };

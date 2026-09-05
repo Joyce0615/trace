@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { Icon, bridge, readableError, repositoryRef } from "./shell";
-import type { PredictionExercise, Repository } from "./types";
-import type { ArchitectureState, ChainState, LocalizationState, ReviewState, TraceState } from "./exercise-state";
+import type { Lesson, PredictionExercise, Repository } from "./types";
+import type { ArchitectureState, ChainState, HistoryState, LocalizationState, ReviewState, TraceState } from "./exercise-state";
 
 /**
- * Exercise and visualization panels (items 26-30).
+ * Exercise and visualization panels (items 26-31).
  *
  * These are loaded lazily: a learner who never opens Chains, Locate, or Review
  * never downloads them, which keeps the application entry chunk inside the
@@ -270,6 +270,91 @@ export function ArchitecturePanel({ repository, currentFile, symbol, state, onSt
       </div>
     </div>}
     {!flow && currentFile && <p className="architecture-hint">Open a file with an indexed symbol to see its callers, callees, and data flow.</p>}
+  </section>;
+}
+
+/**
+ * Repository history (item 31): ownership, evolution, regressions, and the
+ * commits that explain a design decision — all read from real `git log` output.
+ */
+export function HistoryPanel({ repository, state, onState, onAnchor, onLesson }: {
+  repository: Repository;
+  state: HistoryState;
+  onState: (update: Partial<HistoryState>) => void;
+  onAnchor: (path: string, line: number) => void;
+  onLesson: (lesson: Lesson) => void;
+}) {
+  const { summary, lessons, status, view } = state;
+
+  useEffect(() => {
+    if (status !== "idle") return;
+    let active = true;
+    onState({ status: "loading" });
+    void bridge.history({ repository: repositoryRef(repository), commits: 400 })
+      .then((result) => { if (active) onState({ summary: result.summary, lessons: result.lessons, status: "ready" }); })
+      .catch(() => { if (active) onState({ status: "error" }); });
+    return () => { active = false; };
+  }, [onState, repository, status]);
+
+  if (status !== "ready" || !summary) {
+    return <section className="history-panel empty" data-status={status}>
+      <Icon name="git" size={22} />
+      <p>{status === "error" ? "Repository history is unavailable." : "Reading git history…"}</p>
+    </section>;
+  }
+  if (!summary.available) {
+    return <section className="history-panel empty" data-status="unavailable">
+      <Icon name="git" size={22} />
+      <p data-reason="no-history">{summary.reason}</p>
+    </section>;
+  }
+
+  const views: Array<HistoryState["view"]> = ["ownership", "evolution", "regressions", "decisions"];
+  return <section className="history-panel" data-status="ready" data-commits={summary.commitCount} data-view={view}>
+    <div className="history-head">
+      <span>REPOSITORY HISTORY</span>
+      <strong>{summary.commitCount.toLocaleString()} commits · {summary.authorCount} authors · bus factor {summary.repositoryBusFactor}</strong>
+      <small>{summary.since?.slice(0, 10)} → {summary.until?.slice(0, 10)}{summary.truncated ? " (most recent)" : ""}</small>
+    </div>
+    <div className="history-tabs">
+      {views.map((candidate) => <button key={candidate} className={view === candidate ? "active" : ""} onClick={() => onState({ view: candidate })}>{candidate}</button>)}
+    </div>
+    {view === "ownership" && <div className="history-list" data-list="ownership">
+      {summary.ownership?.files.slice(0, 6).map((entry) => <div key={entry.key} className="ownership-row" data-file={entry.key}>
+        <button onClick={() => onAnchor(entry.key, 1)}><code>{entry.key}</code></button>
+        <div className="ownership-bar" title={`${entry.authorCount} authors`}>
+          {entry.authors.slice(0, 3).map((author) => <span key={author.name} style={{ width: `${Math.max(6, author.share * 100)}%` }} title={`${author.name} · ${Math.round(author.share * 100)}%`} />)}
+        </div>
+        <small data-bus-factor={entry.busFactor}>{entry.authors[0]?.name} {Math.round(entry.topAuthorShare * 100)}% · bus {entry.busFactor}</small>
+      </div>)}
+    </div>}
+    {view === "evolution" && <div className="history-list" data-list="evolution">
+      <div className="churn-chart">
+        {summary.evolution?.buckets.slice(-18).map((bucket) => <span key={bucket.month} title={`${bucket.month}: ${bucket.commits} commits`} style={{ height: `${Math.max(4, (bucket.commits / Math.max(...(summary.evolution?.buckets ?? []).map((item) => item.commits))) * 46)}px` }} />)}
+      </div>
+      {summary.evolution?.hotFiles.slice(0, 6).map((entry) => <button key={entry.path} className="hot-file" onClick={() => onAnchor(entry.path, 1)}>
+        <code>{entry.path}</code><small>{entry.commits} commits · {entry.lines} lines · {entry.lastChange.slice(0, 10)}</small>
+      </button>)}
+    </div>}
+    {view === "regressions" && <div className="history-list" data-list="regressions">
+      <p className="history-note" data-fix-ratio={summary.regressions?.fixRatio}>{summary.regressions?.fixCommits} fix commits ({Math.round((summary.regressions?.fixRatio ?? 0) * 100)}% of history) and {summary.regressions?.revertCommits} reverts.</p>
+      {summary.regressions?.hotspots.slice(0, 6).map((entry) => <button key={entry.path} className="hotspot" data-fixes={entry.fixes} onClick={() => onAnchor(entry.path, 1)}>
+        <code>{entry.path}</code><small>{entry.fixes} fixes · last {entry.lastFix.slice(0, 10)}</small>
+        <em>{entry.examples[0]?.subject}</em>
+      </button>)}
+    </div>}
+    {view === "decisions" && <div className="history-list" data-list="decisions">
+      {summary.decisions?.slice(0, 5).map((decision) => <div key={decision.hash} className="decision" data-reason={decision.reason}>
+        <strong>{decision.subject}</strong>
+        <small>{decision.hash} · {decision.author} · {decision.date.slice(0, 10)}</small>
+        {decision.excerpt && <p>{decision.excerpt}</p>}
+        <div className="decision-files">{decision.files.slice(0, 4).map((filePath) => <button key={filePath} onClick={() => onAnchor(filePath, 1)}>{filePath.split("/").at(-1)}</button>)}</div>
+      </div>)}
+    </div>}
+    {lessons.length > 0 && <div className="history-lessons">
+      <strong>History lessons</strong>
+      {lessons.map((lesson) => <button key={lesson.id} data-lesson={lesson.id} onClick={() => onLesson(lesson)}>{lesson.title}<small>{lesson.duration} min</small></button>)}
+    </div>}
   </section>;
 }
 

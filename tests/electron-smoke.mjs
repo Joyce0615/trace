@@ -405,6 +405,43 @@ try {
   assert.equal(Array.isArray(flow.flow.parameters), true);
   assert.equal(flow.flow.path, architectureAudit.edge.targetPath);
 
+  // Item 31: real git history read from the open repository.
+  const historyAudit = await page.evaluate(async () => {
+    const repository = { id: window.traceWorkspace.repository.id, rootPath: window.traceWorkspace.repository.rootPath };
+    return window.trace.history({ repository, commits: 200 });
+  });
+  const history = historyAudit.summary;
+  assert.equal(history.available, true, history.reason);
+  assert.equal(history.version, 1);
+  assert.ok(history.commitCount >= 100, String(history.commitCount));
+  assert.ok(history.authorCount >= 2, String(history.authorCount));
+  assert.ok(history.repositoryBusFactor >= 1);
+  assert.match(history.since, /^\d{4}-\d{2}-\d{2}T/);
+  assert.ok(history.until >= history.since);
+  // Ownership shares are real fractions of real files.
+  assert.ok(history.ownership.files.length >= 5);
+  for (const entry of history.ownership.files.slice(0, 5)) {
+    assert.ok(entry.commits >= 1 && entry.lines >= 0);
+    assert.ok(entry.topAuthorShare > 0 && entry.topAuthorShare <= 1, String(entry.topAuthorShare));
+    assert.ok(entry.busFactor >= 1 && entry.busFactor <= entry.authorCount);
+    assert.equal(entry.authors.reduce((sum, author) => sum + author.lines, 0) <= entry.lines, true);
+  }
+  assert.ok(history.evolution.buckets.length >= 1);
+  assert.equal(history.evolution.buckets.every((bucket) => /^\d{4}-\d{2}$/.test(bucket.month)), true);
+  assert.ok(history.regressions.fixCommits >= 1, JSON.stringify(history.regressions.fixCommits));
+  assert.ok(history.regressions.hotspots.length >= 1);
+  assert.ok(history.regressions.hotspots[0].examples.length >= 1);
+  // No raw contact address survives from any commit message.
+  assert.equal(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.(com|org|net|io|dev)\b/.test(JSON.stringify(history).replace(/example\.com/g, "")), false);
+  // Generated lessons only anchor files that still exist in the index.
+  const historyFiles = new Set(await page.evaluate(() => window.traceWorkspace.repository.files.map((file) => file.path)));
+  assert.ok(historyAudit.lessons.length >= 2, String(historyAudit.lessons.length));
+  for (const lesson of historyAudit.lessons) {
+    for (const anchor of lesson.anchors) {
+      assert.ok(historyFiles.has(anchor.path), `${lesson.id} anchors a missing file ${anchor.path}`);
+    }
+  }
+
   // Item 17: real-repository import resolution plus the optional language-server bridge.
   const languageServers = await page.evaluate(() => window.trace.detectLanguageServers());
   assert.ok(Object.keys(languageServers).length >= 6, JSON.stringify(languageServers));
@@ -511,6 +548,7 @@ try {
     localization: { symbol: localizationAudit.exercise.symbol, goldFiles: localizationAudit.guess.goldFiles, perfectScore: localizationAudit.perfect.score },
     race: { strong: raceAudit.strong.stageScores, weak: raceAudit.weak.stageScores, bands: [raceAudit.strong.band, raceAudit.weak.band] },
     architecture: { modules: architecture.stats.moduleCount, layers: architecture.stats.layerCount, cycles: architecture.stats.cycleCount, violations: architecture.stats.violationCount, busiest: architectureAudit.busiest.id },
+    history: { commits: history.commitCount, authors: history.authorCount, busFactor: history.repositoryBusFactor, fixCommits: history.regressions.fixCommits, lessons: historyAudit.lessons.map((lesson) => lesson.id) },
     executionTrace: { runtime: traceAudit.runtimes.python.version, calls: traceAudit.ran.summary.callCount, transitions: traceAudit.ran.summary.transitions.length, confirmed: traceAudit.ran.summary.confirmedStaticEdges, dynamicOnly: traceAudit.ran.summary.dynamicOnlyEdges },
   }, null, 2));
 } finally {

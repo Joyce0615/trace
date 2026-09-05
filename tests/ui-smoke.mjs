@@ -248,6 +248,12 @@ try {
   await flow.locator('[data-parameter="self"]').waitFor({ state: "detached" }).catch(() => undefined);
   await page.screenshot({ path: path.join(artifactDirectory, "architecture.png") });
 
+  // Item 31: the demo has no git work tree, so history reports that honestly.
+  const history = page.locator(".history-panel");
+  await history.waitFor();
+  assert.equal(await history.getAttribute("data-status"), "unavailable");
+  assert.match(await history.locator('[data-reason="no-history"]').innerText(), /no git history to read/);
+
   await page.getByRole("button", { name: "Ask", exact: true }).click();
   await page.getByText("Ask without losing your place.").waitFor();
   await page.locator(".tutor-input textarea").fill("Where is Scheduler defined?");

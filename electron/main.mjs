@@ -18,6 +18,7 @@ import { buildLocalizationExercise, nextHint, publicLocalizationExercise, scoreL
 import { buildRaceTask, gradeRaceSubmission, publicRaceTask } from "./race-grader.mjs";
 import { detectRuntimes, runExecutionTrace, suggestTraceSnippets, summarizeTrace } from "./execution-trace.mjs";
 import { buildArchitecture, dataFlow, symbolNeighborhood } from "./architecture.mjs";
+import { historyLessons, historySummary } from "./git-history.mjs";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const openedRepositories = new Map();
@@ -346,6 +347,12 @@ const ipcHandlers = {
       // A file that cannot be read still yields callers and callees.
     }
     return { ...neighborhood, definition: { path: definition.path, line: definition.line, symbol: request.symbol }, flow };
+  },
+
+  "history:summary": async (_event, request) => {
+    const repository = openedRepository(request.repository);
+    const summary = await historySummary(repository.rootPath, { limits: { commits: request.commits ?? 400 } });
+    return { summary, lessons: historyLessons(summary, repository) };
   },
 
   "agents:ask": async (_event, request) => {

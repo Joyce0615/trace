@@ -613,6 +613,11 @@ export const browserBridge: TraceBridge = {
       },
     };
   },
+  async history() {
+    // The browser demo has no git repository behind it, so it reports the same
+    // unavailable result the desktop app produces outside a git work tree.
+    return { summary: { version: 1, available: false, reason: "The featured demo runs from a bundled snapshot, so it has no git history to read.", commitCount: 0 }, lessons: [] };
+  },
   async askAgent(request) {
     await new Promise((resolve) => setTimeout(resolve, 550));
     const pack = demoPack(request);

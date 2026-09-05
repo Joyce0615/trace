@@ -261,6 +261,10 @@ export const IPC_SCHEMAS = {
     symbol: s.string({ maxLength: 200 }),
     line: s.number({ integer: true, min: 1, max: 10_000_000, optional: true }),
   }),
+  "history:summary": s.object({
+    repository: repositoryReference,
+    commits: s.number({ integer: true, min: 10, max: 2_000, optional: true }),
+  }),
   "agents:ask": s.object({
     provider: s.literal(["codex", "claude"]),
     rootPath: s.string({ maxLength: 4_096 }),

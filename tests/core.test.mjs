@@ -18,6 +18,7 @@ import { PROMPT_ISOLATION_VERSION, buildIsolatedPrompt, createNonce, detectInjec
 import { tutorPrompt } from "../electron/agents.mjs";
 import { SECRET_SCANNER_VERSION, anonymizePath, redact, redactValue, scanText, shannonEntropy, summarizeFindings } from "../electron/secret-scanner.mjs";
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
+import { GIT_HISTORY_VERSION, busFactor, historyLessons, historySummary, parseHistory } from "../electron/git-history.mjs";
 import { ARCHITECTURE_VERSION, architectureDiagramBlock, buildArchitecture, dataFlow, moduleFor, symbolNeighborhood } from "../electron/architecture.mjs";
 import { EXECUTION_TRACE_VERSION, detectRuntimes, runExecutionTrace, suggestTraceSnippets, summarizeTrace, traceSupported, traceTimelineBlock } from "../electron/execution-trace.mjs";
 import { RACE_GRADER_VERSION, buildRaceTask, gradeRaceSubmission, publicRaceTask, signatureParameters } from "../electron/race-grader.mjs";
@@ -738,7 +739,7 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
     "lessons:call-chains", "lessons:grade-prediction",
     "exercise:localization", "exercise:localization-hint", "exercise:localization-score",
     "grade:race-task", "grade:race", "trace:runtimes", "trace:run",
-    "graph:architecture", "graph:symbol-flow", "agents:ask",
+    "graph:architecture", "graph:symbol-flow", "history:summary", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
   assert.throws(() => schemaFor("repository:evil"), /is not a registered IPC channel/);
@@ -1719,4 +1720,148 @@ test("architecture view derives layers, boundaries, and data flow", async (conte
   const empty = buildArchitecture({ files: [], symbols: [], imports: [] });
   assert.equal(empty.stats.moduleCount, 0);
   assert.equal(empty.stats.acyclic, true);
+});
+
+test("git history yields ownership, evolution, regressions, and decisions", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-history-"));
+  const rootPath = path.join(workspace, "repo");
+  await mkdir(path.join(rootPath, "src"), { recursive: true });
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  const git = (...args) => execFileAsync("git", ["-C", rootPath, ...args]);
+  await execFileAsync("git", ["init", rootPath]);
+  await git("config", "user.email", "ada@example.com");
+  await git("config", "user.name", "Ada Lovelace");
+
+  const commit = async (message, author) => {
+    await git("add", ".");
+    await git("-c", `user.name=${author.name}`, "-c", `user.email=${author.email}`, "commit", "-m", message);
+  };
+  const ada = { name: "Ada Lovelace", email: "ada@example.com" };
+  const grace = { name: "Grace Hopper", email: "grace@example.com" };
+
+  await writeFile(path.join(rootPath, "src", "core.py"), "def run():\n    return 1\n");
+  await commit("Add the core entry point", ada);
+  await writeFile(path.join(rootPath, "src", "core.py"), "def run():\n    return 1\n\n\ndef extra():\n    return 2\n");
+  await commit("Extend core with a helper", ada);
+  await writeFile(path.join(rootPath, "src", "core.py"), "def run():\n    return 3\n\n\ndef extra():\n    return 2\n");
+  await commit("Fix wrong return value in run", ada);
+  await writeFile(path.join(rootPath, "src", "core.py"), "def run():\n    return 4\n\n\ndef extra():\n    return 2\n");
+  await commit("Fix regression in run after the last change", grace);
+  await writeFile(path.join(rootPath, "src", "helper.py"), "def helper():\n    return 5\n");
+  await commit(
+    "Introduce a helper module\n\nWe considered folding this into core.py, but that would have coupled the\nscheduler to the transport layer and made the fix in run() harder to reason\nabout. Keeping it separate lets each module be tested on its own, which is\nthe rationale for this design.",
+    grace,
+  );
+  await writeFile(path.join(rootPath, "src", "helper.py"), "def helper():\n    return 6\n");
+  await commit("Revert \"Introduce a helper module\" default", grace);
+  // A plain subject with a long body must still be recognised as a decision.
+  await writeFile(path.join(rootPath, "src", "helper.py"), "def helper():\n    return 7\n");
+  await commit(
+    "Adjust the default helper value\n\nThe previous value came from an early prototype and no longer matches what\nthe scheduler expects, so callers had to compensate for it in three places.\nChanging it here removes that compensation and keeps the contract in one\nspot, which is worth the small behavioural change.",
+    ada,
+  );
+
+  // Commit messages routinely carry contact addresses; they must be redacted.
+  await writeFile(path.join(rootPath, "CHANGELOG.md"), "# Changelog\n- helper default changed\n");
+  await commit("Introduce a changelog credit for tester@contributor.dev", grace);
+
+  const summary = await historySummary(rootPath);
+  assert.equal(GIT_HISTORY_VERSION, 1);
+  assert.equal(summary.available, true, summary.reason);
+  assert.equal(summary.commitCount, 8);
+  assert.equal(summary.authorCount, 2);
+  assert.deepEqual(summary.authors.map((author) => author.name).sort(), ["Ada Lovelace", "Grace Hopper"]);
+
+  // Ownership is per file, with real line counts and a bus factor.
+  const core = summary.ownership.files.find((entry) => entry.key === "src/core.py");
+  assert.ok(core, JSON.stringify(summary.ownership.files.map((entry) => entry.key)));
+  assert.equal(core.commits, 4);
+  assert.equal(core.authorCount, 2);
+  assert.equal(core.authors[0].name, "Ada Lovelace", "Ada changed the most lines in core.py");
+  assert.ok(core.topAuthorShare > 0.5 && core.topAuthorShare <= 1);
+  assert.equal(core.busFactor, 1);
+  assert.equal(busFactor([{ lines: 10 }, { lines: 9 }, { lines: 1 }]), 2);
+  assert.equal(busFactor([]), 0);
+  const modules = summary.ownership.modules.map((entry) => entry.key);
+  assert.deepEqual(modules.sort(), ["<root>", "src"], "a top-level file belongs to the root module");
+
+  // Evolution buckets are real months and the hot file is the most-changed one.
+  assert.ok(summary.evolution.buckets.length >= 1);
+  assert.match(summary.evolution.buckets[0].month, /^\d{4}-\d{2}$/);
+  assert.equal(summary.evolution.buckets.reduce((sum, bucket) => sum + bucket.commits, 0), 8);
+  assert.equal(summary.evolution.hotFiles[0].path, "src/core.py");
+  assert.equal(summary.evolution.hotFiles[0].commits, 4);
+
+  // Regressions: fix commits and reverts are classified from real subjects.
+  assert.equal(summary.regressions.fixCommits, 2);
+  assert.equal(summary.regressions.revertCommits, 1);
+  assert.ok(Math.abs(summary.regressions.fixRatio - 2 / 8) < 1e-3);
+  const hotspot = summary.regressions.hotspots.find((entry) => entry.path === "src/core.py");
+  assert.equal(hotspot.fixes, 2);
+  assert.equal(hotspot.examples.length, 2);
+  assert.match(hotspot.examples[0].subject, /Fix/);
+  assert.equal(summary.regressions.reverts[0].files[0], "src/helper.py");
+
+  // Design decisions are the commits that explain themselves.
+  const explained = summary.decisions.find((decision) => decision.reason === "explained-in-body");
+  assert.ok(explained, JSON.stringify(summary.decisions.map((item) => [item.subject, item.reason])));
+  assert.match(explained.excerpt, /keeps the contract in one/);
+  assert.deepEqual(explained.files, ["src/helper.py"]);
+  assert.ok(summary.decisions.some((decision) => decision.reason === "subject-keyword"));
+
+  // Neither author metadata nor an address inside a commit message survives.
+  const serialized = JSON.stringify(summary);
+  assert.equal(serialized.includes("ada@example.com"), false, "an author email leaked into the history summary");
+  // `example.com` addresses are documented placeholders; a real domain is not.
+  assert.equal(serialized.includes("tester@contributor.dev"), false, "an email inside a commit subject leaked");
+  assert.match(serialized, /REDACTED:email-address/);
+  assert.ok(summary.decisions.some((decision) => decision.subject.includes("[REDACTED:email-address]")));
+
+  // Lessons are generated and every anchor exists in the current index.
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const lessons = historyLessons(summary, repository);
+  assert.deepEqual(lessons.map((lesson) => lesson.id), ["history-ownership", "history-evolution", "history-regressions", "history-decisions"]);
+  for (const lesson of lessons) {
+    assert.ok(lesson.anchors.length >= 1, `${lesson.id} has no anchor`);
+    for (const anchor of lesson.anchors) {
+      assert.ok(repository.files.some((file) => file.path === anchor.path), `${lesson.id} anchors a missing file ${anchor.path}`);
+      assert.ok(anchor.line >= 1);
+    }
+    assert.ok(lesson.quiz.question.length > 10);
+    assert.ok((lesson.content ?? []).length >= 1);
+  }
+  assert.match(lessons[0].summary, /bus factor 1/);
+  assert.match(lessons[2].summary, /2 of 8 commits are fixes/);
+
+  // A deleted file is never anchored, even though history still mentions it.
+  await rm(path.join(rootPath, "src", "helper.py"));
+  await commit("Remove the helper module", grace);
+  const afterDelete = await historySummary(rootPath);
+  const deletedRepository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  for (const lesson of historyLessons(afterDelete, deletedRepository)) {
+    for (const anchor of lesson.anchors) {
+      assert.notEqual(anchor.path, "src/helper.py", `${lesson.id} anchored a deleted file`);
+    }
+  }
+
+  // Outside a git work tree the feature reports unavailable instead of throwing.
+  const plain = path.join(workspace, "plain");
+  await mkdir(plain, { recursive: true });
+  const missing = await historySummary(plain);
+  assert.equal(missing.available, false);
+  assert.equal(missing.commitCount, 0);
+  assert.deepEqual(historyLessons(missing, repository), []);
+
+  // The parser handles renames and binary files without inventing paths.
+  const parsed = parseHistory(
+    "\u001e" + ["abc123", "Ada", "ada@example.com", "2026-01-01T00:00:00+00:00", "Move things", "line one\nline two"].join("\u001f"),
+    "\u001eabc123\n3\t1\tsrc/{old.py => new.py}\n-\t-\tassets/logo.png",
+  );
+  assert.equal(parsed.length, 1);
+  assert.equal(parsed[0].files[0].path, "new.py");
+  assert.equal(parsed[0].files[1].binary, true);
+  assert.equal(parsed[0].lines, 4);
+  // A multi-line body survives the split that numstat output would have broken.
+  assert.equal(parsed[0].body, "line one\nline two");
 });

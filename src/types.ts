@@ -632,6 +632,51 @@ export interface SymbolFlow {
   flow: DataFlow | null;
 }
 
+export interface HistoryAuthor {
+  name: string;
+  commits: number;
+  lines: number;
+  share: number;
+}
+
+export interface HistoryOwnership {
+  key: string;
+  commits: number;
+  lines: number;
+  fixes: number;
+  lastChange: string;
+  authors: HistoryAuthor[];
+  authorCount: number;
+  busFactor: number;
+  topAuthorShare: number;
+}
+
+export interface HistorySummary {
+  version: number;
+  available: boolean;
+  reason?: string;
+  commitCount: number;
+  truncated?: boolean;
+  since?: string | null;
+  until?: string | null;
+  authors?: HistoryAuthor[];
+  authorCount?: number;
+  repositoryBusFactor?: number;
+  ownership?: { files: HistoryOwnership[]; modules: HistoryOwnership[] };
+  evolution?: {
+    buckets: Array<{ month: string; commits: number; lines: number; authors: number }>;
+    hotFiles: Array<{ path: string; commits: number; lines: number; lastChange: string }>;
+  };
+  regressions?: {
+    fixCommits: number;
+    revertCommits: number;
+    fixRatio: number;
+    hotspots: Array<{ path: string; fixes: number; lastFix: string; examples: Array<{ hash: string; subject: string; date: string }> }>;
+    reverts: Array<{ hash: string; subject: string; date: string; files: string[] }>;
+  };
+  decisions?: Array<{ hash: string; subject: string; excerpt: string; date: string; author: string; files: string[]; reason: string }>;
+}
+
 export interface AgentState {
   codex: { available: boolean; version: string | null };
   claude: { available: boolean; version: string | null };
@@ -684,6 +729,7 @@ export interface TraceBridge {
   runTrace(request: { repository: RepositoryRef; language: "python"; snippet: string; timeoutMs?: number; maxEvents?: number; includeLines?: boolean }): Promise<TraceRunResult>;
   architecture(request: { repository: RepositoryRef; moduleDepth?: number }): Promise<Architecture>;
   symbolFlow(request: { repository: RepositoryRef; path: string; symbol: string; line?: number }): Promise<SymbolFlow>;
+  history(request: { repository: RepositoryRef; commits?: number }): Promise<{ summary: HistorySummary; lessons: Lesson[] }>;
   askAgent(request: {
     provider: "codex" | "claude";
     rootPath: string;
