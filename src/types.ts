@@ -677,6 +677,30 @@ export interface HistorySummary {
   decisions?: Array<{ hash: string; subject: string; excerpt: string; date: string; author: string; files: string[]; reason: string }>;
 }
 
+export interface EvidenceItem {
+  id: string;
+  kind: "issue" | "pull-request" | "adr" | "doc" | "test";
+  reference: string;
+  title: string;
+  summary: string;
+  source: string;
+  body: string;
+  status?: string | null;
+  anchors: CodeAnchor[];
+  paths: string[];
+  symbols?: Array<{ name: string; path: string; line: number }>;
+  cases?: Array<{ name: string; line: number }>;
+  confidence: number;
+}
+
+export interface EvidenceImport {
+  version: number;
+  items: EvidenceItem[];
+  stats: { total: number; byKind: Record<string, number>; maxPerKind?: number; linked: number; unlinked: number; coverage: number };
+  sources: { offline: string[]; unavailable: string[] };
+  bySkill: Record<string, Array<{ id: string; kind: string; title: string; reference: string; confidence: number }>>;
+}
+
 export interface AgentState {
   codex: { available: boolean; version: string | null };
   claude: { available: boolean; version: string | null };
@@ -730,6 +754,7 @@ export interface TraceBridge {
   architecture(request: { repository: RepositoryRef; moduleDepth?: number }): Promise<Architecture>;
   symbolFlow(request: { repository: RepositoryRef; path: string; symbol: string; line?: number }): Promise<SymbolFlow>;
   history(request: { repository: RepositoryRef; commits?: number }): Promise<{ summary: HistorySummary; lessons: Lesson[] }>;
+  importEvidence(request: { repository: RepositoryRef; commits?: number; skillGraph?: SkillGraph }): Promise<EvidenceImport>;
   askAgent(request: {
     provider: "codex" | "claude";
     rootPath: string;

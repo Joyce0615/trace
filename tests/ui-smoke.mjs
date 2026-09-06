@@ -254,6 +254,20 @@ try {
   assert.equal(await history.getAttribute("data-status"), "unavailable");
   assert.match(await history.locator('[data-reason="no-history"]').innerText(), /no git history to read/);
 
+  // Item 32: imported evidence, and an honest note about what is unavailable offline.
+  const evidence = page.locator('.evidence-panel[data-status="ready"]');
+  await evidence.waitFor();
+  assert.equal(await evidence.getAttribute("data-total"), "1");
+  assert.equal(await evidence.getAttribute("data-linked"), "1");
+  assert.match(await evidence.locator(".evidence-unavailable").innerText(), /git history/);
+  assert.equal(await evidence.locator('.evidence-item[data-kind="doc"]').count(), 1);
+  await evidence.locator('.evidence-tabs button[data-kind="test"]').click();
+  await evidence.locator(".evidence-empty").waitFor();
+  await evidence.locator('.evidence-tabs button[data-kind="all"]').click();
+  await evidence.locator('.evidence-item[data-kind="doc"] .evidence-anchors button').first().click();
+  await page.locator(".monaco-editor").waitFor({ timeout: 20_000 });
+  await page.getByText("README.md", { exact: false }).first().waitFor();
+
   await page.getByRole("button", { name: "Ask", exact: true }).click();
   await page.getByText("Ask without losing your place.").waitFor();
   await page.locator(".tutor-input textarea").fill("Where is Scheduler defined?");

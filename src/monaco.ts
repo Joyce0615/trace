@@ -72,12 +72,22 @@ export function ensureMonaco(): Promise<MonacoModule> {
   return corePromise;
 }
 
-/** Load one language grammar on demand. Unknown languages resolve without a fetch. */
+/**
+ * Load one language grammar on demand. Unknown languages resolve without a
+ * fetch. A grammar that fails to load must never block the editor: the file is
+ * still readable without highlighting, and the failure is not cached, so the
+ * next attempt can succeed.
+ */
 export function ensureLanguage(languageId: string | undefined): Promise<unknown> {
   if (!languageId) return Promise.resolve(null);
   const load = languageLoaders[languageId];
   if (!load) return Promise.resolve(null);
-  if (!requestedLanguages.has(languageId)) requestedLanguages.set(languageId, load());
+  if (!requestedLanguages.has(languageId)) {
+    requestedLanguages.set(languageId, load().catch(() => {
+      requestedLanguages.delete(languageId);
+      return null;
+    }));
+  }
   return requestedLanguages.get(languageId)!;
 }
 

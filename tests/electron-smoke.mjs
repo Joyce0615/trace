@@ -442,6 +442,34 @@ try {
     }
   }
 
+  // Item 32: evidence imported from the real repository's own artifacts.
+  const evidenceAudit = await page.evaluate(async () => {
+    const repository = { id: window.traceWorkspace.repository.id, rootPath: window.traceWorkspace.repository.rootPath };
+    return window.trace.importEvidence({ repository, commits: 200, skillGraph: window.traceWorkspace.skillGraph });
+  });
+  assert.equal(evidenceAudit.version, 1);
+  assert.ok(evidenceAudit.stats.total >= 10, JSON.stringify(evidenceAudit.stats));
+  // Pull requests and issues are recovered offline, from commit history alone.
+  assert.ok((evidenceAudit.stats.byKind["pull-request"] ?? 0) >= 1, JSON.stringify(evidenceAudit.stats.byKind));
+  assert.ok((evidenceAudit.stats.byKind.doc ?? 0) >= 1, JSON.stringify(evidenceAudit.stats.byKind));
+  assert.ok((evidenceAudit.stats.byKind.test ?? 0) >= 1, JSON.stringify(evidenceAudit.stats.byKind));
+  assert.ok(evidenceAudit.stats.coverage > 0.5, String(evidenceAudit.stats.coverage));
+  const evidenceFiles = new Set(await page.evaluate(() => window.traceWorkspace.repository.files.map((file) => file.path)));
+  for (const item of evidenceAudit.items) {
+    assert.ok(["issue", "pull-request", "adr", "doc", "test"].includes(item.kind), item.kind);
+    assert.ok(item.confidence > 0 && item.confidence <= 1);
+    for (const anchor of item.anchors) assert.ok(evidenceFiles.has(anchor.path), `${item.id} anchors ${anchor.path}`);
+    for (const symbol of item.symbols ?? []) assert.ok(evidenceFiles.has(symbol.path), `${item.id} points at ${symbol.path}`);
+  }
+  // A pull request keeps its number and the files it changed.
+  const realPullRequest = evidenceAudit.items.find((item) => item.kind === "pull-request");
+  assert.match(realPullRequest.reference, /^#\d+$/);
+  assert.ok(realPullRequest.title.length > 0);
+  // Evidence attaches to at least one skill in the generated skill graph.
+  assert.ok(Object.keys(evidenceAudit.bySkill).length >= 1, JSON.stringify(Object.keys(evidenceAudit.bySkill)));
+  // No contact address survives from any imported artifact.
+  assert.equal(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.(com|org|net|io|dev)\b/.test(JSON.stringify(evidenceAudit).replace(/example\.com/g, "")), false);
+
   // Item 17: real-repository import resolution plus the optional language-server bridge.
   const languageServers = await page.evaluate(() => window.trace.detectLanguageServers());
   assert.ok(Object.keys(languageServers).length >= 6, JSON.stringify(languageServers));
@@ -549,6 +577,7 @@ try {
     race: { strong: raceAudit.strong.stageScores, weak: raceAudit.weak.stageScores, bands: [raceAudit.strong.band, raceAudit.weak.band] },
     architecture: { modules: architecture.stats.moduleCount, layers: architecture.stats.layerCount, cycles: architecture.stats.cycleCount, violations: architecture.stats.violationCount, busiest: architectureAudit.busiest.id },
     history: { commits: history.commitCount, authors: history.authorCount, busFactor: history.repositoryBusFactor, fixCommits: history.regressions.fixCommits, lessons: historyAudit.lessons.map((lesson) => lesson.id) },
+    evidence: { total: evidenceAudit.stats.total, byKind: evidenceAudit.stats.byKind, coverage: evidenceAudit.stats.coverage, skills: Object.keys(evidenceAudit.bySkill).length },
     executionTrace: { runtime: traceAudit.runtimes.python.version, calls: traceAudit.ran.summary.callCount, transitions: traceAudit.ran.summary.transitions.length, confirmed: traceAudit.ran.summary.confirmedStaticEdges, dynamicOnly: traceAudit.ran.summary.dynamicOnlyEdges },
   }, null, 2));
 } finally {

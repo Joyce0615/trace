@@ -164,17 +164,30 @@ function ownershipFor(commits, keyOf) {
   }).sort((left, right) => right.lines - left.lines || left.key.localeCompare(right.key));
 }
 
+/**
+ * Read raw commits. Shared by the history summary and the evidence importer so
+ * both see the same parsed history.
+ */
+export async function readCommits(rootPath, options = {}) {
+  const limits = { ...DEFAULT_HISTORY_LIMITS, ...(options.limits ?? {}) };
+  const mergeArgs = options.includeMerges ? [] : ["--no-merges"];
+  const format = RECORD + ["%H", "%an", "%ae", "%aI", "%s", "%b"].join(UNIT);
+  const meta = await runGit(rootPath, ["log", ...mergeArgs, `-n${limits.commits}`, `--pretty=format:${format}`], limits);
+  if (!meta.ok || !meta.stdout.trim()) {
+    return { ok: false, commits: [], reason: meta.stderr.trim() || "This repository has no readable git history." };
+  }
+  const stats = await runGit(rootPath, ["log", ...mergeArgs, `-n${limits.commits}`, `--pretty=format:${RECORD}%H`, "--numstat"], limits);
+  return { ok: true, commits: parseHistory(meta.stdout, stats.ok ? stats.stdout : ""), limits };
+}
+
 /** Read and summarize repository history. Returns `available:false` outside git. */
 export async function historySummary(rootPath, options = {}) {
   const limits = { ...DEFAULT_HISTORY_LIMITS, ...(options.limits ?? {}) };
-  const format = RECORD + ["%H", "%an", "%ae", "%aI", "%s", "%b"].join(UNIT);
-  const meta = await runGit(rootPath, ["log", "--no-merges", `-n${limits.commits}`, `--pretty=format:${format}`], limits);
-  if (!meta.ok || !meta.stdout.trim()) {
-    return { version: GIT_HISTORY_VERSION, available: false, reason: meta.stderr.trim() || "This repository has no readable git history.", commitCount: 0 };
+  const read = await readCommits(rootPath, { limits });
+  if (!read.ok) {
+    return { version: GIT_HISTORY_VERSION, available: false, reason: read.reason, commitCount: 0 };
   }
-  const stats = await runGit(rootPath, ["log", "--no-merges", `-n${limits.commits}`, `--pretty=format:${RECORD}%H`, "--numstat"], limits);
-
-  const commits = parseHistory(meta.stdout, stats.ok ? stats.stdout : "");
+  const commits = read.commits;
   if (!commits.length) {
     return { version: GIT_HISTORY_VERSION, available: false, reason: "No commits were parsed from git log.", commitCount: 0 };
   }

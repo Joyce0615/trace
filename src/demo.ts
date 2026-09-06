@@ -618,6 +618,30 @@ export const browserBridge: TraceBridge = {
     // unavailable result the desktop app produces outside a git work tree.
     return { summary: { version: 1, available: false, reason: "The featured demo runs from a bundled snapshot, so it has no git history to read.", commitCount: 0 }, lessons: [] };
   },
+  async importEvidence() {
+    // The bundled demo has no git history and no checked-in ADRs, so the only
+    // evidence it can offer is its documentation and the linked source it names.
+    const readme = nanoSourceByPath["README.md"] ?? "";
+    const items = [{
+      id: "doc-readme",
+      kind: "doc" as const,
+      reference: "README.md",
+      title: readme.match(/^#\s+(.+)$/m)?.[1] ?? "README",
+      summary: "0 file references, 0 symbol references",
+      source: "README.md",
+      body: readme.split("\n").filter((line) => line.trim() && !line.startsWith("#")).slice(0, 4).join(" "),
+      anchors: [{ path: "README.md", line: 1, symbol: null }],
+      paths: [],
+      confidence: 0.5,
+    }];
+    return {
+      version: 1,
+      items,
+      stats: { total: items.length, byKind: { doc: items.length }, linked: items.length, unlinked: 0, coverage: 1 },
+      sources: { offline: ["documentation"], unavailable: ["git history (the featured demo runs from a bundled snapshot)"] },
+      bySkill: {},
+    };
+  },
   async askAgent(request) {
     await new Promise((resolve) => setTimeout(resolve, 550));
     const pack = demoPack(request);

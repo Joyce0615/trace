@@ -18,7 +18,8 @@ import { buildLocalizationExercise, nextHint, publicLocalizationExercise, scoreL
 import { buildRaceTask, gradeRaceSubmission, publicRaceTask } from "./race-grader.mjs";
 import { detectRuntimes, runExecutionTrace, suggestTraceSnippets, summarizeTrace } from "./execution-trace.mjs";
 import { buildArchitecture, dataFlow, symbolNeighborhood } from "./architecture.mjs";
-import { historyLessons, historySummary } from "./git-history.mjs";
+import { historyLessons, historySummary, readCommits } from "./git-history.mjs";
+import { evidenceForSkills, importEvidence } from "./evidence-import.mjs";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const openedRepositories = new Map();
@@ -353,6 +354,18 @@ const ipcHandlers = {
     const repository = openedRepository(request.repository);
     const summary = await historySummary(repository.rootPath, { limits: { commits: request.commits ?? 400 } });
     return { summary, lessons: historyLessons(summary, repository) };
+  },
+
+  "evidence:import": async (_event, request) => {
+    const repository = openedRepository(request.repository);
+    // Pull requests and issues are recovered from local history; live issue APIs
+    // would need network access and credentials this app deliberately avoids.
+    const history = await readCommits(repository.rootPath, { limits: { commits: request.commits ?? 300 }, includeMerges: true });
+    const evidence = await importEvidence(repository, { commits: history.commits });
+    return {
+      ...evidence,
+      bySkill: request.skillGraph?.nodes ? evidenceForSkills(evidence.items, request.skillGraph) : {},
+    };
   },
 
   "agents:ask": async (_event, request) => {

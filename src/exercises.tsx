@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { Icon, bridge, readableError, repositoryRef } from "./shell";
-import type { Lesson, PredictionExercise, Repository } from "./types";
-import type { ArchitectureState, ChainState, HistoryState, LocalizationState, ReviewState, TraceState } from "./exercise-state";
+import type { Lesson, PredictionExercise, Repository, SkillGraph } from "./types";
+import type { ArchitectureState, ChainState, EvidenceState, HistoryState, LocalizationState, ReviewState, TraceState } from "./exercise-state";
 
 /**
- * Exercise and visualization panels (items 26-31).
+ * Exercise and visualization panels (items 26-32).
  *
  * These are loaded lazily: a learner who never opens Chains, Locate, or Review
  * never downloads them, which keeps the application entry chunk inside the
@@ -355,6 +355,68 @@ export function HistoryPanel({ repository, state, onState, onAnchor, onLesson }:
       <strong>History lessons</strong>
       {lessons.map((lesson) => <button key={lesson.id} data-lesson={lesson.id} onClick={() => onLesson(lesson)}>{lesson.title}<small>{lesson.duration} min</small></button>)}
     </div>}
+  </section>;
+}
+
+/**
+ * Imported evidence (item 32): the pull requests, issues, ADRs, docs, and tests
+ * that already explain this repository, linked to the files they describe.
+ */
+export function EvidencePanel({ repository, skillGraph, currentFile, state, onState, onAnchor }: {
+  repository: Repository;
+  skillGraph: SkillGraph | null;
+  currentFile: string | null;
+  state: EvidenceState;
+  onState: (update: Partial<EvidenceState>) => void;
+  onAnchor: (path: string, line: number) => void;
+}) {
+  const { evidence, status, kind, onlyCurrentFile } = state;
+
+  useEffect(() => {
+    if (status !== "idle") return;
+    let active = true;
+    onState({ status: "loading" });
+    void bridge.importEvidence({ repository: repositoryRef(repository), commits: 300, skillGraph: skillGraph ?? undefined })
+      .then((result) => { if (active) onState({ evidence: result, status: "ready" }); })
+      .catch(() => { if (active) onState({ status: "error" }); });
+    return () => { active = false; };
+  }, [onState, repository, skillGraph, status]);
+
+  if (status !== "ready" || !evidence) {
+    return <section className="evidence-panel empty" data-status={status}>
+      <Icon name="book" size={22} />
+      <p>{status === "error" ? "Evidence import is unavailable for this repository." : "Importing documentation, decisions, and tests…"}</p>
+    </section>;
+  }
+
+  const kinds = ["all", "pull-request", "issue", "adr", "doc", "test"] as const;
+  const visible = evidence.items
+    .filter((item) => kind === "all" || item.kind === kind)
+    .filter((item) => !onlyCurrentFile || !currentFile || item.anchors.some((anchor) => anchor.path === currentFile) || item.paths.includes(currentFile))
+    .slice(0, 12);
+
+  return <section className="evidence-panel" data-status="ready" data-total={evidence.stats.total} data-linked={evidence.stats.linked}>
+    <div className="evidence-head">
+      <span>IMPORTED EVIDENCE</span>
+      <strong>{evidence.stats.total} items · {Math.round(evidence.stats.coverage * 100)}% linked to source</strong>
+      <small>{Object.entries(evidence.stats.byKind).map(([name, count]) => `${name} ${count}`).join(" · ") || "nothing imported"}</small>
+    </div>
+    {evidence.sources.unavailable.length > 0 && <p className="evidence-unavailable">Not available offline: {evidence.sources.unavailable.join(", ")}.</p>}
+    <div className="evidence-tabs">
+      {kinds.map((candidate) => <button key={candidate} className={kind === candidate ? "active" : ""} data-kind={candidate} onClick={() => onState({ kind: candidate })}>{candidate}</button>)}
+      <label className="evidence-filter"><input type="checkbox" checked={onlyCurrentFile} onChange={() => onState({ onlyCurrentFile: !onlyCurrentFile })} />this file only</label>
+    </div>
+    <div className="evidence-list">
+      {visible.length === 0 && <p className="evidence-empty">No imported evidence matches this filter.</p>}
+      {visible.map((item) => <div className="evidence-item" key={item.id} data-kind={item.kind} data-confidence={item.confidence}>
+        <div className="evidence-item-head"><em>{item.kind}</em><strong>{item.title}</strong><small>{item.reference}</small></div>
+        <p>{item.summary}</p>
+        <div className="evidence-anchors">
+          {item.anchors.slice(0, 4).map((anchor) => <button key={`${anchor.path}-${anchor.line}`} onClick={() => onAnchor(anchor.path, anchor.line)}>{anchor.path.split("/").at(-1)}:{anchor.line}</button>)}
+          {(item.symbols ?? []).slice(0, 3).map((symbol) => <button key={`${symbol.path}-${symbol.name}`} className="symbol" onClick={() => onAnchor(symbol.path, symbol.line)}>{symbol.name}()</button>)}
+        </div>
+      </div>)}
+    </div>
   </section>;
 }
 

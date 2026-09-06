@@ -265,6 +265,11 @@ export const IPC_SCHEMAS = {
     repository: repositoryReference,
     commits: s.number({ integer: true, min: 10, max: 2_000, optional: true }),
   }),
+  "evidence:import": s.object({
+    repository: repositoryReference,
+    commits: s.number({ integer: true, min: 10, max: 2_000, optional: true }),
+    skillGraph: s.opaque({ optional: true }),
+  }),
   "agents:ask": s.object({
     provider: s.literal(["codex", "claude"]),
     rootPath: s.string({ maxLength: 4_096 }),

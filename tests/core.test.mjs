@@ -18,7 +18,8 @@ import { PROMPT_ISOLATION_VERSION, buildIsolatedPrompt, createNonce, detectInjec
 import { tutorPrompt } from "../electron/agents.mjs";
 import { SECRET_SCANNER_VERSION, anonymizePath, redact, redactValue, scanText, shannonEntropy, summarizeFindings } from "../electron/secret-scanner.mjs";
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
-import { GIT_HISTORY_VERSION, busFactor, historyLessons, historySummary, parseHistory } from "../electron/git-history.mjs";
+import { GIT_HISTORY_VERSION, busFactor, historyLessons, historySummary, parseHistory, readCommits } from "../electron/git-history.mjs";
+import { EVIDENCE_VERSION, evidenceByPath, evidenceForSkills, importEvidence } from "../electron/evidence-import.mjs";
 import { ARCHITECTURE_VERSION, architectureDiagramBlock, buildArchitecture, dataFlow, moduleFor, symbolNeighborhood } from "../electron/architecture.mjs";
 import { EXECUTION_TRACE_VERSION, detectRuntimes, runExecutionTrace, suggestTraceSnippets, summarizeTrace, traceSupported, traceTimelineBlock } from "../electron/execution-trace.mjs";
 import { RACE_GRADER_VERSION, buildRaceTask, gradeRaceSubmission, publicRaceTask, signatureParameters } from "../electron/race-grader.mjs";
@@ -739,7 +740,7 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
     "lessons:call-chains", "lessons:grade-prediction",
     "exercise:localization", "exercise:localization-hint", "exercise:localization-score",
     "grade:race-task", "grade:race", "trace:runtimes", "trace:run",
-    "graph:architecture", "graph:symbol-flow", "history:summary", "agents:ask",
+    "graph:architecture", "graph:symbol-flow", "history:summary", "evidence:import", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
   assert.throws(() => schemaFor("repository:evil"), /is not a registered IPC channel/);
@@ -1864,4 +1865,147 @@ test("git history yields ownership, evolution, regressions, and decisions", asyn
   assert.equal(parsed[0].lines, 4);
   // A multi-line body survives the split that numstat output would have broken.
   assert.equal(parsed[0].body, "line one\nline two");
+});
+
+test("issues, pull requests, ADRs, docs, and tests import as linked evidence", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-evidence-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "src"), { recursive: true });
+  await mkdir(path.join(rootPath, "tests"), { recursive: true });
+  await mkdir(path.join(rootPath, "docs", "adr"), { recursive: true });
+  await writeFile(path.join(rootPath, "src", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "src", "scheduler.py"), "def schedule(jobs):\n    return sorted(jobs)\n");
+  await writeFile(path.join(rootPath, "src", "runner.py"), "from src.scheduler import schedule\n\n\ndef run(jobs):\n    return schedule(jobs)\n");
+  await writeFile(path.join(rootPath, "tests", "__init__.py"), "");
+  await writeFile(
+    path.join(rootPath, "tests", "test_scheduler.py"),
+    "from src.scheduler import schedule\n\n\ndef test_schedule_sorts():\n    assert schedule([2, 1]) == [1, 2]\n\n\ndef test_schedule_empty():\n    assert schedule([]) == []\n",
+  );
+  await writeFile(
+    path.join(rootPath, "docs", "adr", "0001-separate-scheduling.md"),
+    "# ADR 1: Separate scheduling from execution\n\n## Status\n\nAccepted\n\n## Context\n\nThe runner used to sort inline, which made `src/runner.py` responsible for two concerns.\n\n## Decision\n\nScheduling moves into `src/scheduler.py` behind `schedule()`.\n",
+  );
+  await writeFile(
+    path.join(rootPath, "README.md"),
+    "# Job Runner\n\nStart at `src/runner.py`; the ordering rules live in `schedule()`.\n",
+  );
+  await writeFile(path.join(rootPath, "docs", "unrelated.md"), "just prose with no headings or references\n");
+
+  const git = (...args) => execFileAsync("git", ["-C", rootPath, ...args]);
+  await execFileAsync("git", ["init", rootPath]);
+  await git("config", "user.email", "dev@contributor.dev");
+  await git("config", "user.name", "Dev");
+  await git("add", ".");
+  await git("commit", "-m", "Initial import");
+  await writeFile(path.join(rootPath, "src", "scheduler.py"), "def schedule(jobs):\n    return sorted(jobs, key=str)\n");
+  await git("add", ".");
+  await git("commit", "-m", "Stabilise ordering for mixed job types (#42)\n\nFixes #41 by comparing as strings.");
+  await writeFile(path.join(rootPath, "src", "runner.py"), "from src.scheduler import schedule\n\n\ndef run(jobs):\n    return list(schedule(jobs))\n");
+  await git("add", ".");
+  await git("commit", "-m", "Merge pull request #43 from contributor/list-result\n\nReturn a list from run()");
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const commits = (await readCommits(rootPath, { includeMerges: true })).commits;
+  const evidence = await importEvidence(repository, { commits });
+
+  assert.equal(EVIDENCE_VERSION, 1);
+  assert.ok(evidence.stats.total >= 5, JSON.stringify(evidence.stats));
+  for (const kind of ["pull-request", "issue", "adr", "doc", "test"]) {
+    assert.ok(evidence.stats.byKind[kind] >= 1, `no ${kind} evidence: ${JSON.stringify(evidence.stats.byKind)}`);
+  }
+
+  // Pull requests come from both merge commits and squash subjects.
+  const pullRequests = evidence.items.filter((item) => item.kind === "pull-request");
+  assert.deepEqual(pullRequests.map((item) => item.reference).sort(), ["#42", "#43"]);
+  const merged = pullRequests.find((item) => item.reference === "#43");
+  assert.equal(merged.confidence, 1);
+  assert.equal(merged.title, "Return a list from run()");
+  assert.ok(merged.anchors.some((anchor) => anchor.path === "src/runner.py"));
+
+  // Issues are recovered from the commits that reference them.
+  const issues = evidence.items.filter((item) => item.kind === "issue");
+  assert.deepEqual(issues.map((item) => item.reference).sort(), ["#41"]);
+  assert.ok(issues[0].anchors.some((anchor) => anchor.path === "src/scheduler.py"));
+
+  // The ADR keeps its status and links to the code it names.
+  const adr = evidence.items.find((item) => item.kind === "adr");
+  // The redundant "ADR 1:" prefix is stripped; the record id lives in `reference`.
+  assert.equal(adr.title, "Separate scheduling from execution");
+  assert.equal(adr.reference, "0001-separate-scheduling");
+  assert.equal(adr.status, "Accepted");
+  assert.deepEqual(adr.paths.sort(), ["src/runner.py", "src/scheduler.py"]);
+  assert.ok(adr.symbols.some((symbol) => symbol.name === "schedule" && symbol.path === "src/scheduler.py"));
+  assert.equal(adr.confidence, 0.9);
+  assert.ok(adr.anchors.some((anchor) => anchor.path === "docs/adr/0001-separate-scheduling.md"));
+
+  // Documentation is linked through the paths and symbols it mentions.
+  const readme = evidence.items.find((item) => item.kind === "doc" && item.source === "README.md");
+  assert.equal(readme.title, "Job Runner");
+  assert.deepEqual(readme.paths, ["src/runner.py"]);
+  assert.ok(readme.symbols.some((symbol) => symbol.name === "schedule"));
+  // Prose with neither headings nor references is not imported as evidence.
+  assert.equal(evidence.items.some((item) => item.source === "docs/unrelated.md"), false);
+
+  // Tests carry their cases and the symbols they actually exercise.
+  const test = evidence.items.find((item) => item.kind === "test");
+  assert.equal(test.source, "tests/test_scheduler.py");
+  assert.deepEqual(test.cases.map((entry) => entry.name), ["test_schedule_sorts", "test_schedule_empty"]);
+  assert.deepEqual(test.paths, ["src/scheduler.py"]);
+  assert.ok(test.symbols.some((symbol) => symbol.name === "schedule" && symbol.path === "src/scheduler.py"));
+  assert.equal(test.confidence, 0.95);
+
+  // Every anchor points at a file that exists, and coverage is reported.
+  for (const item of evidence.items) {
+    for (const anchor of item.anchors) {
+      assert.ok(repository.files.some((file) => file.path === anchor.path), `${item.id} anchors a missing file ${anchor.path}`);
+      assert.ok(anchor.line >= 1);
+    }
+  }
+  assert.equal(evidence.stats.linked + evidence.stats.unlinked, evidence.stats.total);
+  assert.ok(evidence.stats.coverage > 0.9, String(evidence.stats.coverage));
+
+  // Evidence is grouped by the file it explains and attached to matching skills.
+  const byPath = evidenceByPath(evidence.items);
+  assert.ok(byPath.get("src/scheduler.py").length >= 3, JSON.stringify(byPath.get("src/scheduler.py")));
+  assert.ok(byPath.get("src/scheduler.py").some((item) => item.kind === "test"));
+  const skillGraph = { nodes: [
+    { id: "skill-scheduler", anchors: [{ path: "src/scheduler.py", line: 1, symbol: "schedule" }] },
+    { id: "skill-unrelated", anchors: [{ path: "src/__init__.py", line: 1, symbol: null }] },
+  ] };
+  const bySkill = evidenceForSkills(evidence.items, skillGraph);
+  assert.ok(bySkill["skill-scheduler"].length >= 3);
+  assert.equal(bySkill["skill-unrelated"], undefined);
+
+  // No single source can crowd the others out of the payload.
+  const manyPullRequests = Array.from({ length: 90 }, (unused, index) => ({
+    hash: `${index}`.padStart(40, "0"),
+    author: "Dev",
+    date: "2026-01-01T00:00:00+00:00",
+    subject: `Merge pull request #${index + 100} from contributor/branch-${index}`,
+    body: `Change number ${index}`,
+    files: [{ path: "src/scheduler.py", added: 1, removed: 1, binary: false }],
+    lines: 2,
+    isFix: false,
+    isRevert: false,
+  }));
+  const balanced = await importEvidence(repository, { commits: [...commits, ...manyPullRequests], maxPerKind: 5 });
+  assert.equal(balanced.stats.byKind["pull-request"], 5);
+  assert.ok(balanced.stats.byKind.test >= 1, JSON.stringify(balanced.stats.byKind));
+  assert.ok(balanced.stats.byKind.adr >= 1, JSON.stringify(balanced.stats.byKind));
+  assert.ok(balanced.stats.byKind.doc >= 1, JSON.stringify(balanced.stats.byKind));
+
+  // Without history the importer still works and says what is missing.
+  const offline = await importEvidence(repository, {});
+  assert.equal(offline.items.some((item) => item.kind === "pull-request"), false);
+  assert.deepEqual(offline.sources.unavailable, ["git history (no commits were provided)"]);
+  assert.ok(offline.items.some((item) => item.kind === "adr"));
+
+  // Contact addresses inside imported prose never survive.
+  await writeFile(path.join(rootPath, "docs", "adr", "0002-contact.md"), "# ADR 2: Ownership\n\n## Status\n\nProposed\n\nAsk maintainer@contributor.dev before changing `src/scheduler.py`.\n");
+  const withContact = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const redactedEvidence = await importEvidence(withContact, {});
+  assert.equal(JSON.stringify(redactedEvidence).includes("maintainer@contributor.dev"), false);
+  assert.match(JSON.stringify(redactedEvidence), /REDACTED:email-address/);
 });
