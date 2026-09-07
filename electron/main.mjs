@@ -20,6 +20,7 @@ import { detectRuntimes, runExecutionTrace, suggestTraceSnippets, summarizeTrace
 import { buildArchitecture, dataFlow, symbolNeighborhood } from "./architecture.mjs";
 import { historyLessons, historySummary, readCommits } from "./git-history.mjs";
 import { evidenceForSkills, importEvidence } from "./evidence-import.mjs";
+import { buildSearchIndex, search } from "./search.mjs";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const openedRepositories = new Map();
@@ -28,6 +29,7 @@ const indexingRequests = new Map();
 const callChainSets = new Map();
 const localizationExercises = new Map();
 const raceTasks = new Map();
+const searchIndexes = new Map();
 
 function openedRepository(candidate) {
   const repository = candidate?.id ? openedRepositories.get(candidate.id) : null;
@@ -366,6 +368,17 @@ const ipcHandlers = {
       ...evidence,
       bySkill: request.skillGraph?.nodes ? evidenceForSkills(evidence.items, request.skillGraph) : {},
     };
+  },
+
+  "search:query": async (_event, request) => {
+    const repository = openedRepository(request.repository);
+    // The index is built once per repository version and reused across queries.
+    const cached = searchIndexes.get(repository.id);
+    const index = cached?.sourceVersion === repository.versionId
+      ? cached
+      : await buildSearchIndex(repository, { read: (filePath) => readRepositoryFile(repository.rootPath, filePath) });
+    searchIndexes.set(repository.id, index);
+    return { ...search(index, request.query, { limit: request.limit ?? 10 }), indexStats: index.stats };
   },
 
   "agents:ask": async (_event, request) => {

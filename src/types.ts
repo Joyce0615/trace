@@ -701,6 +701,28 @@ export interface EvidenceImport {
   bySkill: Record<string, Array<{ id: string; kind: string; title: string; reference: string; confidence: number }>>;
 }
 
+export interface SearchResult {
+  path: string;
+  line: number | null;
+  symbol: string | null;
+  kind: string | null;
+  score: number;
+  strategies: Record<string, { rank: number; score: number }>;
+  strategyCount: number;
+  language: string | null;
+  snippet: { line: number; text: string; hits: number } | null;
+}
+
+export interface SearchResponse {
+  version: number;
+  query: string;
+  results: SearchResult[];
+  strategies: Record<string, number>;
+  fused: number;
+  tookMs?: number;
+  indexStats?: { indexedFiles: number; candidateFiles: number; vocabulary: number };
+}
+
 export interface AgentState {
   codex: { available: boolean; version: string | null };
   claude: { available: boolean; version: string | null };
@@ -755,6 +777,7 @@ export interface TraceBridge {
   symbolFlow(request: { repository: RepositoryRef; path: string; symbol: string; line?: number }): Promise<SymbolFlow>;
   history(request: { repository: RepositoryRef; commits?: number }): Promise<{ summary: HistorySummary; lessons: Lesson[] }>;
   importEvidence(request: { repository: RepositoryRef; commits?: number; skillGraph?: SkillGraph }): Promise<EvidenceImport>;
+  search(request: { repository: RepositoryRef; query: string; limit?: number }): Promise<SearchResponse>;
   askAgent(request: {
     provider: "codex" | "claude";
     rootPath: string;

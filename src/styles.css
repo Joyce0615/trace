@@ -649,3 +649,20 @@ button { color: inherit; }
 .evidence-anchors { display: flex; flex-wrap: wrap; gap: 5px; }
 .evidence-anchors button { padding: 2px 8px; border: 1px solid #262d3d; border-radius: 6px; background: none; color: #93a0b1; font-family: "SFMono-Regular", Menlo, monospace; font-size: calc(9px + var(--font-boost)); cursor: pointer; }
 .evidence-anchors button.symbol { border-color: #2f4a6f; color: #8fbde0; }
+
+/* Item 33: hybrid search results inside the explorer. */
+.search-results { display: flex; flex-direction: column; gap: 5px; padding: 6px 0 10px; border-bottom: 1px solid #171d28; margin-bottom: 6px; }
+.search-heading { display: flex; flex-direction: column; gap: 2px; color: var(--purple); font-size: calc(8px + var(--font-boost)); letter-spacing: .12em; }
+.search-heading small { color: #5b6474; letter-spacing: 0; font-size: calc(8px + var(--font-boost)); }
+.search-empty { color: #5b6474; font-size: calc(9px + var(--font-boost)); }
+.search-result { text-align: left; padding: 6px 8px; border: 1px solid #1a2130; border-radius: 7px; background: #0c1017; color: #c3cad6; cursor: pointer; display: flex; flex-direction: column; gap: 3px; }
+.search-result:hover { border-color: #2c3446; }
+.search-result-head { display: flex; flex-direction: column; }
+.search-result-head strong { font-size: calc(10px + var(--font-boost)); font-weight: 600; }
+.search-result-head small { color: #616b7c; font-family: "SFMono-Regular", Menlo, monospace; font-size: calc(8px + var(--font-boost)); overflow: hidden; text-overflow: ellipsis; }
+.search-result code { color: #8d97a5; font-family: "SFMono-Regular", Menlo, monospace; font-size: calc(8px + var(--font-boost)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.search-strategies { display: flex; flex-wrap: wrap; gap: 3px; }
+.search-strategies em { padding: 0 5px; border-radius: 4px; background: #161c28; color: #7c8798; font-style: normal; font-size: calc(7px + var(--font-boost)); letter-spacing: .06em; text-transform: uppercase; }
+.search-strategies em[data-strategy="symbol"] { background: #1b1730; color: #b9a8e8; }
+.search-strategies em[data-strategy="embedding"] { background: #10201a; color: #8fd0b4; }
+.search-strategies em[data-strategy="graph"] { background: #101a26; color: #8fbde0; }

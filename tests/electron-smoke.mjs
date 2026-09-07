@@ -470,6 +470,44 @@ try {
   // No contact address survives from any imported artifact.
   assert.equal(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.(com|org|net|io|dev)\b/.test(JSON.stringify(evidenceAudit).replace(/example\.com/g, "")), false);
 
+  // Item 33: hybrid search over the real repository index.
+  const searchAudit = await page.evaluate(async () => {
+    const repository = { id: window.traceWorkspace.repository.id, rootPath: window.traceWorkspace.repository.rootPath };
+    const started = performance.now();
+    const first = await window.trace.search({ repository, query: "single prefill decode", limit: 8 });
+    const cold = performance.now() - started;
+    // Search for a symbol this repository really defines.
+    const target = window.traceWorkspace.repository.symbols.find((symbol) => symbol.name.length >= 12 && /^[A-Za-z_]\w+$/.test(symbol.name));
+    const warmStart = performance.now();
+    const second = await window.trace.search({ repository, query: target.name, limit: 8 });
+    const warm = performance.now() - warmStart;
+    const nonsense = await window.trace.search({ repository, query: "zzzqqqxxwvv", limit: 8 });
+    return { first, second, nonsense, cold, warm, target };
+  });
+  assert.equal(searchAudit.first.version, 1);
+  assert.ok(searchAudit.first.indexStats.indexedFiles >= 100, JSON.stringify(searchAudit.first.indexStats));
+  assert.ok(searchAudit.first.results.length >= 3, JSON.stringify(searchAudit.first.results.map((item) => item.path)));
+  // Every retriever contributed something on a real repository.
+  for (const strategy of ["lexical", "symbol", "graph", "embedding"]) {
+    assert.ok(searchAudit.first.strategies[strategy] >= 1, `${strategy} returned nothing: ${JSON.stringify(searchAudit.first.strategies)}`);
+  }
+  const searchFiles = new Set(await page.evaluate(() => window.traceWorkspace.repository.files.map((file) => file.path)));
+  for (const result of [...searchAudit.first.results, ...searchAudit.second.results]) {
+    assert.ok(searchFiles.has(result.path), `search returned an unknown path ${result.path}`);
+    assert.ok(result.score > 0 && result.strategyCount >= 1);
+    if (result.line !== null) assert.ok(result.line >= 1);
+  }
+  // A real symbol query returns that symbol's definition.
+  const wrapper = searchAudit.second.results.find((result) => result.symbol === searchAudit.target.name);
+  assert.ok(wrapper, `${searchAudit.target.name}: ${JSON.stringify(searchAudit.second.results.map((item) => [item.path, item.symbol]))}`);
+  assert.ok(wrapper.strategies.symbol);
+  assert.equal(wrapper.path, searchAudit.target.path);
+  assert.equal(wrapper.line, searchAudit.target.line);
+  // Gibberish returns nothing rather than weak noise.
+  assert.deepEqual(searchAudit.nonsense.results, [], JSON.stringify(searchAudit.nonsense.results.map((item) => item.path)));
+  // The index is cached per repository version, so the second query is fast.
+  assert.ok(searchAudit.warm < 1_000, `warm query took ${searchAudit.warm} ms`);
+
   // Item 17: real-repository import resolution plus the optional language-server bridge.
   const languageServers = await page.evaluate(() => window.trace.detectLanguageServers());
   assert.ok(Object.keys(languageServers).length >= 6, JSON.stringify(languageServers));
@@ -578,6 +616,7 @@ try {
     architecture: { modules: architecture.stats.moduleCount, layers: architecture.stats.layerCount, cycles: architecture.stats.cycleCount, violations: architecture.stats.violationCount, busiest: architectureAudit.busiest.id },
     history: { commits: history.commitCount, authors: history.authorCount, busFactor: history.repositoryBusFactor, fixCommits: history.regressions.fixCommits, lessons: historyAudit.lessons.map((lesson) => lesson.id) },
     evidence: { total: evidenceAudit.stats.total, byKind: evidenceAudit.stats.byKind, coverage: evidenceAudit.stats.coverage, skills: Object.keys(evidenceAudit.bySkill).length },
+    search: { indexedFiles: searchAudit.first.indexStats.indexedFiles, strategies: searchAudit.first.strategies, coldMs: Math.round(searchAudit.cold), warmMs: Math.round(searchAudit.warm) },
     executionTrace: { runtime: traceAudit.runtimes.python.version, calls: traceAudit.ran.summary.callCount, transitions: traceAudit.ran.summary.transitions.length, confirmed: traceAudit.ran.summary.confirmedStaticEdges, dynamicOnly: traceAudit.ran.summary.dynamicOnlyEdges },
   }, null, 2));
 } finally {

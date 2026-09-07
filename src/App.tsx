@@ -4,7 +4,7 @@ import { demoCourse, demoLearnerState, demoRepository, demoSkillGraph } from "./
 import { emptyArchitectureState, emptyChainState, emptyEvidenceState, emptyHistoryState, emptyLocalizationState, emptyReviewState, emptyTraceState, type ArchitectureState, type ChainState, type EvidenceState, type HistoryState, type LocalizationState, type ReviewState, type TraceState } from "./exercise-state";
 import { Icon, bridge, readableError, repositoryRef } from "./shell";
 import { addEvidence, completeDiagnostic, personalizeSkillGraph, skillForLesson } from "./learning";
-import type { AgentState, ContextMode, ContextPack, ContextScope, Course, IndexProgress, KnowledgeGraphSummary, LearnerProfile, LinkClassification, LearnerState, LearningMemory, Lesson, LessonContentBlock, PracticeReport, PracticeSession, Repository, RepoFile, SkillGraph, SkillNode, SymbolResolution } from "./types";
+import type { AgentState, ContextMode, ContextPack, SearchResponse, ContextScope, Course, IndexProgress, KnowledgeGraphSummary, LearnerProfile, LinkClassification, LearnerState, LearningMemory, Lesson, LessonContentBlock, PracticeReport, PracticeSession, Repository, RepoFile, SkillGraph, SkillNode, SymbolResolution } from "./types";
 
 type TutorMode = "learn" | "ask" | "quiz" | "practice";
 type WorkspaceMode = "lesson" | "diagram" | "code" | "chains" | "locate" | "review" | "notes";
@@ -259,12 +259,46 @@ function CourseSidebar({ course, skillGraph, knowledgeGraph, learnerState, activ
   );
 }
 
-function FileExplorer({ repository, lesson, currentFile, query, onQuery, onOpen, resolution, resolutionBusy, onResolve }: {
+/**
+ * Hybrid search results (item 33). Every result shows which retrievers found it,
+ * so a learner can tell a symbol hit from a fuzzy one.
+ */
+function SearchResults({ query, results, busy, onOpen }: { query: string; results: SearchResponse | null; busy: boolean; onOpen: (path: string, line: number) => void }) {
+  if (!query.trim()) return null;
+  if (busy && !results) return <div className="search-results" data-state="searching"><small>Searching…</small></div>;
+  if (!results) return null;
+  return <div className="search-results" data-state="ready" data-count={results.results.length}>
+    <div className="search-heading">
+      HYBRID SEARCH <small>{results.results.length} results · {Object.entries(results.strategies).map(([name, count]) => `${name} ${count}`).join(" · ")}</small>
+    </div>
+    {results.results.length === 0 && <p className="search-empty">Nothing matched “{results.query}”.</p>}
+    {results.results.map((result) => (
+      <button
+        key={`${result.path}-${result.symbol ?? ""}-${result.line ?? 0}`}
+        className="search-result"
+        data-path={result.path}
+        data-strategies={Object.keys(result.strategies).join(",")}
+        onClick={() => onOpen(result.path, result.line ?? result.snippet?.line ?? 1)}
+      >
+        <span className="search-result-head">
+          {result.symbol ? <strong>{result.symbol}</strong> : <strong>{result.path.split("/").at(-1)}</strong>}
+          <small>{result.path}{result.line ? `:${result.line}` : ""}</small>
+        </span>
+        {result.snippet && <code>{result.snippet.text}</code>}
+        <span className="search-strategies">{Object.keys(result.strategies).map((name) => <em key={name} data-strategy={name}>{name}</em>)}</span>
+      </button>
+    ))}
+  </div>;
+}
+
+function FileExplorer({ repository, lesson, currentFile, query, onQuery, searchResults, searchBusy, onOpen, resolution, resolutionBusy, onResolve }: {
   repository: Repository;
   lesson: Lesson;
   currentFile: RepoFile | null;
   query: string;
   onQuery: (value: string) => void;
+  searchResults: SearchResponse | null;
+  searchBusy: boolean;
   onOpen: (file: RepoFile, line?: number) => void;
   resolution: SymbolResolution | null;
   resolutionBusy: boolean;
@@ -302,6 +336,7 @@ function FileExplorer({ repository, lesson, currentFile, query, onQuery, onOpen,
       <div className="explorer-header"><span>EXPLORER</span><small>{repository.files.length}</small></div>
       <label className="explorer-search"><Icon name="search" size={13} /><input value={query} onChange={(event) => onQuery(event.target.value)} placeholder="Find file" /></label>
       <div className="explorer-scroll">
+        <SearchResults query={query} results={searchResults} busy={searchBusy} onOpen={(filePath, targetLine) => { const file = repository.files.find((item) => item.path === filePath); if (file) onOpen(file, targetLine); }} />
         <div className="tree-root"><Icon name="folder" size={14} /><strong>{repository.name}</strong></div>
         {visibleFiles.map((file) => (
           <button className={`file-row ${currentFile?.path === file.path ? "active" : ""}`} key={file.path} onClick={() => onOpen(file)} title={file.path}>
@@ -407,6 +442,22 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
   onResolve: () => void;
 }) {
   const [query, setQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<SearchResponse | null>(null);
+  const [searchBusy, setSearchBusy] = useState(false);
+  // Hybrid search runs in the main process; short queries stay a local filter.
+  useEffect(() => {
+    const trimmed = query.trim();
+    if (trimmed.length < 3) { setSearchResults(null); return; }
+    let active = true;
+    setSearchBusy(true);
+    const timer = window.setTimeout(() => {
+      void bridge.search({ repository: repositoryRef(repository), query: trimmed, limit: 8 })
+        .then((response) => { if (active) setSearchResults(response); })
+        .catch(() => { if (active) setSearchResults(null); })
+        .finally(() => { if (active) setSearchBusy(false); });
+    }, 180);
+    return () => { active = false; window.clearTimeout(timer); };
+  }, [query, repository]);
   // The architecture view follows whatever symbol the learner is currently reading.
   const architectureSymbol = useMemo(() => {
     const candidates = repository.symbols.filter((symbol) => symbol.path === currentFile?.path);
@@ -475,7 +526,7 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
 
   return (
     <main className="code-workspace panel-border">
-      <FileExplorer repository={repository} lesson={lesson} currentFile={currentFile} query={query} onQuery={setQuery} onOpen={(file, targetLine) => { onWorkspaceMode("code"); onOpen(file, targetLine); }} resolution={resolution} resolutionBusy={resolutionBusy} onResolve={onResolve} />
+      <FileExplorer repository={repository} lesson={lesson} currentFile={currentFile} query={query} onQuery={setQuery} searchResults={searchResults} searchBusy={searchBusy} onOpen={(file, targetLine) => { onWorkspaceMode("code"); onOpen(file, targetLine); }} resolution={resolution} resolutionBusy={resolutionBusy} onResolve={onResolve} />
       <section className="editor-column">
         <div className="lesson-context">
           <div><span>NOW LEARNING</span><strong>{lesson.title}</strong></div>

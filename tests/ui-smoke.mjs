@@ -268,6 +268,28 @@ try {
   await page.locator(".monaco-editor").waitFor({ timeout: 20_000 });
   await page.getByText("README.md", { exact: false }).first().waitFor();
 
+  // Item 33: hybrid search runs the same retrieval code as the desktop app.
+  await page.locator(".content-tabs").getByRole("button", { name: "Code" }).click();
+  await page.locator(".explorer-search input").fill("scheduler");
+  const searchPanel = page.locator('.search-results[data-state="ready"]');
+  await searchPanel.waitFor();
+  assert.ok(Number(await searchPanel.getAttribute("data-count")) >= 2, await searchPanel.getAttribute("data-count"));
+  assert.match(await searchPanel.locator(".search-heading small").innerText(), /lexical \d+ · symbol \d+ · graph \d+ · embedding \d+/);
+  // The Scheduler class is found by the symbol retriever, with its definition line.
+  const symbolResult = searchPanel.locator('.search-result[data-strategies*="symbol"]').first();
+  await symbolResult.waitFor();
+  assert.match(await symbolResult.locator(".search-result-head small").innerText(), /nanovllm\/engine\/scheduler\.py:\d+/);
+  // At least one result was found by more than one retriever.
+  const strategyLists = await searchPanel.locator(".search-result").evaluateAll((items) => items.map((item) => (item.getAttribute("data-strategies") ?? "").split(",").length));
+  assert.ok(Math.max(...strategyLists) >= 2, strategyLists.join(","));
+  // A misspelling still finds the file through fuzzy and embedding retrieval.
+  await page.locator(".explorer-search input").fill("Schedular");
+  await page.waitForTimeout(400);
+  assert.ok(await searchPanel.locator('.search-result[data-path="nanovllm/engine/scheduler.py"]').count() >= 1);
+  await searchPanel.locator('.search-result[data-path="nanovllm/engine/scheduler.py"]').first().click();
+  await page.getByText("nanovllm/engine/scheduler.py", { exact: false }).first().waitFor();
+  await page.locator(".explorer-search input").fill("");
+
   await page.getByRole("button", { name: "Ask", exact: true }).click();
   await page.getByText("Ask without losing your place.").waitFor();
   await page.locator(".tutor-input textarea").fill("Where is Scheduler defined?");

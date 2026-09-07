@@ -19,6 +19,7 @@ import { tutorPrompt } from "../electron/agents.mjs";
 import { SECRET_SCANNER_VERSION, anonymizePath, redact, redactValue, scanText, shannonEntropy, summarizeFindings } from "../electron/secret-scanner.mjs";
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
 import { GIT_HISTORY_VERSION, busFactor, historyLessons, historySummary, parseHistory, readCommits } from "../electron/git-history.mjs";
+import { EMBEDDING_DIMENSIONS, SEARCH_VERSION, buildSearchIndex, cosine, embed, search, subsequenceScore, tokenize } from "../electron/search.mjs";
 import { EVIDENCE_VERSION, evidenceByPath, evidenceForSkills, importEvidence } from "../electron/evidence-import.mjs";
 import { ARCHITECTURE_VERSION, architectureDiagramBlock, buildArchitecture, dataFlow, moduleFor, symbolNeighborhood } from "../electron/architecture.mjs";
 import { EXECUTION_TRACE_VERSION, detectRuntimes, runExecutionTrace, suggestTraceSnippets, summarizeTrace, traceSupported, traceTimelineBlock } from "../electron/execution-trace.mjs";
@@ -740,7 +741,7 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
     "lessons:call-chains", "lessons:grade-prediction",
     "exercise:localization", "exercise:localization-hint", "exercise:localization-score",
     "grade:race-task", "grade:race", "trace:runtimes", "trace:run",
-    "graph:architecture", "graph:symbol-flow", "history:summary", "evidence:import", "agents:ask",
+    "graph:architecture", "graph:symbol-flow", "history:summary", "evidence:import", "search:query", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
   assert.throws(() => schemaFor("repository:evil"), /is not a registered IPC channel/);
@@ -2008,4 +2009,111 @@ test("issues, pull requests, ADRs, docs, and tests import as linked evidence", a
   const redactedEvidence = await importEvidence(withContact, {});
   assert.equal(JSON.stringify(redactedEvidence).includes("maintainer@contributor.dev"), false);
   assert.match(JSON.stringify(redactedEvidence), /REDACTED:email-address/);
+});
+
+test("hybrid search fuses lexical, symbol, graph, and embedding retrieval", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-search-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "engine"), { recursive: true });
+  await mkdir(path.join(rootPath, "util"), { recursive: true });
+  await writeFile(path.join(rootPath, "engine", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "util", "__init__.py"), "");
+  await writeFile(
+    path.join(rootPath, "engine", "scheduler.py"),
+    "from util.timing import retry_timeout\n\n\nclass RequestScheduler:\n    def schedule_batch(self, requests):\n        return sorted(requests)[: retry_timeout()]\n",
+  );
+  await writeFile(path.join(rootPath, "util", "timing.py"), "def retry_timeout():\n    # the retry timeout in milliseconds\n    return 250\n");
+  await writeFile(path.join(rootPath, "engine", "worker.py"), "from engine.scheduler import RequestScheduler\n\n\ndef spin_worker():\n    return RequestScheduler()\n");
+  await writeFile(path.join(rootPath, "README.md"), "# Batching engine\n\nRequests are grouped before dispatch.\n");
+  await writeFile(path.join(rootPath, "util", "colors.py"), "PALETTE = ['red', 'green']\n\n\ndef pick_color(index):\n    return PALETTE[index]\n");
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const index = await buildSearchIndex(repository, { read: (filePath) => readFile(path.join(rootPath, filePath), "utf8") });
+
+  assert.equal(SEARCH_VERSION, 1);
+  assert.equal(index.sourceVersion, repository.versionId);
+  assert.ok(index.stats.indexedFiles >= 5, JSON.stringify(index.stats));
+  assert.ok(index.stats.vocabulary > 10);
+  await assert.rejects(() => buildSearchIndex(repository, {}), /requires a read/);
+
+  // Tokenization splits identifiers the way a reader does.
+  assert.deepEqual(tokenize("RequestScheduler"), ["requestscheduler", "request", "scheduler"]);
+  assert.deepEqual(tokenize("retry_timeout()"), ["retry_timeout", "retry", "timeout"]);
+  assert.equal(tokenize("the and for").length, 0, "stop words are dropped");
+
+  // The embedding is deterministic, normalized, and orders by similarity.
+  const vector = embed("retry timeout");
+  assert.equal(vector.length, EMBEDDING_DIMENSIONS);
+  assert.ok(Math.abs(cosine(vector, vector) - 1) < 1e-9, "embeddings are L2-normalized");
+  assert.deepEqual([...embed("retry timeout")], [...vector], "embedding is deterministic");
+  assert.ok(cosine(vector, embed("retry_timeout")) > cosine(vector, embed("pick color palette")));
+  assert.equal(subsequenceScore("rsch", "requestscheduler") > 0, true);
+  assert.equal(subsequenceScore("zzz", "requestscheduler"), 0);
+
+  // A lexical phrase finds the file that contains it.
+  const lexical = search(index, "retry timeout milliseconds", { limit: 5 });
+  assert.equal(lexical.results[0].path, "util/timing.py", JSON.stringify(lexical.results.map((item) => item.path)));
+  assert.ok(lexical.strategies.lexical >= 1);
+  assert.ok(lexical.results[0].snippet.text.includes("retry timeout"));
+
+  // An exact symbol name is found by the symbol retriever with its definition line.
+  const symbol = search(index, "RequestScheduler", { limit: 5 });
+  const symbolHit = symbol.results.find((result) => result.symbol === "RequestScheduler");
+  assert.ok(symbolHit, JSON.stringify(symbol.results.map((item) => [item.path, item.symbol])));
+  assert.equal(symbolHit.path, "engine/scheduler.py");
+  assert.equal(symbolHit.line, 4);
+  assert.ok(symbolHit.strategies.symbol.rank >= 1);
+  // The graph retriever contributes a neighbour that the text never mentions:
+  // `util/timing.py` matches no query token but is one import hop from the seed.
+  const graphHit = symbol.results.find((result) => result.path === "util/timing.py");
+  assert.ok(graphHit, JSON.stringify(symbol.results.map((item) => [item.path, Object.keys(item.strategies)])));
+  assert.ok(graphHit.strategies.graph, JSON.stringify(graphHit.strategies));
+  assert.equal(graphHit.strategies.lexical, undefined, "the graph result is not a text match");
+  assert.ok(symbol.results.some((result) => result.path === "engine/worker.py"), "the importing file is retrieved too");
+
+  // A misspelled symbol still resolves through fuzzy and embedding retrieval.
+  const fuzzy = search(index, "RequstSchedular", { limit: 5 });
+  assert.ok(fuzzy.results.some((result) => result.path === "engine/scheduler.py"), JSON.stringify(fuzzy.results.map((item) => item.path)));
+  assert.ok(fuzzy.results.some((result) => result.strategies.embedding || result.strategies.symbol));
+
+  // Fusion rewards agreement: a result found by several retrievers outranks a
+  // result found by one, and every result reports which retrievers found it.
+  const fused = search(index, "scheduler batch", { limit: 6 });
+  assert.ok(fused.results.length >= 2);
+  assert.ok(fused.results[0].strategyCount >= 2, JSON.stringify(fused.results.map((item) => [item.path, item.strategyCount])));
+  for (const result of fused.results) {
+    assert.ok(repository.files.some((file) => file.path === result.path), `unknown result path ${result.path}`);
+    assert.ok(Object.keys(result.strategies).length >= 1);
+    for (const [name, detail] of Object.entries(result.strategies)) {
+      assert.ok(["lexical", "symbol", "graph", "embedding"].includes(name), name);
+      assert.ok(detail.rank >= 1);
+    }
+    assert.ok(result.score > 0);
+  }
+  // Results are ordered by fused score.
+  const scores = fused.results.map((result) => result.score);
+  assert.deepEqual(scores, [...scores].sort((left, right) => right - left));
+
+  // Weighting a strategy to zero removes its contribution but not the others.
+  const noSymbols = search(index, "RequestScheduler", { limit: 10, weights: { symbol: 0 } });
+  assert.ok(noSymbols.results.length >= 1);
+  const symbolOnly = noSymbols.results.find((result) => Object.keys(result.strategies).join() === "symbol");
+  assert.equal(symbolOnly?.score, 0, "a zero-weighted strategy contributes no score");
+
+  // An empty query is answered without touching any retriever.
+  assert.deepEqual(search(index, "   ").results, []);
+  // A query that matches nothing returns an empty, well-formed response.
+  const nothing = search(index, "zzzqqqxxx", { limit: 5 });
+  assert.deepEqual(nothing.results, []);
+  assert.equal(nothing.query, "zzzqqqxxx");
+  assert.equal(typeof nothing.tookMs, "number");
+
+  // Indexing is bounded by the configured limits.
+  const bounded = await buildSearchIndex(repository, {
+    read: (filePath) => readFile(path.join(rootPath, filePath), "utf8"),
+    limits: { maxIndexedFiles: 2 },
+  });
+  assert.equal(bounded.stats.indexedFiles <= 2, true);
 });

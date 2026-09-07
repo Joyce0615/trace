@@ -1,5 +1,8 @@
 import type { Architecture, ArchitectureModule, DataFlow, CallChain, CallChainStep, ContextPack, LocalizationExercise, RaceStageResult, RaceTask, ContextSection, KnowledgeGraphEdge, KnowledgeGraphNode, KnowledgeGraphSummary, LearnerState, LinkClassification, PredictionExercise, TraceBridge } from "./types";
 import { nanoCourse, nanoLearnerState, nanoRepository, nanoSkillGraph, nanoSourceByPath } from "./nano-demo";
+// The demo runs the *same* retrieval code as the desktop app, so hybrid search
+// behaves identically with and without a main process.
+import { buildSearchIndex, search, type SearchIndex } from "../electron/search.mjs";
 
 export const demoRepository = nanoRepository;
 export const demoCourse = nanoCourse;
@@ -7,6 +10,7 @@ export const demoSkillGraph = nanoSkillGraph;
 export const demoLearnerState = nanoLearnerState;
 
 let savedLearning: LearnerState = structuredClone(nanoLearnerState);
+let demoSearchIndex: SearchIndex | null = null;
 
 const demoGraphNodes: KnowledgeGraphNode[] = [
   { id: `repository:${nanoRepository.id}`, kind: "repository", key: nanoRepository.id, label: nanoRepository.name },
@@ -641,6 +645,10 @@ export const browserBridge: TraceBridge = {
       sources: { offline: ["documentation"], unavailable: ["git history (the featured demo runs from a bundled snapshot)"] },
       bySkill: {},
     };
+  },
+  async search(request) {
+    demoSearchIndex = demoSearchIndex ?? await buildSearchIndex(nanoRepository, { read: (filePath) => nanoSourceByPath[filePath] ?? "" });
+    return { ...search(demoSearchIndex, request.query, { limit: request.limit ?? 10 }), indexStats: demoSearchIndex.stats };
   },
   async askAgent(request) {
     await new Promise((resolve) => setTimeout(resolve, 550));
