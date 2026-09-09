@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { Icon, bridge, readableError, repositoryRef } from "./shell";
-import type { Lesson, PredictionExercise, Repository, SkillGraph } from "./types";
-import type { ArchitectureState, ChainState, EvidenceState, HistoryState, LocalizationState, ReviewState, TraceState } from "./exercise-state";
+import type { Course, Lesson, PredictionExercise, Repository, SkillGraph } from "./types";
+import type { ArchitectureState, ChainState, EvaluationState, EvidenceState, HistoryState, LocalizationState, ReviewState, TraceState } from "./exercise-state";
 
 /**
- * Exercise and visualization panels (items 26-32).
+ * Exercise, visualization, and quality panels (items 26-34).
  *
  * These are loaded lazily: a learner who never opens Chains, Locate, or Review
  * never downloads them, which keeps the application entry chunk inside the
@@ -417,6 +417,81 @@ export function EvidencePanel({ repository, skillGraph, currentFile, state, onSt
         </div>
       </div>)}
     </div>
+  </section>;
+}
+
+/**
+ * Quality scorecards (item 34). Retrieval, tutor answers, and lessons are shown
+ * side by side and never averaged: they fail for different reasons.
+ */
+export function EvaluationPanel({ repository, course, skillGraph, state, onState, onAnchor }: {
+  repository: Repository;
+  course: Course | null;
+  skillGraph: SkillGraph | null;
+  state: EvaluationState;
+  onState: (update: Partial<EvaluationState>) => void;
+  onAnchor: (path: string, line: number) => void;
+}) {
+  const { report, status } = state;
+  const run = async () => {
+    onState({ status: "loading" });
+    try {
+      onState({
+        report: await bridge.evaluate({
+          repository: repositoryRef(repository),
+          course: course ?? undefined,
+          skillGraph: skillGraph ?? undefined,
+          sampleSize: 12,
+        }),
+        status: "ready",
+      });
+    } catch {
+      onState({ status: "error" });
+    }
+  };
+
+  return <section className="evaluation-panel" data-status={status}>
+    <div className="evaluation-head">
+      <span>QUALITY SCORECARDS</span>
+      <button className="ghost" disabled={status === "loading"} onClick={() => void run()}>{status === "loading" ? "Evaluating…" : report ? "Re-run evaluation" : "Run evaluation"}</button>
+    </div>
+    {status === "error" && <p className="evaluation-note">Evaluation is unavailable for this repository.</p>}
+    {!report && status !== "loading" && <p className="evaluation-note">Retrieval, tutor answers, and lessons are measured separately, never averaged into one number.</p>}
+    {report && <div className="scorecards">
+      {report.retrieval && <div className="scorecard" data-card="retrieval">
+        <header>Retrieval<small>{report.retrieval.cases} gold cases</small></header>
+        <div className="scorecard-metrics">
+          <div><em data-metric="recall1">{Math.round(report.retrieval.recallAt1 * 100)}%</em><small>recall@1</small></div>
+          <div><em data-metric="recall5">{Math.round(report.retrieval.recallAt5 * 100)}%</em><small>recall@5</small></div>
+          <div><em data-metric="mrr">{report.retrieval.mrr.toFixed(2)}</em><small>MRR</small></div>
+          <div><em data-metric="ndcg">{report.retrieval.ndcgAt5.toFixed(2)}</em><small>nDCG@5</small></div>
+        </div>
+        <small className="scorecard-note">{report.retrieval.medianLatencyMs} ms median · {report.retrieval.falsePositiveQueries} nonsense queries returned results</small>
+        {report.retrieval.missed.length > 0 && <div className="scorecard-misses">{report.retrieval.missed.slice(0, 3).map((miss) => <button key={miss.query} onClick={() => onAnchor(miss.goldPath, 1)}>{miss.query}</button>)}</div>}
+      </div>}
+      {report.lessons && <div className="scorecard" data-card="lessons" data-verdict={report.lessons.verdict}>
+        <header>Lessons<small>{report.lessons.lessons} lessons · {report.lessons.anchors} anchors</small></header>
+        <div className="scorecard-metrics">
+          <div><em data-metric="anchors">{Math.round(report.lessons.anchorValidity * 100)}%</em><small>anchors valid</small></div>
+          <div><em data-metric="symbols">{Math.round(report.lessons.symbolAccuracy * 100)}%</em><small>symbols exact</small></div>
+          <div><em data-metric="quiz">{Math.round(report.lessons.quizCoverage * 100)}%</em><small>quiz coverage</small></div>
+          <div><em data-metric="entry">{Math.round(report.lessons.entryPointCoverage * 100)}%</em><small>entry points</small></div>
+        </div>
+        <small className="scorecard-note">{report.lessons.difficultyInversions} difficulty inversions · verdict {report.lessons.verdict}</small>
+        {report.lessons.danglingAnchors.length > 0 && <div className="scorecard-misses">{report.lessons.danglingAnchors.slice(0, 3).map((anchor) => <button key={`${anchor.lessonId}-${anchor.path}`}>{anchor.path}</button>)}</div>}
+      </div>}
+      <div className="scorecard" data-card="tutor">
+        <header>Tutor answers<small>{report.tutor ? `${report.tutor.answers} graded` : "no answers yet"}</small></header>
+        {report.tutor ? <>
+          <div className="scorecard-metrics">
+            <div><em data-metric="grounding">{Math.round(report.tutor.grounding * 100)}%</em><small>citations valid</small></div>
+            <div><em data-metric="precision">{Math.round(report.tutor.symbolPrecision * 100)}%</em><small>symbols real</small></div>
+            <div><em data-metric="faithful">{Math.round(report.tutor.faithfulness * 100)}%</em><small>context used</small></div>
+            <div><em data-metric="unverifiable">{report.tutor.unverifiable}</em><small>unverifiable</small></div>
+          </div>
+        </> : <p className="evaluation-note">Ask the tutor a question, then re-run to grade its grounding.</p>}
+      </div>
+    </div>}
   </section>;
 }
 

@@ -21,6 +21,7 @@ import { buildArchitecture, dataFlow, symbolNeighborhood } from "./architecture.
 import { historyLessons, historySummary, readCommits } from "./git-history.mjs";
 import { evidenceForSkills, importEvidence } from "./evidence-import.mjs";
 import { buildSearchIndex, search } from "./search.mjs";
+import { runEvaluation } from "./evaluation.mjs";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const openedRepositories = new Map();
@@ -379,6 +380,23 @@ const ipcHandlers = {
       : await buildSearchIndex(repository, { read: (filePath) => readRepositoryFile(repository.rootPath, filePath) });
     searchIndexes.set(repository.id, index);
     return { ...search(index, request.query, { limit: request.limit ?? 10 }), indexStats: index.stats };
+  },
+
+  "eval:run": async (_event, request) => {
+    const repository = openedRepository(request.repository);
+    const cached = searchIndexes.get(repository.id);
+    const index = cached?.sourceVersion === repository.versionId
+      ? cached
+      : await buildSearchIndex(repository, { read: (filePath) => readRepositoryFile(repository.rootPath, filePath) });
+    searchIndexes.set(repository.id, index);
+    return runEvaluation({
+      index,
+      repository,
+      course: request.course ?? null,
+      skillGraph: request.skillGraph ?? null,
+      answers: request.answers ?? [],
+      options: { retrieval: { sampleSize: request.sampleSize ?? 20 } },
+    });
   },
 
   "agents:ask": async (_event, request) => {

@@ -719,8 +719,64 @@ export interface SearchResponse {
   results: SearchResult[];
   strategies: Record<string, number>;
   fused: number;
+  grounded?: boolean;
   tookMs?: number;
   indexStats?: { indexedFiles: number; candidateFiles: number; vocabulary: number };
+}
+
+export interface RetrievalScorecard {
+  kind: "retrieval";
+  cases: number;
+  recallAt1: number;
+  recallAt5: number;
+  mrr: number;
+  ndcgAt5: number;
+  exactSymbolRate: number;
+  missed: Array<{ query: string; goldPath: string }>;
+  medianLatencyMs: number;
+  falsePositiveQueries: number;
+  falsePositiveRate: number;
+  samples: Array<{ query: string; goldPath: string; rank: number | null; returned: number; exactSymbol: boolean; tookMs: number }>;
+}
+
+export interface TutorScorecard {
+  kind: "tutor";
+  answers: number;
+  grounding: number;
+  symbolPrecision: number;
+  faithfulness: number;
+  score: number;
+  unverifiable: number;
+  verdicts: string[];
+  details: unknown[];
+}
+
+export interface LessonScorecard {
+  kind: "lessons";
+  lessons: number;
+  anchors: number;
+  anchorValidity: number;
+  danglingAnchors: Array<{ lessonId: string; path: string }>;
+  symbolAnchors: number;
+  symbolAccuracy: number;
+  contentBlocks: number;
+  blockAnchorValidity: number;
+  quizCoverage: number;
+  lessonsWithoutAnchor: string[];
+  difficultyInversions: number;
+  entryPointCoverage: number;
+  skillCoverage: number | null;
+  score: number;
+  verdict: "solid" | "usable" | "weak";
+}
+
+export interface EvaluationReport {
+  version: number;
+  separate: boolean;
+  retrieval: RetrievalScorecard | null;
+  tutor: TutorScorecard | null;
+  lessons: LessonScorecard | null;
+  generatedAt: string;
 }
 
 export interface AgentState {
@@ -778,6 +834,7 @@ export interface TraceBridge {
   history(request: { repository: RepositoryRef; commits?: number }): Promise<{ summary: HistorySummary; lessons: Lesson[] }>;
   importEvidence(request: { repository: RepositoryRef; commits?: number; skillGraph?: SkillGraph }): Promise<EvidenceImport>;
   search(request: { repository: RepositoryRef; query: string; limit?: number }): Promise<SearchResponse>;
+  evaluate(request: { repository: RepositoryRef; course?: Course; skillGraph?: SkillGraph; answers?: unknown[]; sampleSize?: number }): Promise<EvaluationReport>;
   askAgent(request: {
     provider: "codex" | "claude";
     rootPath: string;

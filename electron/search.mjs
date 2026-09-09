@@ -154,6 +154,32 @@ function bm25(index, queryTokens, options = {}) {
   return scored.sort((left, right) => right.score - left.score || left.path.localeCompare(right.path));
 }
 
+/** Bounded Levenshtein distance; returns `limit + 1` once the bound is exceeded. */
+export function editDistance(left, right, limit = 4) {
+  if (Math.abs(left.length - right.length) > limit) return limit + 1;
+  let previous = Array.from({ length: right.length + 1 }, (unused, index) => index);
+  for (let row = 1; row <= left.length; row += 1) {
+    const current = [row];
+    let best = row;
+    for (let column = 1; column <= right.length; column += 1) {
+      const cost = left[row - 1] === right[column - 1] ? 0 : 1;
+      current[column] = Math.min(previous[column] + 1, current[column - 1] + 1, previous[column - 1] + cost);
+      best = Math.min(best, current[column]);
+    }
+    if (best > limit) return limit + 1;
+    previous = current;
+  }
+  return previous[right.length];
+}
+
+/** Normalized similarity for a misspelled identifier, in [0, 1]. */
+export function similarityScore(query, candidate) {
+  const longest = Math.max(query.length, candidate.length);
+  if (!longest) return 0;
+  const distance = editDistance(query, candidate);
+  return distance > 4 ? 0 : 1 - distance / longest;
+}
+
 /** Subsequence match, the behaviour a fuzzy file/symbol picker is expected to have. */
 export function subsequenceScore(query, candidate) {
   if (!query) return 0;
@@ -182,8 +208,12 @@ function symbolSearch(index, query) {
     else if (symbol.lower.includes(lower)) score = 2;
     else if (tokens.some((token) => symbol.lower.includes(token))) score = 1.2;
     else {
-      const fuzzy = subsequenceScore(lower.replace(/[^a-z0-9_]/g, ""), symbol.lower);
-      if (fuzzy > 0) score = fuzzy;
+      // A misspelled identifier belongs to the symbol retriever, not to a fuzzy
+      // embedding: edit similarity is what actually recognises `Schedular`.
+      const compact = lower.replace(/[^a-z0-9_]/g, "");
+      const similarity = similarityScore(compact, symbol.lower);
+      const fuzzy = subsequenceScore(compact, symbol.lower);
+      score = Math.max(similarity >= 0.7 ? similarity : 0, fuzzy);
     }
     if (score > 0) scored.push({ path: symbol.path, line: symbol.line, symbol: symbol.name, kind: symbol.kind, score });
   }
@@ -210,9 +240,12 @@ function graphSearch(index, seeds, limit) {
     .slice(0, limit);
 }
 
-// A trigram embedding always produces *some* similarity, so a nonsense query
-// would otherwise return the same weak files every time. Results must clear both
-// an absolute floor and a fraction of the best match for this query.
+// A trigram embedding always produces *some* similarity, and on a large corpus
+// nonsense can out-score a real query (measured: 0.37 for gibberish against 0.43
+// for a real phrase), so an absolute threshold cannot separate them. Embedding
+// results are therefore kept only when something else anchors the query to this
+// repository - a known token or a recognisable symbol - and must still clear a
+// fraction of the best match for the query.
 const EMBEDDING_FLOOR = 0.25;
 const EMBEDDING_RELATIVE_FLOOR = 0.4;
 
@@ -257,7 +290,9 @@ export function search(index, query, options = {}) {
   const symbols = symbolSearch(index, trimmed).slice(0, limit * 3);
   const seeds = [...new Set([...lexical.slice(0, 5).map((entry) => entry.path), ...symbols.slice(0, 5).map((entry) => entry.path)])];
   const graph = graphSearch(index, seeds, limit * 2);
-  const embedding = embeddingSearch(index, trimmed, limit * 3, options);
+  const grounded = queryTokens.some((token) => index.documentFrequency.has(token))
+    || symbols.some((entry) => entry.score >= 0.7);
+  const embedding = grounded ? embeddingSearch(index, trimmed, limit * 3, options) : [];
 
   const fused = new Map();
   const contribute = (strategy, entries) => {
@@ -315,6 +350,7 @@ export function search(index, query, options = {}) {
       embedding: embedding.length,
     },
     fused: fused.size,
+    grounded,
     tookMs: Date.now() - started,
   };
 }

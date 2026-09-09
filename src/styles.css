@@ -666,3 +666,22 @@ button { color: inherit; }
 .search-strategies em[data-strategy="symbol"] { background: #1b1730; color: #b9a8e8; }
 .search-strategies em[data-strategy="embedding"] { background: #10201a; color: #8fd0b4; }
 .search-strategies em[data-strategy="graph"] { background: #101a26; color: #8fbde0; }
+
+/* Item 34: separate quality scorecards for retrieval, tutor answers, lessons. */
+.evaluation-panel { padding: 18px 26px 34px; display: flex; flex-direction: column; gap: 10px; border-top: 1px solid #1a2130; }
+.evaluation-head { display: flex; align-items: center; gap: 10px; }
+.evaluation-head span { color: #ffd28f; font-size: calc(9px + var(--font-boost)); letter-spacing: .14em; }
+.evaluation-head .ghost { margin-left: auto; padding: 5px 12px; border: 1px solid #262d3d; border-radius: 8px; background: none; color: #93a0b1; font-size: calc(10px + var(--font-boost)); cursor: pointer; }
+.evaluation-note { color: #616b7c; font-size: calc(10px + var(--font-boost)); }
+.scorecards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 9px; }
+.scorecard { padding: 10px 12px; border: 1px solid #1e2532; border-radius: 9px; background: #0e121a; display: flex; flex-direction: column; gap: 7px; }
+.scorecard[data-verdict="weak"] { border-color: #4a2f2f; }
+.scorecard > header { display: flex; align-items: baseline; gap: 8px; color: #dbe1ea; font-size: calc(11px + var(--font-boost)); font-weight: 600; }
+.scorecard > header small { color: #616b7c; font-weight: 400; font-size: calc(9px + var(--font-boost)); }
+.scorecard-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 5px; }
+.scorecard-metrics div { padding: 5px 3px; border: 1px solid #1c2230; border-radius: 7px; background: #0c1017; text-align: center; }
+.scorecard-metrics em { display: block; font-style: normal; font-size: calc(12px + var(--font-boost)); color: #cfd6e2; }
+.scorecard-metrics small { color: #5b6474; font-size: calc(8px + var(--font-boost)); }
+.scorecard-note { color: #616b7c; font-size: calc(9px + var(--font-boost)); }
+.scorecard-misses { display: flex; flex-wrap: wrap; gap: 5px; }
+.scorecard-misses button { padding: 2px 8px; border: 1px solid #3a3222; border-radius: 6px; background: #16130d; color: #c8ad72; font-family: "SFMono-Regular", Menlo, monospace; font-size: calc(9px + var(--font-boost)); cursor: pointer; }

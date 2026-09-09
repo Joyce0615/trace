@@ -508,6 +508,40 @@ try {
   // The index is cached per repository version, so the second query is fast.
   assert.ok(searchAudit.warm < 1_000, `warm query took ${searchAudit.warm} ms`);
 
+  // Item 34: separate quality scorecards computed from the real repository.
+  const evaluationAudit = await page.evaluate(async () => {
+    const workspace = window.traceWorkspace;
+    const repository = { id: workspace.repository.id, rootPath: workspace.repository.rootPath };
+    const good = workspace.repository.symbols[0];
+    return window.trace.evaluate({
+      repository,
+      course: workspace.course,
+      skillGraph: workspace.skillGraph,
+      sampleSize: 12,
+      answers: [
+        { text: `\`${good.name}\` is defined at ${good.path}:${good.line}.`, pack: { sections: [{ source: `${good.path}:${good.line}` }] } },
+        { text: "It lives at flashinfer/definitely_not_a_file.py:9 and calls `totally_invented_symbol`.", pack: { sections: [] } },
+      ],
+    });
+  });
+  assert.equal(evaluationAudit.version, 1);
+  assert.equal(evaluationAudit.separate, true);
+  assert.equal("overall" in evaluationAudit, false, "scorecards must not be averaged together");
+  // Retrieval is measured against gold cases derived from the real index.
+  assert.ok(evaluationAudit.retrieval.cases >= 10, String(evaluationAudit.retrieval.cases));
+  assert.ok(evaluationAudit.retrieval.recallAt5 >= evaluationAudit.retrieval.recallAt1);
+  assert.ok(evaluationAudit.retrieval.mrr > 0, JSON.stringify(evaluationAudit.retrieval));
+  assert.equal(evaluationAudit.retrieval.falsePositiveQueries, 0);
+  // Tutor grading separates the grounded answer from the fabricated one.
+  assert.equal(evaluationAudit.tutor.answers, 2);
+  assert.deepEqual(evaluationAudit.tutor.verdicts.sort(), ["grounded", "ungrounded"]);
+  assert.ok(evaluationAudit.tutor.details.some((detail) => detail.unknownSymbols.includes("totally_invented_symbol")));
+  assert.ok(evaluationAudit.tutor.details.some((detail) => detail.invalidCitations.some((citation) => citation.reason === "unknown-file")));
+  // The generated course anchors only files that exist.
+  assert.equal(evaluationAudit.lessons.anchorValidity, 1, JSON.stringify(evaluationAudit.lessons.danglingAnchors));
+  assert.equal(evaluationAudit.lessons.difficultyInversions, 0);
+  assert.ok(evaluationAudit.lessons.score >= 0.8, String(evaluationAudit.lessons.score));
+
   // Item 17: real-repository import resolution plus the optional language-server bridge.
   const languageServers = await page.evaluate(() => window.trace.detectLanguageServers());
   assert.ok(Object.keys(languageServers).length >= 6, JSON.stringify(languageServers));
@@ -617,6 +651,11 @@ try {
     history: { commits: history.commitCount, authors: history.authorCount, busFactor: history.repositoryBusFactor, fixCommits: history.regressions.fixCommits, lessons: historyAudit.lessons.map((lesson) => lesson.id) },
     evidence: { total: evidenceAudit.stats.total, byKind: evidenceAudit.stats.byKind, coverage: evidenceAudit.stats.coverage, skills: Object.keys(evidenceAudit.bySkill).length },
     search: { indexedFiles: searchAudit.first.indexStats.indexedFiles, strategies: searchAudit.first.strategies, coldMs: Math.round(searchAudit.cold), warmMs: Math.round(searchAudit.warm) },
+    evaluation: {
+      retrieval: { cases: evaluationAudit.retrieval.cases, recallAt1: evaluationAudit.retrieval.recallAt1, recallAt5: evaluationAudit.retrieval.recallAt5, mrr: evaluationAudit.retrieval.mrr, ndcg: evaluationAudit.retrieval.ndcgAt5 },
+      tutor: { grounding: evaluationAudit.tutor.grounding, symbolPrecision: evaluationAudit.tutor.symbolPrecision },
+      lessons: { score: evaluationAudit.lessons.score, verdict: evaluationAudit.lessons.verdict },
+    },
     executionTrace: { runtime: traceAudit.runtimes.python.version, calls: traceAudit.ran.summary.callCount, transitions: traceAudit.ran.summary.transitions.length, confirmed: traceAudit.ran.summary.confirmedStaticEdges, dynamicOnly: traceAudit.ran.summary.dynamicOnlyEdges },
   }, null, 2));
 } finally {

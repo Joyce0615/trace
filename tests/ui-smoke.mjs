@@ -290,6 +290,22 @@ try {
   await page.getByText("nanovllm/engine/scheduler.py", { exact: false }).first().waitFor();
   await page.locator(".explorer-search input").fill("");
 
+  // Item 34: three quality scorecards, never averaged into one number.
+  await page.locator(".content-tabs").getByRole("button", { name: "Diagram" }).click();
+  const evaluation = page.locator(".evaluation-panel");
+  await evaluation.waitFor();
+  await evaluation.getByRole("button", { name: "Run evaluation" }).click();
+  await evaluation.locator('.scorecard[data-card="retrieval"]').waitFor({ timeout: 30_000 });
+  assert.equal(await evaluation.locator(".scorecard").count(), 3);
+  const recallAt5 = Number((await evaluation.locator('[data-metric="recall5"]').innerText()).replace("%", ""));
+  assert.ok(recallAt5 >= 50, `recall@5 was ${recallAt5}%`);
+  assert.equal(await evaluation.locator('[data-metric="anchors"]').innerText(), "100%");
+  assert.equal(await evaluation.locator('[data-metric="quiz"]').innerText(), "100%");
+  assert.equal(await evaluation.locator('.scorecard[data-card="lessons"]').getAttribute("data-verdict"), "solid");
+  // Tutor answers are graded only once there are answers to grade.
+  await evaluation.locator('.scorecard[data-card="tutor"]').getByText("no answers yet").waitFor();
+  await page.screenshot({ path: path.join(artifactDirectory, "scorecards.png") });
+
   await page.getByRole("button", { name: "Ask", exact: true }).click();
   await page.getByText("Ask without losing your place.").waitFor();
   await page.locator(".tutor-input textarea").fill("Where is Scheduler defined?");

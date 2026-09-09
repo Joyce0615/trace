@@ -27,6 +27,8 @@ export declare function tokenize(text: string): string[];
 export declare function embed(text: string): Float64Array;
 export declare function cosine(left: Float64Array, right: Float64Array): number;
 export declare function subsequenceScore(query: string, candidate: string): number;
+export declare function editDistance(left: string, right: string, limit?: number): number;
+export declare function similarityScore(query: string, candidate: string): number;
 export declare function buildSearchIndex(
   repository: Pick<Repository, "id" | "files" | "symbols"> & { versionId?: string; imports?: Repository["imports"]; callEdges?: Repository["callEdges"] },
   options: { read: (filePath: string) => Promise<string> | string; limits?: Partial<typeof DEFAULT_SEARCH_LIMITS> },

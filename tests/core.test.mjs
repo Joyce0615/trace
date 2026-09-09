@@ -19,7 +19,8 @@ import { tutorPrompt } from "../electron/agents.mjs";
 import { SECRET_SCANNER_VERSION, anonymizePath, redact, redactValue, scanText, shannonEntropy, summarizeFindings } from "../electron/secret-scanner.mjs";
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
 import { GIT_HISTORY_VERSION, busFactor, historyLessons, historySummary, parseHistory, readCommits } from "../electron/git-history.mjs";
-import { EMBEDDING_DIMENSIONS, SEARCH_VERSION, buildSearchIndex, cosine, embed, search, subsequenceScore, tokenize } from "../electron/search.mjs";
+import { EVALUATION_VERSION, evaluateLessons, evaluateRetrieval, evaluateTutorAnswer, runEvaluation } from "../electron/evaluation.mjs";
+import { EMBEDDING_DIMENSIONS, SEARCH_VERSION, buildSearchIndex, cosine, editDistance, embed, search, similarityScore, subsequenceScore, tokenize } from "../electron/search.mjs";
 import { EVIDENCE_VERSION, evidenceByPath, evidenceForSkills, importEvidence } from "../electron/evidence-import.mjs";
 import { ARCHITECTURE_VERSION, architectureDiagramBlock, buildArchitecture, dataFlow, moduleFor, symbolNeighborhood } from "../electron/architecture.mjs";
 import { EXECUTION_TRACE_VERSION, detectRuntimes, runExecutionTrace, suggestTraceSnippets, summarizeTrace, traceSupported, traceTimelineBlock } from "../electron/execution-trace.mjs";
@@ -741,7 +742,7 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
     "lessons:call-chains", "lessons:grade-prediction",
     "exercise:localization", "exercise:localization-hint", "exercise:localization-score",
     "grade:race-task", "grade:race", "trace:runtimes", "trace:run",
-    "graph:architecture", "graph:symbol-flow", "history:summary", "evidence:import", "search:query", "agents:ask",
+    "graph:architecture", "graph:symbol-flow", "history:summary", "evidence:import", "search:query", "eval:run", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
   assert.throws(() => schemaFor("repository:evil"), /is not a registered IPC channel/);
@@ -2051,6 +2052,12 @@ test("hybrid search fuses lexical, symbol, graph, and embedding retrieval", asyn
   assert.ok(cosine(vector, embed("retry_timeout")) > cosine(vector, embed("pick color palette")));
   assert.equal(subsequenceScore("rsch", "requestscheduler") > 0, true);
   assert.equal(subsequenceScore("zzz", "requestscheduler"), 0);
+  // Misspellings are recognised by edit distance, which is what a symbol search
+  // needs; the bound keeps it cheap over thousands of symbols.
+  assert.equal(editDistance("abc", "abd"), 1);
+  assert.equal(editDistance("abc", "completely-different"), 5, "the bound is reported rather than the true distance");
+  assert.ok(similarityScore("requstschedular", "requestscheduler") >= 0.7);
+  assert.equal(similarityScore("zzzqqq", "requestscheduler"), 0);
 
   // A lexical phrase finds the file that contains it.
   const lexical = search(index, "retry timeout milliseconds", { limit: 5 });
@@ -2104,9 +2111,14 @@ test("hybrid search fuses lexical, symbol, graph, and embedding retrieval", asyn
 
   // An empty query is answered without touching any retriever.
   assert.deepEqual(search(index, "   ").results, []);
-  // A query that matches nothing returns an empty, well-formed response.
+  // A query that matches nothing returns an empty, well-formed response. On a
+  // large corpus a trigram embedding scores nonsense as highly as a real query,
+  // so results also require the query to be grounded in the repository.
   const nothing = search(index, "zzzqqqxxx", { limit: 5 });
   assert.deepEqual(nothing.results, []);
+  assert.equal(nothing.grounded, false);
+  assert.equal(search(index, "retry timeout", { limit: 5 }).grounded, true);
+  assert.equal(search(index, "RequstSchedular", { limit: 5 }).grounded, true, "a recognisable misspelling is still grounded");
   assert.equal(nothing.query, "zzzqqqxxx");
   assert.equal(typeof nothing.tookMs, "number");
 
@@ -2116,4 +2128,135 @@ test("hybrid search fuses lexical, symbol, graph, and embedding retrieval", asyn
     limits: { maxIndexedFiles: 2 },
   });
   assert.equal(bounded.stats.indexedFiles <= 2, true);
+});
+
+test("retrieval, tutor answers, and lessons are evaluated separately", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-eval-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "engine"), { recursive: true });
+  await writeFile(path.join(rootPath, "engine", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "engine", "planner.py"), "def plan_batch(requests):\n    return sorted(requests)\n\n\ndef estimate_cost(plan):\n    return len(plan)\n");
+  await writeFile(path.join(rootPath, "engine", "executor.py"), "from engine.planner import plan_batch\n\n\ndef execute_plan(requests):\n    return plan_batch(requests)\n");
+  await writeFile(path.join(rootPath, "README.md"), "# Planner\n\nBatches requests before execution.\n");
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const index = await buildSearchIndex(repository, { read: (filePath) => readFile(path.join(rootPath, filePath), "utf8") });
+
+  assert.equal(EVALUATION_VERSION, 1);
+
+  // --- Retrieval scorecard -------------------------------------------------
+  const retrieval = evaluateRetrieval(index, repository, { sampleSize: 4 });
+  assert.equal(retrieval.kind, "retrieval");
+  assert.ok(retrieval.cases >= 3, String(retrieval.cases));
+  assert.ok(retrieval.recallAt5 >= 0.75, JSON.stringify(retrieval));
+  assert.ok(retrieval.mrr > 0 && retrieval.mrr <= 1);
+  assert.ok(retrieval.ndcgAt5 > 0 && retrieval.ndcgAt5 <= 1);
+  // Ranking metrics must be consistent with each other.
+  assert.ok(retrieval.recallAt1 <= retrieval.recallAt5);
+  assert.ok(retrieval.mrr <= retrieval.recallAt5 + 1e-9);
+  assert.equal(retrieval.falsePositiveQueries, 0, "nonsense queries must return nothing");
+  assert.equal(retrieval.falsePositiveRate, 0);
+  assert.ok(retrieval.samples.every((sample) => repository.files.some((file) => file.path === sample.goldPath)));
+  // A deterministic sample means the same run twice gives the same score.
+  assert.deepEqual(evaluateRetrieval(index, repository, { sampleSize: 4 }).samples.map((item) => item.query), retrieval.samples.map((item) => item.query));
+
+  // --- Tutor scorecard -----------------------------------------------------
+  const lineCounts = { "engine/planner.py": 6, "engine/executor.py": 5 };
+  const grounded = evaluateTutorAnswer({
+    text: "`plan_batch` is defined at engine/planner.py:1 and used by `execute_plan` at engine/executor.py:4.",
+    pack: { sections: [{ source: "engine/planner.py:1" }, { source: "engine/executor.py:4" }] },
+  }, repository, { lineCounts });
+  assert.equal(grounded.citations, 2);
+  assert.equal(grounded.validCitations, 2);
+  assert.equal(grounded.grounding, 1);
+  assert.equal(grounded.symbolPrecision, 1);
+  assert.equal(grounded.faithfulness, 1);
+  assert.equal(grounded.verdict, "grounded");
+  assert.equal(grounded.unverifiable, false);
+
+  // A fabricated citation and an invented symbol are both caught.
+  const hallucinated = evaluateTutorAnswer({
+    text: "`plan_batch` calls `optimise_queue` which lives at engine/optimiser.py:12, see engine/planner.py:900.",
+    pack: { sections: [{ source: "engine/planner.py:1" }] },
+  }, repository, { lineCounts });
+  assert.equal(hallucinated.citations, 2);
+  assert.equal(hallucinated.validCitations, 0);
+  assert.deepEqual(hallucinated.invalidCitations.map((citation) => citation.reason).sort(), ["line-out-of-range", "unknown-file"]);
+  assert.deepEqual(hallucinated.unknownSymbols, ["optimise_queue"]);
+  assert.equal(hallucinated.symbolPrecision, 0.5);
+  assert.ok(hallucinated.score < grounded.score);
+  assert.equal(hallucinated.verdict, "ungrounded");
+
+  // A fluent answer with no citation is flagged as unverifiable, not as correct.
+  const fluent = evaluateTutorAnswer({ text: "The planner sorts work before the executor runs it, which keeps ordering stable.", pack: { sections: [] } }, repository, { lineCounts });
+  assert.equal(fluent.unverifiable, true);
+  assert.equal(fluent.grounding, 0);
+  assert.ok(fluent.score < 0.5);
+
+  // --- Lesson scorecard ----------------------------------------------------
+  const course = generateStarterCourse(repository);
+  const skillGraph = buildSkillGraph(repository, course);
+  const lessons = evaluateLessons(course, repository, skillGraph);
+  assert.equal(lessons.kind, "lessons");
+  assert.equal(lessons.anchorValidity, 1, JSON.stringify(lessons.danglingAnchors));
+  assert.equal(lessons.symbolAccuracy, 1, "every symbol anchor names a symbol that exists at that path");
+  assert.equal(lessons.quizCoverage, 1);
+  assert.equal(lessons.difficultyInversions, 0, "a generated course must not go backwards in difficulty");
+  assert.equal(lessons.blockAnchorValidity, 1);
+  assert.equal(lessons.skillCoverage, 1);
+  assert.ok(lessons.score >= 0.8);
+  assert.equal(lessons.verdict, "solid");
+
+  // A broken course is scored down and the exact dangling anchor is reported.
+  const brokenCourse = {
+    ...course,
+    modules: [{
+      id: "broken",
+      number: "01",
+      title: "Broken",
+      summary: "",
+      lessons: [
+        { id: "gone", title: "Missing", objective: "x", difficulty: "advanced", anchors: [{ path: "engine/deleted.py", line: 3, symbol: "ghost" }], quiz: { question: "?", hint: "" }, content: [] },
+        { id: "back", title: "Backwards", objective: "y", difficulty: "foundation", anchors: [{ path: "engine/planner.py", line: 1, symbol: "not_a_symbol" }], quiz: { question: "A real question about this code?", hint: "" }, content: [] },
+      ],
+    }],
+  };
+  const broken = evaluateLessons(brokenCourse, repository, null);
+  assert.equal(broken.anchorValidity, 0.5);
+  assert.deepEqual(broken.danglingAnchors, [{ lessonId: "gone", path: "engine/deleted.py" }]);
+  assert.equal(broken.symbolAccuracy, 0, "neither symbol anchor names a real symbol");
+  assert.equal(broken.difficultyInversions, 1);
+  assert.equal(broken.quizCoverage, 0.5);
+  assert.ok(broken.score < 0.5);
+  assert.equal(broken.verdict, "weak");
+  assert.equal(broken.skillCoverage, null);
+
+  // --- The report keeps them apart ----------------------------------------
+  const report = runEvaluation({
+    index,
+    repository,
+    course,
+    skillGraph,
+    answers: [
+      { text: "`plan_batch` is defined at engine/planner.py:1.", pack: { sections: [{ source: "engine/planner.py:1" }] } },
+      { text: "It lives at engine/nowhere.py:1.", pack: { sections: [] } },
+    ],
+    options: { retrieval: { sampleSize: 4 }, tutor: { lineCounts } },
+  });
+  assert.equal(report.separate, true);
+  assert.equal("overall" in report, false, "the report must not blend the three scorecards");
+  assert.deepEqual(Object.keys(report).sort(), ["generatedAt", "lessons", "retrieval", "separate", "tutor", "version"]);
+  assert.equal(report.tutor.answers, 2);
+  assert.equal(report.tutor.grounding, 0.5, "one of the two answers cites a real file");
+  assert.deepEqual(report.tutor.verdicts.sort(), ["grounded", "ungrounded"]);
+  assert.equal(report.retrieval.kind, "retrieval");
+  assert.equal(report.lessons.kind, "lessons");
+
+  // Each part is optional and independently omitted.
+  const lessonsOnly = runEvaluation({ index: null, repository, course, skillGraph });
+  assert.equal(lessonsOnly.retrieval, null);
+  assert.equal(lessonsOnly.tutor, null);
+  assert.equal(lessonsOnly.lessons.kind, "lessons");
 });

@@ -1,8 +1,9 @@
 import type { Architecture, ArchitectureModule, DataFlow, CallChain, CallChainStep, ContextPack, LocalizationExercise, RaceStageResult, RaceTask, ContextSection, KnowledgeGraphEdge, KnowledgeGraphNode, KnowledgeGraphSummary, LearnerState, LinkClassification, PredictionExercise, TraceBridge } from "./types";
 import { nanoCourse, nanoLearnerState, nanoRepository, nanoSkillGraph, nanoSourceByPath } from "./nano-demo";
-// The demo runs the *same* retrieval code as the desktop app, so hybrid search
-// behaves identically with and without a main process.
-import { buildSearchIndex, search, type SearchIndex } from "../electron/search.mjs";
+// The demo runs the *same* retrieval and evaluation code as the desktop app, so
+// both behave identically with and without a main process. They are imported
+// dynamically so they stay out of the application entry chunk.
+import type { SearchIndex } from "../electron/search.mjs";
 
 export const demoRepository = nanoRepository;
 export const demoCourse = nanoCourse;
@@ -647,8 +648,21 @@ export const browserBridge: TraceBridge = {
     };
   },
   async search(request) {
-    demoSearchIndex = demoSearchIndex ?? await buildSearchIndex(nanoRepository, { read: (filePath) => nanoSourceByPath[filePath] ?? "" });
-    return { ...search(demoSearchIndex, request.query, { limit: request.limit ?? 10 }), indexStats: demoSearchIndex.stats };
+    const retrieval = await import("../electron/search.mjs");
+    demoSearchIndex = demoSearchIndex ?? await retrieval.buildSearchIndex(nanoRepository, { read: (filePath) => nanoSourceByPath[filePath] ?? "" });
+    return { ...retrieval.search(demoSearchIndex, request.query, { limit: request.limit ?? 10 }), indexStats: demoSearchIndex.stats };
+  },
+  async evaluate(request) {
+    const [retrieval, evaluation] = await Promise.all([import("../electron/search.mjs"), import("../electron/evaluation.mjs")]);
+    demoSearchIndex = demoSearchIndex ?? await retrieval.buildSearchIndex(nanoRepository, { read: (filePath) => nanoSourceByPath[filePath] ?? "" });
+    return evaluation.runEvaluation({
+      index: demoSearchIndex,
+      repository: nanoRepository,
+      course: request.course ?? nanoCourse,
+      skillGraph: request.skillGraph ?? nanoSkillGraph,
+      answers: request.answers ?? [],
+      options: { retrieval: { sampleSize: request.sampleSize ?? 10 } },
+    });
   },
   async askAgent(request) {
     await new Promise((resolve) => setTimeout(resolve, 550));

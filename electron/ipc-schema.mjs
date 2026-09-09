@@ -275,6 +275,13 @@ export const IPC_SCHEMAS = {
     query: s.string({ maxLength: 200, minLength: 1 }),
     limit: s.number({ integer: true, min: 1, max: 20, optional: true }),
   }),
+  "eval:run": s.object({
+    repository: repositoryReference,
+    course: s.opaque({ optional: true }),
+    skillGraph: s.opaque({ optional: true }),
+    answers: s.array(s.opaque(), { maxItems: 20, optional: true }),
+    sampleSize: s.number({ integer: true, min: 1, max: 100, optional: true }),
+  }),
   "agents:ask": s.object({
     provider: s.literal(["codex", "claude"]),
     rootPath: s.string({ maxLength: 4_096 }),

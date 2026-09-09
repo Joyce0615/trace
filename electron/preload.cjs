@@ -33,6 +33,7 @@ contextBridge.exposeInMainWorld("trace", {
   history: (request) => ipcRenderer.invoke("history:summary", request),
   importEvidence: (request) => ipcRenderer.invoke("evidence:import", request),
   search: (request) => ipcRenderer.invoke("search:query", request),
+  evaluate: (request) => ipcRenderer.invoke("eval:run", request),
   askAgent: (request) => ipcRenderer.invoke("agents:ask", request),
   enhanceCourse: (request) => ipcRenderer.invoke("course:enhance", request),
   loadLearning: (request) => ipcRenderer.invoke("learning:load", request),
