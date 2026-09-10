@@ -779,6 +779,58 @@ export interface EvaluationReport {
   generatedAt: string;
 }
 
+export interface MisconceptionFinding {
+  id: string;
+  title: string;
+  summary: string;
+  confidence: number;
+  evidence: string[];
+  remediation: string;
+  activity: string;
+  source: string | null;
+}
+
+export interface CalibratedSkill {
+  skillId: string;
+  title: string;
+  mastery: number;
+  confidence: number;
+  interval: number[];
+  intervalWidth: number;
+  evidenceCount: number;
+  effectiveObservations: number;
+  brier: number | null;
+  calibrationBias: number | null;
+  calibration: "unknown" | "overconfident" | "underconfident" | "calibrated";
+  status: string;
+  misconceptions: MisconceptionFinding[];
+  probe: { id: string; skillId: string; prompt: string; anchor: CodeAnchor | null; options: Array<{ id: string; text: string }>; fanIn: number };
+}
+
+export interface DiagnosisReport {
+  version: number;
+  skills: CalibratedSkill[];
+  summary: {
+    skills: number;
+    assessed: number;
+    meanConfidence: number;
+    meanBrier: number | null;
+    overconfidentSkills: number;
+    underconfidentSkills: number;
+    misconceptionCounts: Record<string, number>;
+  };
+  taxonomy: Array<{ id: string; title: string; summary: string; remediation: string; activity: string }>;
+}
+
+export interface ProbeGrade {
+  probeId: string;
+  skillId: string;
+  correct: boolean;
+  choiceId: string | null;
+  misconception: { id: string; title: string; summary: string; confidence: number; remediation: string; activity: string } | null;
+  anchor: CodeAnchor | null;
+}
+
 export interface AgentState {
   codex: { available: boolean; version: string | null };
   claude: { available: boolean; version: string | null };
@@ -835,6 +887,8 @@ export interface TraceBridge {
   importEvidence(request: { repository: RepositoryRef; commits?: number; skillGraph?: SkillGraph }): Promise<EvidenceImport>;
   search(request: { repository: RepositoryRef; query: string; limit?: number }): Promise<SearchResponse>;
   evaluate(request: { repository: RepositoryRef; course?: Course; skillGraph?: SkillGraph; answers?: unknown[]; sampleSize?: number }): Promise<EvaluationReport>;
+  diagnose(request: { repository: RepositoryRef; skillGraph: SkillGraph; learnerState: LearnerState; text?: string }): Promise<DiagnosisReport>;
+  answerProbe(request: { repository: RepositoryRef; probeId: string; choiceId: string }): Promise<ProbeGrade>;
   askAgent(request: {
     provider: "codex" | "claude";
     rootPath: string;

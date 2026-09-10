@@ -306,6 +306,32 @@ try {
   await evaluation.locator('.scorecard[data-card="tutor"]').getByText("no answers yet").waitFor();
   await page.screenshot({ path: path.join(artifactDirectory, "scorecards.png") });
 
+  // Item 35: calibrated confidence and a probe that names the misconception.
+  const diagnosis = page.locator(".diagnosis-panel");
+  await diagnosis.waitFor();
+  await diagnosis.locator(".diagnosis-input").fill("It runs top to bottom, and nothing else calls it.");
+  await diagnosis.getByRole("button", { name: "Run diagnosis" }).click();
+  await diagnosis.locator(".diagnosis-skill").first().waitFor();
+  // Both misconceptions in the learner's own words are named.
+  await diagnosis.locator('[data-misconception="execution-order"]').first().waitFor();
+  await diagnosis.locator('[data-misconception="single-caller"]').first().waitFor();
+  // A skill with evidence is reported with a narrower interval than one without.
+  const spreads = await diagnosis.locator(".diagnosis-skill").evaluateAll((items) => items.map((item) => ({
+    evidence: item.querySelector(".diagnosis-evidence")?.textContent ?? "",
+    confidence: Number(item.querySelector("[data-confidence]")?.getAttribute("data-confidence") ?? 0),
+  })));
+  const assessed = spreads.filter((entry) => !entry.evidence.startsWith("0 evidence"));
+  const unassessed = spreads.filter((entry) => entry.evidence.startsWith("0 evidence"));
+  assert.ok(assessed.length >= 1 && unassessed.length >= 1, JSON.stringify(spreads));
+  assert.ok(Math.max(...assessed.map((entry) => entry.confidence)) > Math.max(...unassessed.map((entry) => entry.confidence)), JSON.stringify(spreads));
+  // A wrong probe answer names the misconception it encodes, with remediation.
+  const firstSkill = diagnosis.locator(".diagnosis-skill").first();
+  await firstSkill.locator('.probe button[data-option="call-vs-definition"]').click();
+  await firstSkill.locator('.probe-result[data-correct="false"]').waitFor();
+  assert.match(await firstSkill.locator(".probe-result strong").innerText(), /call site/i);
+  assert.match(await firstSkill.locator(".probe-result p").innerText(), /definition anchor/);
+  await page.screenshot({ path: path.join(artifactDirectory, "diagnosis.png") });
+
   await page.getByRole("button", { name: "Ask", exact: true }).click();
   await page.getByText("Ask without losing your place.").waitFor();
   await page.locator(".tutor-input textarea").fill("Where is Scheduler defined?");

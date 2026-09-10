@@ -1,4 +1,4 @@
-import type { Architecture, ArchitectureModule, DataFlow, CallChain, CallChainStep, ContextPack, LocalizationExercise, RaceStageResult, RaceTask, ContextSection, KnowledgeGraphEdge, KnowledgeGraphNode, KnowledgeGraphSummary, LearnerState, LinkClassification, PredictionExercise, TraceBridge } from "./types";
+import type { Architecture, ArchitectureModule, DataFlow, DiagnosisReport, CallChain, CallChainStep, ContextPack, LocalizationExercise, RaceStageResult, RaceTask, ContextSection, KnowledgeGraphEdge, KnowledgeGraphNode, KnowledgeGraphSummary, LearnerState, LinkClassification, PredictionExercise, TraceBridge } from "./types";
 import { nanoCourse, nanoLearnerState, nanoRepository, nanoSkillGraph, nanoSourceByPath } from "./nano-demo";
 // The demo runs the *same* retrieval and evaluation code as the desktop app, so
 // both behave identically with and without a main process. They are imported
@@ -12,6 +12,7 @@ export const demoLearnerState = nanoLearnerState;
 
 let savedLearning: LearnerState = structuredClone(nanoLearnerState);
 let demoSearchIndex: SearchIndex | null = null;
+let demoProbes: Record<string, Parameters<typeof import("../electron/misconception.mjs").gradeProbe>[0]> = {};
 
 const demoGraphNodes: KnowledgeGraphNode[] = [
   { id: `repository:${nanoRepository.id}`, kind: "repository", key: nanoRepository.id, label: nanoRepository.name },
@@ -663,6 +664,22 @@ export const browserBridge: TraceBridge = {
       answers: request.answers ?? [],
       options: { retrieval: { sampleSize: request.sampleSize ?? 10 } },
     });
+  },
+  async diagnose(request) {
+    const model = await import("../electron/misconception.mjs");
+    const diagnosis = model.diagnoseLearner(request.learnerState, request.skillGraph, nanoRepository, {
+      findings: request.text
+        ? Object.fromEntries(request.skillGraph.nodes.map((node) => [node.id, model.detectMisconceptions(request.text!, { source: "answer" })]))
+        : {},
+    });
+    demoProbes = diagnosis.probes;
+    return { ...diagnosis, probes: undefined } as unknown as DiagnosisReport;
+  },
+  async answerProbe(request) {
+    const model = await import("../electron/misconception.mjs");
+    const probe = demoProbes[request.probeId];
+    if (!probe) throw new Error("That probe is not active for this repository.");
+    return model.gradeProbe(probe, request.choiceId);
   },
   async askAgent(request) {
     await new Promise((resolve) => setTimeout(resolve, 550));

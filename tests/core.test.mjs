@@ -19,6 +19,7 @@ import { tutorPrompt } from "../electron/agents.mjs";
 import { SECRET_SCANNER_VERSION, anonymizePath, redact, redactValue, scanText, shannonEntropy, summarizeFindings } from "../electron/secret-scanner.mjs";
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
 import { GIT_HISTORY_VERSION, busFactor, historyLessons, historySummary, parseHistory, readCommits } from "../electron/git-history.mjs";
+import { MISCONCEPTIONS, MISCONCEPTION_VERSION, buildProbe, calibrateSkill, detectMisconceptions, diagnoseLearner, gradeProbe } from "../electron/misconception.mjs";
 import { EVALUATION_VERSION, evaluateLessons, evaluateRetrieval, evaluateTutorAnswer, runEvaluation } from "../electron/evaluation.mjs";
 import { EMBEDDING_DIMENSIONS, SEARCH_VERSION, buildSearchIndex, cosine, editDistance, embed, search, similarityScore, subsequenceScore, tokenize } from "../electron/search.mjs";
 import { EVIDENCE_VERSION, evidenceByPath, evidenceForSkills, importEvidence } from "../electron/evidence-import.mjs";
@@ -742,7 +743,8 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
     "lessons:call-chains", "lessons:grade-prediction",
     "exercise:localization", "exercise:localization-hint", "exercise:localization-score",
     "grade:race-task", "grade:race", "trace:runtimes", "trace:run",
-    "graph:architecture", "graph:symbol-flow", "history:summary", "evidence:import", "search:query", "eval:run", "agents:ask",
+    "graph:architecture", "graph:symbol-flow", "history:summary", "evidence:import", "search:query", "eval:run",
+    "learning:diagnose", "learning:probe", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
   assert.throws(() => schemaFor("repository:evil"), /is not a registered IPC channel/);
@@ -2259,4 +2261,149 @@ test("retrieval, tutor answers, and lessons are evaluated separately", async (co
   assert.equal(lessonsOnly.retrieval, null);
   assert.equal(lessonsOnly.tutor, null);
   assert.equal(lessonsOnly.lessons.kind, "lessons");
+});
+
+test("misconceptions are named and confidence is calibrated per skill", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-diagnose-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "app"), { recursive: true });
+  await writeFile(path.join(rootPath, "app", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "app", "queue.py"), "def enqueue(job):\n    return job\n");
+  await writeFile(path.join(rootPath, "app", "worker.py"), "from app.queue import enqueue\n\n\ndef work(job):\n    return enqueue(job)\n");
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const course = generateStarterCourse(repository);
+  const skillGraph = buildSkillGraph(repository, course);
+
+  assert.equal(MISCONCEPTION_VERSION, 1);
+  assert.ok(MISCONCEPTIONS.length >= 8, String(MISCONCEPTIONS.length));
+  assert.equal(new Set(MISCONCEPTIONS.map((entry) => entry.id)).size, MISCONCEPTIONS.length, "misconception ids are unique");
+  for (const entry of MISCONCEPTIONS) {
+    assert.ok(entry.patterns.length >= 1 && entry.remediation.length > 20, entry.id);
+  }
+
+  // --- Detection in the learner's own words --------------------------------
+  const detected = detectMisconceptions("It runs top to bottom, and it is safe to change because it is used once.");
+  assert.deepEqual(detected.map((finding) => finding.id).sort(), ["execution-order", "single-caller"]);
+  assert.ok(detected.every((finding) => finding.confidence > 0 && finding.confidence <= 0.9));
+  assert.ok(detected[0].evidence.length >= 1);
+  assert.match(detected.find((finding) => finding.id === "execution-order").remediation, /call edge/);
+  // A correct explanation is not flagged.
+  assert.deepEqual(detectMisconceptions("The worker calls enqueue in app/queue.py, which returns the job unchanged after the caller awaits it."), []);
+  assert.deepEqual(detectMisconceptions(""), []);
+  // More matching phrases mean more confidence, but never certainty.
+  const strong = detectMisconceptions("It happens immediately and blocks until done.");
+  assert.equal(strong[0].id, "sync-assumption");
+  assert.ok(strong[0].confidence > detectMisconceptions("It happens immediately.")[0].confidence);
+
+  // --- Probes name the misconception a wrong answer encodes ----------------
+  const skill = skillGraph.nodes[0];
+  const probe = buildProbe(skill, repository);
+  assert.equal(probe.skillId, skill.id);
+  assert.equal(probe.options.length, 4);
+  assert.equal(new Set(probe.options.map((option) => option.id)).size, 4);
+  assert.equal(gradeProbe(probe, "correct").correct, true);
+  assert.equal(gradeProbe(probe, "correct").misconception, null);
+  const wrong = gradeProbe(probe, "call-vs-definition");
+  assert.equal(wrong.correct, false);
+  assert.equal(wrong.misconception.id, "call-vs-definition");
+  assert.match(wrong.misconception.remediation, /definition anchor/);
+  assert.equal(gradeProbe(probe, "not-an-option").misconception, null);
+
+  // --- Calibration ---------------------------------------------------------
+  const single = calibrateSkill({ skillId: "s", status: "active", evidence: [{ kind: "quiz", strength: 0.8, detail: "" }] });
+  const repeated = calibrateSkill({
+    skillId: "s",
+    status: "active",
+    evidence: Array.from({ length: 8 }, () => ({ kind: "quiz", strength: 0.8, detail: "" })),
+  });
+  // The same mean with more evidence must be reported with more confidence, and
+  // the confidence scale must not collapse to zero for realistic evidence counts.
+  assert.ok(Math.abs(repeated.mastery - single.mastery) < 0.2);
+  assert.ok(single.confidence > 0, `a single observation must still register: ${single.confidence}`);
+  assert.ok(repeated.confidence > single.confidence + 0.2, `${single.confidence} -> ${repeated.confidence}`);
+  assert.ok(repeated.confidence < 0.95, "eight observations is not certainty");
+  assert.ok(repeated.intervalWidth < single.intervalWidth);
+  assert.ok(repeated.interval[0] < repeated.mastery && repeated.mastery < repeated.interval[1]);
+  assert.equal(repeated.evidenceCount, 8);
+  assert.ok(repeated.effectiveObservations > single.effectiveObservations);
+  // No evidence means an honest "unknown", not zero mastery with high confidence.
+  const empty = calibrateSkill({ skillId: "s", evidence: [] });
+  assert.equal(empty.mastery, 0.5);
+  assert.equal(empty.evidenceCount, 0);
+  assert.equal(empty.brier, null);
+  assert.equal(empty.calibration, "unknown");
+  assert.ok(empty.confidence < 0.3, String(empty.confidence));
+
+  // An overconfident learner: high self-report, poor outcomes.
+  const overconfident = calibrateSkill({
+    skillId: "s",
+    evidence: [
+      { kind: "self-report", strength: 0.95, detail: "" },
+      { kind: "quiz", strength: 0.2, detail: "" },
+      { kind: "self-report", strength: 0.9, detail: "" },
+      { kind: "practice", strength: 0.3, detail: "" },
+    ],
+  });
+  assert.equal(overconfident.calibration, "overconfident");
+  assert.ok(overconfident.calibrationBias > 0.15, String(overconfident.calibrationBias));
+  assert.ok(overconfident.brier > 0.5, String(overconfident.brier));
+  const calibrated = calibrateSkill({
+    skillId: "s",
+    evidence: [
+      { kind: "self-report", strength: 0.9, detail: "" },
+      { kind: "quiz", strength: 0.9, detail: "" },
+      { kind: "self-report", strength: 0.85, detail: "" },
+      { kind: "practice", strength: 0.9, detail: "" },
+    ],
+  });
+  assert.equal(calibrated.calibration, "calibrated");
+  assert.ok(calibrated.brier < overconfident.brier);
+
+  // --- Whole-learner diagnosis --------------------------------------------
+  const learnerState = {
+    repositoryId: repository.id,
+    diagnosticCompleted: true,
+    mastery: Object.fromEntries(skillGraph.nodes.map((node, index) => [node.id, {
+      skillId: node.id,
+      mastery: 0.5,
+      confidence: 0.5,
+      status: index === 0 ? "active" : "available",
+      evidence: index === 0
+        ? [{ id: "e1", skillId: node.id, kind: "quiz", strength: 0.4, detail: "I think it runs top to bottom.", createdAt: "" }]
+        : [],
+    }])),
+    memory: [{ id: "m1", text: "Nothing else calls it, so the change is safe.", source: "side-chat", createdAt: "" }],
+    updatedAt: "",
+  };
+  const diagnosis = diagnoseLearner(learnerState, skillGraph, repository);
+  assert.equal(diagnosis.version, 1);
+  assert.equal(diagnosis.skills.length, skillGraph.nodes.length);
+  assert.equal(diagnosis.summary.skills, skillGraph.nodes.length);
+  assert.equal(diagnosis.summary.assessed, 1, "only one skill has evidence");
+  // The misconception in the learner's quiz answer is attached to that skill.
+  const first = diagnosis.skills[0];
+  assert.ok(first.misconceptions.some((finding) => finding.id === "execution-order"), JSON.stringify(first.misconceptions));
+  assert.ok(first.misconceptions.some((finding) => finding.id === "single-caller"), "memory notes are diagnosed too");
+  assert.equal(diagnosis.summary.misconceptionCounts["execution-order"], 1);
+  assert.ok(diagnosis.summary.misconceptionCounts["single-caller"] >= 1);
+  // Probes never ship their answer key to the renderer.
+  for (const skillReport of diagnosis.skills) {
+    assert.equal(skillReport.probe.answerId, undefined);
+    assert.equal(skillReport.probe.misconceptionByOption, undefined);
+    assert.ok(skillReport.probe.options.length === 4);
+    assert.ok(skillReport.interval[0] <= skillReport.mastery && skillReport.mastery <= skillReport.interval[1]);
+  }
+  // The graded probes are kept separately, keyed by probe id.
+  assert.equal(Object.keys(diagnosis.probes).length, skillGraph.nodes.length);
+  assert.equal(diagnosis.probes[first.probe.id].answerId, "correct");
+  // Free text supplied at diagnosis time is diagnosed against every skill.
+  const withText = diagnoseLearner(learnerState, skillGraph, repository, {
+    findings: Object.fromEntries(skillGraph.nodes.map((node) => [node.id, detectMisconceptions("It passes a copy, so the caller is unaffected.")])),
+  });
+  assert.ok(withText.skills.every((skillReport) => skillReport.misconceptions.some((finding) => finding.id === "mutation-vs-copy")));
+  assert.equal(withText.taxonomy.length, MISCONCEPTIONS.length);
+  assert.equal(withText.taxonomy.every((entry) => !("patterns" in entry)), true, "detector patterns stay in the main process");
 });

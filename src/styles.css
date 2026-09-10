@@ -685,3 +685,38 @@ button { color: inherit; }
 .scorecard-note { color: #616b7c; font-size: calc(9px + var(--font-boost)); }
 .scorecard-misses { display: flex; flex-wrap: wrap; gap: 5px; }
 .scorecard-misses button { padding: 2px 8px; border: 1px solid #3a3222; border-radius: 6px; background: #16130d; color: #c8ad72; font-family: "SFMono-Regular", Menlo, monospace; font-size: calc(9px + var(--font-boost)); cursor: pointer; }
+
+/* Item 35: calibrated diagnosis and misconception feedback. */
+.diagnosis-panel { padding: 18px 26px 34px; display: flex; flex-direction: column; gap: 10px; border-top: 1px solid #1a2130; }
+.diagnosis-head { display: flex; align-items: center; gap: 10px; }
+.diagnosis-head span { color: #ff9fb2; font-size: calc(9px + var(--font-boost)); letter-spacing: .14em; }
+.diagnosis-head .ghost { margin-left: auto; padding: 5px 12px; border: 1px solid #262d3d; border-radius: 8px; background: none; color: #93a0b1; font-size: calc(10px + var(--font-boost)); cursor: pointer; }
+.diagnosis-input { min-height: 54px; padding: 8px 10px; border: 1px solid #1c2230; border-radius: 8px; background: #0c1017; color: #c9d1dd; font: inherit; font-size: calc(10px + var(--font-boost)); resize: vertical; outline: none; }
+.diagnosis-note { color: #616b7c; font-size: calc(10px + var(--font-boost)); }
+.diagnosis-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
+.diagnosis-summary div { padding: 6px 4px; border: 1px solid #1c2230; border-radius: 7px; background: #0c1017; text-align: center; }
+.diagnosis-summary em { display: block; font-style: normal; font-size: calc(13px + var(--font-boost)); color: #cfd6e2; }
+.diagnosis-summary small { color: #5b6474; font-size: calc(8px + var(--font-boost)); }
+.diagnosis-skills { display: flex; flex-direction: column; gap: 7px; }
+.diagnosis-skill { padding: 9px 11px; border: 1px solid #1e2532; border-radius: 9px; background: #0e121a; display: flex; flex-direction: column; gap: 6px; }
+.diagnosis-skill[data-calibration="overconfident"] { border-color: #4a3a2a; }
+.diagnosis-skill-head { display: flex; align-items: baseline; gap: 8px; }
+.diagnosis-skill-head strong { color: #dbe1ea; font-size: calc(11px + var(--font-boost)); }
+.diagnosis-skill-head small { margin-left: auto; color: #cfd6e2; font-size: calc(11px + var(--font-boost)); }
+.diagnosis-skill-head em { color: #616b7c; font-style: normal; font-size: calc(9px + var(--font-boost)); }
+.confidence-bar { position: relative; height: 8px; border-radius: 4px; background: #141a25; overflow: hidden; }
+.confidence-bar span { position: absolute; top: 0; bottom: 0; background: #2f3a63; }
+.confidence-bar i { position: absolute; top: -2px; width: 2px; height: 12px; background: var(--green); }
+.diagnosis-evidence { color: #5b6474; font-size: calc(9px + var(--font-boost)); }
+.misconception { padding: 7px 9px; border: 1px solid #4a2f2f; border-radius: 7px; background: #1a1113; }
+.misconception strong { display: block; color: #dfa2a2; font-size: calc(10px + var(--font-boost)); }
+.misconception p { color: #a58d8d; font-size: calc(9px + var(--font-boost)); }
+.probe { display: flex; flex-direction: column; gap: 4px; }
+.probe p { color: #9aa5b5; font-size: calc(10px + var(--font-boost)); }
+.probe button { text-align: left; padding: 5px 9px; border: 1px solid #1c2230; border-radius: 7px; background: #0c1017; color: #b6bfcc; font-size: calc(10px + var(--font-boost)); cursor: pointer; }
+.probe button:hover { border-color: #3b3468; }
+.probe-result { padding: 8px 10px; border-radius: 7px; font-size: calc(10px + var(--font-boost)); }
+.probe-result.correct { border: 1px solid #2c3f2c; background: #101710; color: #a6d199; }
+.probe-result.incorrect { border: 1px solid #4a2f2f; background: #1a1113; color: #dfa2a2; }
+.probe-result p { color: #8d97a5; margin: 3px 0; }
+.probe-result button { padding: 2px 8px; border: 1px solid #262d3d; border-radius: 6px; background: none; color: #93a0b1; font-family: "SFMono-Regular", Menlo, monospace; font-size: calc(9px + var(--font-boost)); cursor: pointer; }

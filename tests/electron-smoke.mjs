@@ -542,6 +542,68 @@ try {
   assert.equal(evaluationAudit.lessons.difficultyInversions, 0);
   assert.ok(evaluationAudit.lessons.score >= 0.8, String(evaluationAudit.lessons.score));
 
+  // Item 35: calibrated per-skill confidence and misconception naming.
+  const diagnosisAudit = await page.evaluate(async () => {
+    const workspace = window.traceWorkspace;
+    const repository = { id: workspace.repository.id, rootPath: workspace.repository.rootPath };
+    const skillGraph = workspace.skillGraph;
+    // A learner with one weak quiz answer on the first skill and nothing else.
+    const learnerState = {
+      ...workspace.learnerState,
+      mastery: Object.fromEntries(skillGraph.nodes.map((node, index) => [node.id, {
+        skillId: node.id,
+        mastery: 0.5,
+        confidence: 0.5,
+        status: index === 0 ? "active" : "available",
+        evidence: index === 0
+          ? [
+              { id: "a", skillId: node.id, kind: "self-report", strength: 0.95, detail: "I know this one", createdAt: "" },
+              { id: "b", skillId: node.id, kind: "quiz", strength: 0.2, detail: "It runs top to bottom.", createdAt: "" },
+            ]
+          : [],
+      }])),
+      memory: [],
+    };
+    const report = await window.trace.diagnose({ repository, skillGraph, learnerState, text: "It passes a copy, so the caller is unaffected." });
+    const probeId = report.skills[0].probe.id;
+    const wrong = await window.trace.answerProbe({ repository, probeId, choiceId: "execution-order" });
+    const right = await window.trace.answerProbe({ repository, probeId, choiceId: "correct" });
+    let stale = null;
+    try {
+      await window.trace.answerProbe({ repository, probeId: "probe-nope", choiceId: "correct" });
+    } catch (error) {
+      stale = error.message;
+    }
+    return { report, wrong, right, stale };
+  });
+  const diagnosis = diagnosisAudit.report;
+  assert.equal(diagnosis.version, 1);
+  assert.equal(diagnosis.skills.length, await page.evaluate(() => window.traceWorkspace.skillGraph.nodes.length));
+  assert.equal(diagnosis.summary.assessed, 1, JSON.stringify(diagnosis.summary));
+  // The learner claimed 95% and scored 20%, which must read as overconfident.
+  const assessedSkill = diagnosis.skills.find((skill) => skill.evidenceCount > 0);
+  assert.equal(assessedSkill.calibration, "overconfident", JSON.stringify(assessedSkill));
+  assert.ok(assessedSkill.brier > 0.5, String(assessedSkill.brier));
+  assert.equal(diagnosis.summary.overconfidentSkills, 1);
+  // An assessed skill is known more precisely than an unassessed one.
+  const unassessedSkill = diagnosis.skills.find((skill) => skill.evidenceCount === 0);
+  assert.ok(assessedSkill.confidence > unassessedSkill.confidence, `${unassessedSkill.confidence} vs ${assessedSkill.confidence}`);
+  assert.equal(unassessedSkill.calibration, "unknown");
+  assert.ok(assessedSkill.interval[0] <= assessedSkill.mastery && assessedSkill.mastery <= assessedSkill.interval[1]);
+  // Misconceptions are named from the quiz answer and from the supplied text.
+  assert.ok(assessedSkill.misconceptions.some((finding) => finding.id === "execution-order"), JSON.stringify(assessedSkill.misconceptions));
+  assert.ok(diagnosis.skills.every((skill) => skill.misconceptions.some((finding) => finding.id === "mutation-vs-copy")));
+  // The answer key never crosses the IPC boundary.
+  assert.equal(diagnosis.skills.every((skill) => skill.probe.answerId === undefined && skill.probe.misconceptionByOption === undefined), true);
+  assert.equal(diagnosis.taxonomy.every((entry) => !("patterns" in entry)), true);
+  // A wrong probe answer names the misconception; the right one does not.
+  assert.equal(diagnosisAudit.wrong.correct, false);
+  assert.equal(diagnosisAudit.wrong.misconception.id, "execution-order");
+  assert.ok(diagnosisAudit.wrong.misconception.remediation.length > 20);
+  assert.equal(diagnosisAudit.right.correct, true);
+  assert.equal(diagnosisAudit.right.misconception, null);
+  assert.match(diagnosisAudit.stale ?? "", /not active for this repository/);
+
   // Item 17: real-repository import resolution plus the optional language-server bridge.
   const languageServers = await page.evaluate(() => window.trace.detectLanguageServers());
   assert.ok(Object.keys(languageServers).length >= 6, JSON.stringify(languageServers));
@@ -656,6 +718,7 @@ try {
       tutor: { grounding: evaluationAudit.tutor.grounding, symbolPrecision: evaluationAudit.tutor.symbolPrecision },
       lessons: { score: evaluationAudit.lessons.score, verdict: evaluationAudit.lessons.verdict },
     },
+    diagnosis: { skills: diagnosis.skills.length, assessed: diagnosis.summary.assessed, meanConfidence: diagnosis.summary.meanConfidence, brier: diagnosis.summary.meanBrier, overconfident: diagnosis.summary.overconfidentSkills, misconceptions: diagnosis.summary.misconceptionCounts },
     executionTrace: { runtime: traceAudit.runtimes.python.version, calls: traceAudit.ran.summary.callCount, transitions: traceAudit.ran.summary.transitions.length, confirmed: traceAudit.ran.summary.confirmedStaticEdges, dynamicOnly: traceAudit.ran.summary.dynamicOnlyEdges },
   }, null, 2));
 } finally {

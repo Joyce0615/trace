@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { Icon, bridge, readableError, repositoryRef } from "./shell";
-import type { Course, Lesson, PredictionExercise, Repository, SkillGraph } from "./types";
-import type { ArchitectureState, ChainState, EvaluationState, EvidenceState, HistoryState, LocalizationState, ReviewState, TraceState } from "./exercise-state";
+import type { Course, LearnerState, Lesson, PredictionExercise, Repository, SkillGraph } from "./types";
+import type { ArchitectureState, ChainState, DiagnosisState, EvaluationState, EvidenceState, HistoryState, LocalizationState, ReviewState, TraceState } from "./exercise-state";
 
 /**
- * Exercise, visualization, and quality panels (items 26-34).
+ * Exercise, visualization, quality, and diagnosis panels (items 26-35).
  *
  * These are loaded lazily: a learner who never opens Chains, Locate, or Review
  * never downloads them, which keeps the application entry chunk inside the
@@ -492,6 +492,94 @@ export function EvaluationPanel({ repository, course, skillGraph, state, onState
         </> : <p className="evaluation-note">Ask the tutor a question, then re-run to grade its grounding.</p>}
       </div>
     </div>}
+  </section>;
+}
+
+/**
+ * Calibrated diagnosis (item 35): what the learner knows, how sure we are that
+ * we know it, and which specific misconception a wrong answer revealed.
+ */
+export function DiagnosisPanel({ repository, skillGraph, learnerState, state, onState, onAnchor }: {
+  repository: Repository;
+  skillGraph: SkillGraph | null;
+  learnerState: LearnerState | null;
+  state: DiagnosisState;
+  onState: (update: Partial<DiagnosisState>) => void;
+  onAnchor: (path: string, line: number) => void;
+}) {
+  const { report, grades, status, text } = state;
+  const run = async () => {
+    if (!skillGraph || !learnerState) return;
+    onState({ status: "loading" });
+    try {
+      onState({
+        report: await bridge.diagnose({
+          repository: repositoryRef(repository),
+          skillGraph,
+          learnerState,
+          text: text.trim() ? text.trim() : undefined,
+        }),
+        status: "ready",
+      });
+    } catch {
+      onState({ status: "error" });
+    }
+  };
+  const answerProbe = async (probeId: string, choiceId: string) => {
+    const grade = await bridge.answerProbe({ repository: repositoryRef(repository), probeId, choiceId });
+    onState({ grades: { ...grades, [probeId]: grade } });
+  };
+
+  return <section className="diagnosis-panel" data-status={status}>
+    <div className="diagnosis-head">
+      <span>CALIBRATED DIAGNOSIS</span>
+      <button className="ghost" disabled={status === "loading" || !skillGraph} onClick={() => void run()}>{status === "loading" ? "Diagnosing…" : report ? "Re-diagnose" : "Run diagnosis"}</button>
+    </div>
+    <textarea
+      className="diagnosis-input"
+      value={text}
+      onChange={(event) => onState({ text: event.target.value })}
+      placeholder="Optional: paste your own explanation of the code and Trace will name the misconceptions it contains…"
+    />
+    {status === "error" && <p className="diagnosis-note">Diagnosis is unavailable for this repository.</p>}
+    {report && <>
+      <div className="diagnosis-summary" data-assessed={report.summary.assessed}>
+        <div><em data-summary="confidence">{Math.round(report.summary.meanConfidence * 100)}%</em><small>mean confidence</small></div>
+        <div><em data-summary="assessed">{report.summary.assessed}/{report.summary.skills}</em><small>skills with evidence</small></div>
+        <div><em data-summary="brier">{report.summary.meanBrier === null ? "—" : report.summary.meanBrier.toFixed(2)}</em><small>Brier score</small></div>
+        <div><em data-summary="overconfident">{report.summary.overconfidentSkills}</em><small>overconfident</small></div>
+      </div>
+      <div className="diagnosis-skills">
+        {report.skills.slice(0, 6).map((skill) => {
+          const grade = grades[skill.probe.id];
+          return <div className="diagnosis-skill" key={skill.skillId} data-skill={skill.skillId} data-calibration={skill.calibration}>
+            <div className="diagnosis-skill-head">
+              <strong>{skill.title}</strong>
+              <small data-mastery={skill.mastery}>{Math.round(skill.mastery * 100)}%</small>
+              <em data-confidence={skill.confidence}>±{Math.round((skill.interval[1] - skill.mastery) * 100)}</em>
+            </div>
+            <div className="confidence-bar" title={`95% interval ${Math.round(skill.interval[0] * 100)}–${Math.round(skill.interval[1] * 100)}%`}>
+              <span style={{ left: `${skill.interval[0] * 100}%`, width: `${Math.max(2, (skill.interval[1] - skill.interval[0]) * 100)}%` }} />
+              <i style={{ left: `${skill.mastery * 100}%` }} />
+            </div>
+            <small className="diagnosis-evidence">{skill.evidenceCount} evidence · {skill.calibration}</small>
+            {skill.misconceptions.map((finding) => <div className="misconception" key={finding.id} data-misconception={finding.id}>
+              <strong>{finding.title}</strong>
+              <p>{finding.remediation}</p>
+            </div>)}
+            {!grade && <div className="probe" data-probe={skill.probe.id}>
+              <p>{skill.probe.prompt}</p>
+              {skill.probe.options.map((option) => <button key={option.id} data-option={option.id} onClick={() => void answerProbe(skill.probe.id, option.id)}>{option.text}</button>)}
+            </div>}
+            {grade && <div className={`probe-result ${grade.correct ? "correct" : "incorrect"}`} data-correct={String(grade.correct)}>
+              <strong>{grade.correct ? "That is the reliable move." : grade.misconception?.title ?? "Not quite."}</strong>
+              {grade.misconception && <p>{grade.misconception.remediation}</p>}
+              {grade.anchor && <button onClick={() => onAnchor(grade.anchor!.path, grade.anchor!.line)}>{grade.anchor.path.split("/").at(-1)}:{grade.anchor.line}</button>}
+            </div>}
+          </div>;
+        })}
+      </div>
+    </>}
   </section>;
 }
 

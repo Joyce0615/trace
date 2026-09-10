@@ -22,6 +22,7 @@ import { historyLessons, historySummary, readCommits } from "./git-history.mjs";
 import { evidenceForSkills, importEvidence } from "./evidence-import.mjs";
 import { buildSearchIndex, search } from "./search.mjs";
 import { runEvaluation } from "./evaluation.mjs";
+import { detectMisconceptions, diagnoseLearner, gradeProbe } from "./misconception.mjs";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const openedRepositories = new Map();
@@ -31,6 +32,7 @@ const callChainSets = new Map();
 const localizationExercises = new Map();
 const raceTasks = new Map();
 const searchIndexes = new Map();
+const learnerProbes = new Map();
 
 function openedRepository(candidate) {
   const repository = candidate?.id ? openedRepositories.get(candidate.id) : null;
@@ -397,6 +399,26 @@ const ipcHandlers = {
       answers: request.answers ?? [],
       options: { retrieval: { sampleSize: request.sampleSize ?? 20 } },
     });
+  },
+
+  "learning:diagnose": (_event, request) => {
+    const repository = openedRepository(request.repository);
+    if (!Array.isArray(request.skillGraph?.nodes)) throw new Error("Invalid diagnosis request.");
+    const diagnosis = diagnoseLearner(request.learnerState ?? {}, request.skillGraph, repository, {
+      // Free text the learner just wrote is diagnosed against every skill.
+      findings: request.text
+        ? Object.fromEntries(request.skillGraph.nodes.map((node) => [node.id, detectMisconceptions(request.text, { source: "answer" })]))
+        : {},
+    });
+    learnerProbes.set(repository.id, diagnosis.probes);
+    return { ...diagnosis, probes: undefined };
+  },
+
+  "learning:probe": (_event, request) => {
+    const repository = openedRepository(request.repository);
+    const probe = learnerProbes.get(repository.id)?.[request.probeId];
+    if (!probe) throw new Error("That probe is not active for this repository.");
+    return gradeProbe(probe, request.choiceId);
   },
 
   "agents:ask": async (_event, request) => {

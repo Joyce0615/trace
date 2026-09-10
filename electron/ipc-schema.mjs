@@ -282,6 +282,17 @@ export const IPC_SCHEMAS = {
     answers: s.array(s.opaque(), { maxItems: 20, optional: true }),
     sampleSize: s.number({ integer: true, min: 1, max: 100, optional: true }),
   }),
+  "learning:diagnose": s.object({
+    repository: repositoryReference,
+    skillGraph: s.opaque(),
+    learnerState: s.opaque(),
+    text: s.string({ maxLength: 8_000, optional: true }),
+  }),
+  "learning:probe": s.object({
+    repository: repositoryReference,
+    probeId: s.string({ maxLength: 128 }),
+    choiceId: s.string({ maxLength: 64 }),
+  }),
   "agents:ask": s.object({
     provider: s.literal(["codex", "claude"]),
     rootPath: s.string({ maxLength: 4_096 }),
