@@ -293,6 +293,21 @@ export const IPC_SCHEMAS = {
     probeId: s.string({ maxLength: 128 }),
     choiceId: s.string({ maxLength: 64 }),
   }),
+  "learning:schedule": s.object({
+    repository: repositoryReference,
+    skillGraph: s.opaque(),
+    learnerState: s.opaque(),
+    now: s.string({ maxLength: 40, optional: true }),
+    dailyLimit: s.number({ integer: true, min: 1, max: 50, optional: true }),
+  }),
+  "learning:review": s.object({
+    repository: repositoryReference,
+    skillGraph: s.opaque(),
+    learnerState: s.opaque(),
+    skillId: s.string({ maxLength: 200 }),
+    grade: s.literal(["again", "hard", "good", "easy"]),
+    now: s.string({ maxLength: 40, optional: true }),
+  }),
   "agents:ask": s.object({
     provider: s.literal(["codex", "claude"]),
     rootPath: s.string({ maxLength: 4_096 }),

@@ -604,6 +604,118 @@ try {
   assert.equal(diagnosisAudit.right.misconception, null);
   assert.match(diagnosisAudit.stale ?? "", /not active for this repository/);
 
+  // Item 36: spaced repetition, forgetting curves, and mastery decay against
+  // the real skill graph, with the schedule persisted by the main process.
+  const scheduleAudit = await page.evaluate(async () => {
+    const workspace = window.traceWorkspace;
+    const repository = { id: workspace.repository.id, rootPath: workspace.repository.rootPath };
+    const skillGraph = workspace.skillGraph;
+    const day = 86_400_000;
+    const now = new Date().toISOString();
+    const iso = (offsetDays) => new Date(Date.now() - offsetDays * day).toISOString();
+    const nodes = skillGraph.nodes;
+    const learnerState = {
+      ...workspace.learnerState,
+      mastery: Object.fromEntries(nodes.map((node, index) => {
+        const base = { skillId: node.id, mastery: 0, confidence: 0, status: "available", evidence: [], sourceFingerprint: node.sourceFingerprint };
+        // Reviewed a month ago on a four-day interval: badly overdue.
+        if (index === 0) return [node.id, { ...base, mastery: 0.9, status: "mastered", review: { stability: 4, difficulty: 2.2, reviews: 2, lapses: 0, lastReviewedAt: iso(30), lastGrade: "good" } }];
+        // Reviewed yesterday on a ninety-day interval: comfortably retained.
+        if (index === 1) return [node.id, { ...base, mastery: 0.85, status: "mastered", review: { stability: 90, difficulty: 2, reviews: 4, lapses: 0, lastReviewedAt: iso(1), lastGrade: "easy" } }];
+        // Studied against source that has since changed.
+        if (index === 2) return [node.id, { ...base, mastery: 0.95, status: "mastered", sourceFingerprint: "a-fingerprint-from-an-older-index", review: { stability: 45, difficulty: 2, reviews: 3, lapses: 0, lastReviewedAt: iso(2), lastGrade: "good" } }];
+        return [node.id, base];
+      })),
+      memory: [],
+    };
+    const plan = await window.trace.reviewPlan({ repository, skillGraph, learnerState, now });
+    const bounded = await window.trace.reviewPlan({ repository, skillGraph, learnerState, now, dailyLimit: 2 });
+    const target = plan.queue[0].skillId;
+    const recorded = await window.trace.recordReview({ repository, skillGraph, learnerState, skillId: target, grade: "good", now });
+    // The main process persists the schedule, so reloading must return it.
+    const reloaded = await window.trace.loadLearning({ repository, skillGraph });
+    // Reviewing the skill whose source changed is what re-establishes the claim.
+    const revived = await window.trace.recordReview({ repository, skillGraph, learnerState, skillId: nodes[2].id, grade: "good", now });
+    let rejected = null;
+    try {
+      await window.trace.recordReview({ repository, skillGraph, learnerState, skillId: "skill-does-not-exist", grade: "good", now });
+    } catch (error) {
+      rejected = error.message;
+    }
+    let badGrade = null;
+    try {
+      await window.trace.recordReview({ repository, skillGraph, learnerState, skillId: target, grade: "brilliant", now });
+    } catch (error) {
+      badGrade = error.message;
+    }
+    return { plan, bounded, target, recorded, reloaded, revived, rejected, badGrade, skillCount: nodes.length, staleSkillId: nodes[2].id, retainedSkillId: nodes[1].id, staleFingerprint: nodes[2].sourceFingerprint };
+  });
+  const schedulePlan = scheduleAudit.plan;
+  assert.equal(schedulePlan.version, 1);
+  assert.equal(schedulePlan.summary.skills, scheduleAudit.skillCount);
+  // The skill whose source moved on is queued with its retention withheld, and
+  // it outranks every never-reviewed skill (only its own prerequisites may
+  // legitimately come first).
+  const staleEntry = schedulePlan.queue.find((entry) => entry.skillId === scheduleAudit.staleSkillId);
+  const queueSummary = JSON.stringify(schedulePlan.queue.map((entry) => `${entry.skillId}:${entry.state}`));
+  assert.ok(staleEntry, queueSummary);
+  assert.equal(staleEntry.state, "stale");
+  assert.equal(staleEntry.retention, null, "retention of changed source must not be reported");
+  assert.equal(staleEntry.reason, "source-changed");
+  assert.equal(schedulePlan.summary.stale, 1);
+  const staleIndex = schedulePlan.queue.indexOf(staleEntry);
+  const firstNewIndex = schedulePlan.queue.findIndex((entry) => entry.state === "new");
+  assert.ok(firstNewIndex === -1 || staleIndex < firstNewIndex, queueSummary);
+  assert.ok(schedulePlan.queue.slice(0, staleIndex).every((entry) => entry.state !== "new"), queueSummary);
+  // The 90-day skill reviewed yesterday is upcoming work, not due work.
+  assert.equal(schedulePlan.queue.some((entry) => entry.skillId === scheduleAudit.retainedSkillId), false);
+  assert.ok(schedulePlan.upcoming.some((entry) => entry.skillId === scheduleAudit.retainedSkillId), JSON.stringify(schedulePlan.upcoming.map((entry) => entry.skillId)));
+  // Decay is visible: recorded mastery is strictly higher than what is retained.
+  assert.ok(schedulePlan.summary.recordedMastery > schedulePlan.summary.retainedMastery, JSON.stringify(schedulePlan.summary));
+  assert.ok(schedulePlan.summary.decayLoss > 0, String(schedulePlan.summary.decayLoss));
+  // Every queued skill is real, and every retention estimate is a probability.
+  const skillIds = await page.evaluate(() => window.traceWorkspace.skillGraph.nodes.map((node) => node.id));
+  assert.ok(schedulePlan.queue.every((entry) => skillIds.includes(entry.skillId)));
+  assert.ok(schedulePlan.skills.every((entry) => entry.retention === null || (entry.retention >= 0 && entry.retention <= 1)));
+  assert.ok(schedulePlan.skills.every((entry) => entry.retainedMastery <= entry.recordedMastery));
+  // Prerequisites are never scheduled after the skills built on them.
+  const queuePositions = new Map(schedulePlan.queue.map((entry, index) => [entry.skillId, index]));
+  const prerequisitesById = await page.evaluate(() => Object.fromEntries(window.traceWorkspace.skillGraph.nodes.map((node) => [node.id, node.prerequisites ?? []])));
+  for (const [skillId, position] of queuePositions) {
+    for (const prerequisite of prerequisitesById[skillId] ?? []) {
+      if (queuePositions.has(prerequisite)) {
+        assert.ok(queuePositions.get(prerequisite) < position, `${prerequisite} must precede ${skillId}`);
+      }
+    }
+  }
+  // The daily limit bounds the backlog without reordering it.
+  assert.equal(scheduleAudit.bounded.queue.length, Math.min(2, schedulePlan.queue.length));
+  assert.deepEqual(scheduleAudit.bounded.queue.map((entry) => entry.skillId), schedulePlan.queue.slice(0, 2).map((entry) => entry.skillId));
+  // Recording a review advances the curve and persists it.
+  const recordedReview = scheduleAudit.recorded;
+  assert.equal(recordedReview.review.grade, "good");
+  assert.ok(recordedReview.review.intervalDays > 0);
+  assert.equal(recordedReview.learnerState.mastery[scheduleAudit.target].review.reviews >= 1, true);
+  assert.equal(recordedReview.learnerState.mastery[scheduleAudit.target].review.lastGrade, "good");
+  assert.equal(recordedReview.learnerState.mastery[scheduleAudit.target].evidence.at(-1).kind, "review");
+  assert.equal(recordedReview.plan.queue.some((entry) => entry.skillId === scheduleAudit.target), false, "a reviewed skill leaves the queue");
+  assert.ok(recordedReview.plan.curves[scheduleAudit.target], "the earned curve is returned with the plan");
+  // Reviewing the stale skill re-establishes it against the current index; the
+  // 45-day interval it carried from the old source does not survive.
+  const revivedReview = scheduleAudit.revived;
+  assert.equal(revivedReview.learnerState.mastery[scheduleAudit.staleSkillId].sourceFingerprint, scheduleAudit.staleFingerprint);
+  assert.equal(revivedReview.learnerState.mastery[scheduleAudit.staleSkillId].status, "active");
+  assert.equal(revivedReview.learnerState.mastery[scheduleAudit.staleSkillId].review.reviews, 1, "a changed source restarts the curve");
+  assert.ok(revivedReview.review.intervalDays < 45, String(revivedReview.review.intervalDays));
+  assert.equal(revivedReview.plan.summary.stale, 0);
+  // The main process, not the renderer, is the authority on the saved schedule.
+  assert.deepEqual(
+    scheduleAudit.reloaded.mastery[scheduleAudit.target].review,
+    recordedReview.learnerState.mastery[scheduleAudit.target].review,
+  );
+  assert.match(scheduleAudit.rejected ?? "", /not part of this repository/);
+  assert.match(scheduleAudit.badGrade ?? "", /must be one of again, hard, good, easy/);
+
   // Item 17: real-repository import resolution plus the optional language-server bridge.
   const languageServers = await page.evaluate(() => window.trace.detectLanguageServers());
   assert.ok(Object.keys(languageServers).length >= 6, JSON.stringify(languageServers));
@@ -719,6 +831,7 @@ try {
       lessons: { score: evaluationAudit.lessons.score, verdict: evaluationAudit.lessons.verdict },
     },
     diagnosis: { skills: diagnosis.skills.length, assessed: diagnosis.summary.assessed, meanConfidence: diagnosis.summary.meanConfidence, brier: diagnosis.summary.meanBrier, overconfident: diagnosis.summary.overconfidentSkills, misconceptions: diagnosis.summary.misconceptionCounts },
+    schedule: { skills: schedulePlan.summary.skills, due: schedulePlan.summary.due, stale: schedulePlan.summary.stale, meanRetention: schedulePlan.summary.meanRetention, recordedMastery: schedulePlan.summary.recordedMastery, retainedMastery: schedulePlan.summary.retainedMastery, grantedIntervalDays: scheduleAudit.recorded.review.intervalDays },
     executionTrace: { runtime: traceAudit.runtimes.python.version, calls: traceAudit.ran.summary.callCount, transitions: traceAudit.ran.summary.transitions.length, confirmed: traceAudit.ran.summary.confirmedStaticEdges, dynamicOnly: traceAudit.ran.summary.dynamicOnlyEdges },
   }, null, 2));
 } finally {

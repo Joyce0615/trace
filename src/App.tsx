@@ -1,7 +1,7 @@
 import type { OnMount } from "@monaco-editor/react";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { demoCourse, demoLearnerState, demoRepository, demoSkillGraph } from "./demo";
-import { emptyArchitectureState, emptyChainState, emptyDiagnosisState, emptyEvaluationState, emptyEvidenceState, emptyHistoryState, emptyLocalizationState, emptyReviewState, emptyTraceState, type ArchitectureState, type ChainState, type DiagnosisState, type EvaluationState, type EvidenceState, type HistoryState, type LocalizationState, type ReviewState, type TraceState } from "./exercise-state";
+import { emptyArchitectureState, emptyChainState, emptyDiagnosisState, emptyEvaluationState, emptyEvidenceState, emptyHistoryState, emptyLocalizationState, emptyReviewState, emptyScheduleState, emptyTraceState, type ArchitectureState, type ChainState, type DiagnosisState, type EvaluationState, type EvidenceState, type HistoryState, type LocalizationState, type ReviewState, type ScheduleState, type TraceState } from "./exercise-state";
 import { Icon, bridge, readableError, repositoryRef } from "./shell";
 import { addEvidence, completeDiagnostic, personalizeSkillGraph, skillForLesson } from "./learning";
 import type { AgentState, ContextMode, ContextPack, SearchResponse, ContextScope, Course, IndexProgress, KnowledgeGraphSummary, LearnerProfile, LinkClassification, LearnerState, LearningMemory, Lesson, LessonContentBlock, PracticeReport, PracticeSession, Repository, RepoFile, SkillGraph, SkillNode, SymbolResolution } from "./types";
@@ -24,6 +24,7 @@ const LazyHistoryPanel = lazy(async () => ({ default: (await import("./exercises
 const LazyEvidencePanel = lazy(async () => ({ default: (await import("./exercises")).EvidencePanel }));
 const LazyEvaluationPanel = lazy(async () => ({ default: (await import("./exercises")).EvaluationPanel }));
 const LazyDiagnosisPanel = lazy(async () => ({ default: (await import("./exercises")).DiagnosisPanel }));
+const LazySchedulePanel = lazy(async () => ({ default: (await import("./exercises")).SchedulePanel }));
 
 function Logo() {
   return <div className="logo-mark" aria-label="Trace"><span /><span /><span /></div>;
@@ -411,7 +412,7 @@ function LessonCanvas({ lesson, diagramOnly, onAnchor }: { lesson: Lesson; diagr
   </div>;
 }
 
-function CodeWorkspace({ repository, lesson, currentFile, content, line, workspaceMode, fontBoost, trail, chainState, onChainState, localizationState, onLocalizationState, reviewState, onReviewState, traceState, onTraceState, architectureState, onArchitectureState, historyState, onHistoryState, onHistoryLesson, evidenceState, onEvidenceState, skillGraph, course, evaluationState, onEvaluationState, learnerState, diagnosisState, onDiagnosisState, onOpen, onSelection, onWorkspaceMode, resolution, resolutionBusy, onResolve }: {
+function CodeWorkspace({ repository, lesson, currentFile, content, line, workspaceMode, fontBoost, trail, chainState, onChainState, localizationState, onLocalizationState, reviewState, onReviewState, traceState, onTraceState, architectureState, onArchitectureState, historyState, onHistoryState, onHistoryLesson, evidenceState, onEvidenceState, skillGraph, course, evaluationState, onEvaluationState, learnerState, onLearnerState, diagnosisState, onDiagnosisState, scheduleState, onScheduleState, onOpen, onSelection, onWorkspaceMode, resolution, resolutionBusy, onResolve }: {
   repository: Repository;
   lesson: Lesson;
   currentFile: RepoFile | null;
@@ -440,8 +441,11 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
   evaluationState: EvaluationState;
   onEvaluationState: (update: Partial<EvaluationState>) => void;
   learnerState: LearnerState | null;
+  onLearnerState: (next: LearnerState) => void;
   diagnosisState: DiagnosisState;
   onDiagnosisState: (update: Partial<DiagnosisState>) => void;
+  scheduleState: ScheduleState;
+  onScheduleState: (update: Partial<ScheduleState>) => void;
   onOpen: (file: RepoFile, line?: number) => void;
   onSelection: (selection: CodeSelection | null) => void;
   onWorkspaceMode: (mode: WorkspaceMode) => void;
@@ -593,6 +597,15 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
             learnerState={learnerState}
             state={diagnosisState}
             onState={onDiagnosisState}
+            onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }}
+          /></Suspense>
+          <Suspense fallback={<div className="panel-loading">Loading schedule…</div>}><LazySchedulePanel
+            repository={repository}
+            skillGraph={skillGraph}
+            learnerState={learnerState}
+            state={scheduleState}
+            onState={onScheduleState}
+            onLearnerState={onLearnerState}
             onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }}
           /></Suspense>
         </div>}
@@ -865,6 +878,7 @@ export default function App() {
   const [evidenceState, setEvidenceState] = useState<EvidenceState>(emptyEvidenceState);
   const [evaluationState, setEvaluationState] = useState<EvaluationState>(emptyEvaluationState);
   const [diagnosisState, setDiagnosisState] = useState<DiagnosisState>(emptyDiagnosisState);
+  const [scheduleState, setScheduleState] = useState<ScheduleState>(emptyScheduleState);
   const [resolution, setResolution] = useState<SymbolResolution | null>(null);
   const [resolutionBusy, setResolutionBusy] = useState(false);
 
@@ -902,6 +916,7 @@ export default function App() {
   const updateEvidenceState = useCallback((update: Partial<EvidenceState>) => setEvidenceState((previous) => ({ ...previous, ...update })), []);
   const updateEvaluationState = useCallback((update: Partial<EvaluationState>) => setEvaluationState((previous) => ({ ...previous, ...update })), []);
   const updateDiagnosisState = useCallback((update: Partial<DiagnosisState>) => setDiagnosisState((previous) => ({ ...previous, ...update })), []);
+  const updateScheduleState = useCallback((update: Partial<ScheduleState>) => setScheduleState((previous) => ({ ...previous, ...update })), []);
 
   const loadSource = useCallback(async (repo: Repository, file: RepoFile, targetLine = 1) => {
     // The navigation trail is what the localization drill scores for efficiency.
@@ -931,6 +946,7 @@ export default function App() {
     setEvidenceState(emptyEvidenceState);
     setEvaluationState(emptyEvaluationState);
     setDiagnosisState(emptyDiagnosisState);
+    setScheduleState(emptyScheduleState);
     setInspectionTrail([]);
     setCourse(nextCourse);
     setSkillGraph(nextGraph);
@@ -1163,7 +1179,7 @@ export default function App() {
       </header>
       <div className="workspace-grid">
         <CourseSidebar course={course} skillGraph={skillGraph} knowledgeGraph={knowledgeGraph} learnerState={learnerState} activeSkill={activeSkill} selectedLesson={selectedLesson} completed={completed} onSelect={selectLesson} onSelectSkill={selectSkill} onFamiliar={(node) => setLearnerState(addEvidence(learnerState, skillGraph, node.id, { kind: "self-report", strength: 0.62, detail: `Marked familiar: ${node.title}` }))} onChallenge={(node) => { const lesson = flattenLessons(course).find((item) => item.id === node.lessonId); if (lesson) void selectLesson(lesson).then(() => setMode("quiz")); }} onToggleComplete={toggleComplete} onEnhance={enhanceCourse} enhancing={courseBusy} enhanceElapsed={courseElapsed} provider={provider} canEnhance={agents[provider].available} />
-        <CodeWorkspace repository={repository} lesson={selectedLesson} currentFile={currentFile} content={content} line={line} workspaceMode={workspaceMode} fontBoost={fontBoosts[fontScale]} trail={inspectionTrail} chainState={chainState} onChainState={updateChainState} localizationState={localizationState} onLocalizationState={updateLocalizationState} reviewState={reviewState} onReviewState={updateReviewState} traceState={traceState} onTraceState={updateTraceState} architectureState={architectureState} onArchitectureState={updateArchitectureState} historyState={historyState} onHistoryState={updateHistoryState} onHistoryLesson={selectLesson} evidenceState={evidenceState} onEvidenceState={updateEvidenceState} skillGraph={skillGraph} course={course} evaluationState={evaluationState} onEvaluationState={updateEvaluationState} learnerState={learnerState} diagnosisState={diagnosisState} onDiagnosisState={updateDiagnosisState} onOpen={openFile} onSelection={setSelection} onWorkspaceMode={changeWorkspaceMode} resolution={resolution} resolutionBusy={resolutionBusy} onResolve={resolveAtCursor} />
+        <CodeWorkspace repository={repository} lesson={selectedLesson} currentFile={currentFile} content={content} line={line} workspaceMode={workspaceMode} fontBoost={fontBoosts[fontScale]} trail={inspectionTrail} chainState={chainState} onChainState={updateChainState} localizationState={localizationState} onLocalizationState={updateLocalizationState} reviewState={reviewState} onReviewState={updateReviewState} traceState={traceState} onTraceState={updateTraceState} architectureState={architectureState} onArchitectureState={updateArchitectureState} historyState={historyState} onHistoryState={updateHistoryState} onHistoryLesson={selectLesson} evidenceState={evidenceState} onEvidenceState={updateEvidenceState} skillGraph={skillGraph} course={course} evaluationState={evaluationState} onEvaluationState={updateEvaluationState} learnerState={learnerState} onLearnerState={setLearnerState} diagnosisState={diagnosisState} onDiagnosisState={updateDiagnosisState} scheduleState={scheduleState} onScheduleState={updateScheduleState} onOpen={openFile} onSelection={setSelection} onWorkspaceMode={changeWorkspaceMode} resolution={resolution} resolutionBusy={resolutionBusy} onResolve={resolveAtCursor} />
         <TutorPanel repository={repository} lesson={selectedLesson} skill={activeSkill} nextSkill={nextSkill} learnerState={learnerState} provider={provider} agents={agents} mode={mode} messages={messages} askMessages={askMessages} busy={agentBusy} currentFile={currentFile} selection={selection} guideStage={guideStage} onGuideStage={updateGuideStage} onWorkspaceMode={changeWorkspaceMode} onNextSkill={selectSkill} onProvider={setProvider} onMode={setMode} onAsk={ask} onSaveMemory={saveMemory} onQuizEvidence={() => updateEvidence("quiz", 0.55, `Submitted quiz answer for ${selectedLesson.title}`)} onDone={() => toggleComplete(selectedLesson)} complete={completed.has(selectedLesson.id)} practiceSession={practiceSession} practiceReport={practiceReport} practiceBusy={practiceBusy} onCreatePractice={createPractice} onInspectPractice={inspectPractice} onOpenPractice={() => { if (practiceSession) void bridge.openPractice(practiceSession.id); }} onRemovePractice={removePractice} />
       </div>
       {diagnosticOpen && <DiagnosticOverlay graph={skillGraph} onComplete={finishDiagnostic} onSkip={() => finishDiagnostic()} />}

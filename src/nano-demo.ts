@@ -279,7 +279,36 @@ export const nanoSkillGraph: SkillGraph = {
   ],
 };
 
-export const nanoLearnerState: LearnerState = createClientLearnerState(nanoRepository.id, nanoRepository.versionId, nanoSkillGraph);
+function daysAgo(days: number) {
+  return new Date(Date.now() - days * 86_400_000).toISOString();
+}
+
+/**
+ * The featured demo starts with a short review history so the spaced-repetition
+ * view (item 36) has a real curve to show: one skill studied three weeks ago
+ * whose recall has decayed well past the target, and one studied yesterday that
+ * is still comfortably retained. Neither is the entry skill, because prior
+ * mastery legitimately lowers a skill's recommendation score and the demo's
+ * starting lesson should stay the repository map.
+ */
+function seedReviewHistory(state: LearnerState): LearnerState {
+  const seeds: Array<[string, { stability: number; difficulty: number; reviews: number; lapses: number; lastReviewedAt: string; lastGrade: "again" | "hard" | "good" | "easy" }, number]> = [
+    ["skill-prefix-cache", { stability: 4, difficulty: 2.2, reviews: 2, lapses: 0, lastReviewedAt: daysAgo(21), lastGrade: "good" }, 0.7],
+    ["skill-sequence-state", { stability: 30, difficulty: 2, reviews: 3, lapses: 0, lastReviewedAt: daysAgo(1), lastGrade: "easy" }, 0.72],
+  ];
+  const mastery = { ...state.mastery };
+  for (const [skillId, review, recorded] of seeds) {
+    if (!mastery[skillId]) continue;
+    // The seeded status is left alone: the recommendation the learner sees on
+    // first open is decided by the skill graph, not by this fixture.
+    mastery[skillId] = { ...mastery[skillId], mastery: recorded, review };
+  }
+  return { ...state, mastery };
+}
+
+export const nanoLearnerState: LearnerState = seedReviewHistory(
+  createClientLearnerState(nanoRepository.id, nanoRepository.versionId, nanoSkillGraph),
+);
 
 export const nanoSourceByPath: Record<string, string> = {
   "README.md": `# Nano-vLLM\n\nA lightweight vLLM implementation built from scratch.\n\n- Fast offline inference\n- Readable codebase in about 1,200 lines of Python\n- Prefix caching, Tensor Parallelism, Torch compilation, and CUDA graph\n`,

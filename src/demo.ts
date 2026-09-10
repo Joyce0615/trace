@@ -681,6 +681,21 @@ export const browserBridge: TraceBridge = {
     if (!probe) throw new Error("That probe is not active for this repository.");
     return model.gradeProbe(probe, request.choiceId);
   },
+  async reviewPlan(request) {
+    // The demo runs the same scheduler as the desktop app, so it cannot drift.
+    const scheduler = await import("../electron/spaced-repetition.mjs");
+    return scheduler.reviewPlan(request.learnerState, request.skillGraph, { now: request.now, dailyLimit: request.dailyLimit });
+  },
+  async recordReview(request) {
+    const scheduler = await import("../electron/spaced-repetition.mjs");
+    const result = scheduler.applyReview(request.learnerState, request.skillGraph, {
+      skillId: request.skillId,
+      grade: request.grade,
+      now: request.now,
+    });
+    savedLearning = result.learnerState;
+    return result;
+  },
   async askAgent(request) {
     await new Promise((resolve) => setTimeout(resolve, 550));
     const pack = demoPack(request);

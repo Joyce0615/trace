@@ -229,7 +229,7 @@ export interface SkillGraph {
 export interface LearningEvidence {
   id: string;
   skillId: string;
-  kind: "diagnostic" | "lesson" | "quiz" | "practice" | "self-report" | "note";
+  kind: "diagnostic" | "lesson" | "quiz" | "practice" | "self-report" | "note" | "review";
   strength: number;
   detail: string;
   createdAt: string;
@@ -242,6 +242,8 @@ export interface SkillMastery {
   status: SkillStatus;
   evidence: LearningEvidence[];
   sourceFingerprint?: string;
+  /** Spaced-repetition scheduling state (item 36); absent until the first review. */
+  review?: ReviewSchedulingState;
 }
 
 export interface LearningMemory {
@@ -831,6 +833,84 @@ export interface ProbeGrade {
   anchor: CodeAnchor | null;
 }
 
+export type ReviewGradeId = "again" | "hard" | "good" | "easy";
+
+export interface ReviewSchedulingState {
+  stability: number;
+  difficulty: number;
+  reviews: number;
+  lapses: number;
+  lastReviewedAt: string | null;
+  lastGrade: ReviewGradeId | null;
+}
+
+export interface ScheduledSkill {
+  skillId: string;
+  title: string | null;
+  state: "stale" | "new" | "locked" | "due" | "relearning" | "retained";
+  reason: string;
+  explanation: string;
+  recordedMastery: number;
+  retention: number | null;
+  retainedMastery: number;
+  stability: number;
+  difficulty: number;
+  reviews: number;
+  lapses: number;
+  lastReviewedAt: string | null;
+  elapsedDays: number | null;
+  dueAt: string;
+  overdueDays: number;
+  due: boolean;
+  priority: number;
+  anchors: CodeAnchor[];
+}
+
+export interface ForgettingCurve {
+  stabilityDays: number;
+  horizonDays: number;
+  dueDay: number;
+  points: Array<{ day: number; retention: number }>;
+}
+
+export interface ReviewPlan {
+  version: number;
+  generatedAt: string;
+  parameters: { targetRetention: number; dailyLimit: number; masteryFloor: number };
+  queue: ScheduledSkill[];
+  upcoming: ScheduledSkill[];
+  skills: ScheduledSkill[];
+  curves: Record<string, ForgettingCurve>;
+  summary: {
+    skills: number;
+    due: number;
+    queued: number;
+    stale: number;
+    new: number;
+    relearning: number;
+    retained: number;
+    locked: number;
+    meanRetention: number | null;
+    recordedMastery: number;
+    retainedMastery: number;
+    decayLoss: number;
+    nextDueAt: string | null;
+  };
+}
+
+export interface ReviewResult {
+  version: number;
+  grade: ReviewGradeId;
+  recalled: boolean;
+  strength: number;
+  elapsedDays: number;
+  retrievability: number | null;
+  previous: { stability: number; difficulty: number; reviews: number; lapses: number };
+  state: ReviewSchedulingState;
+  intervalDays: number;
+  dueAt: string;
+}
+
 export interface AgentState {
   codex: { available: boolean; version: string | null };
   claude: { available: boolean; version: string | null };
@@ -889,6 +969,8 @@ export interface TraceBridge {
   evaluate(request: { repository: RepositoryRef; course?: Course; skillGraph?: SkillGraph; answers?: unknown[]; sampleSize?: number }): Promise<EvaluationReport>;
   diagnose(request: { repository: RepositoryRef; skillGraph: SkillGraph; learnerState: LearnerState; text?: string }): Promise<DiagnosisReport>;
   answerProbe(request: { repository: RepositoryRef; probeId: string; choiceId: string }): Promise<ProbeGrade>;
+  reviewPlan(request: { repository: RepositoryRef; skillGraph: SkillGraph; learnerState: LearnerState; now?: string; dailyLimit?: number }): Promise<ReviewPlan>;
+  recordReview(request: { repository: RepositoryRef; skillGraph: SkillGraph; learnerState: LearnerState; skillId: string; grade: ReviewGradeId; now?: string }): Promise<{ learnerState: LearnerState; review: ReviewResult; plan: ReviewPlan }>;
   askAgent(request: {
     provider: "codex" | "claude";
     rootPath: string;

@@ -20,6 +20,7 @@ import { SECRET_SCANNER_VERSION, anonymizePath, redact, redactValue, scanText, s
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
 import { GIT_HISTORY_VERSION, busFactor, historyLessons, historySummary, parseHistory, readCommits } from "../electron/git-history.mjs";
 import { MISCONCEPTIONS, MISCONCEPTION_VERSION, buildProbe, calibrateSkill, detectMisconceptions, diagnoseLearner, gradeProbe } from "../electron/misconception.mjs";
+import { DEFAULT_SCHEDULER, REVIEW_GRADE_IDS, SPACED_REPETITION_VERSION, applyReview, decayedMastery, forgettingCurve, gradeReview, intervalForRetention, retention, reviewPlan, scheduleSkill } from "../electron/spaced-repetition.mjs";
 import { EVALUATION_VERSION, evaluateLessons, evaluateRetrieval, evaluateTutorAnswer, runEvaluation } from "../electron/evaluation.mjs";
 import { EMBEDDING_DIMENSIONS, SEARCH_VERSION, buildSearchIndex, cosine, editDistance, embed, search, similarityScore, subsequenceScore, tokenize } from "../electron/search.mjs";
 import { EVIDENCE_VERSION, evidenceByPath, evidenceForSkills, importEvidence } from "../electron/evidence-import.mjs";
@@ -34,6 +35,7 @@ import { buildSkillGraph, createLearnerState, reconcileLearnerState } from "../e
 import { loadLearnerState, saveLearnerState } from "../electron/learning-store.mjs";
 
 const execFileAsync = promisify(execFile);
+const round4 = (value) => Number(Number(value).toFixed(4));
 
 test("languageFor recognizes common source formats", () => {
   assert.equal(languageFor("src/App.tsx"), "typescript");
@@ -744,7 +746,7 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
     "exercise:localization", "exercise:localization-hint", "exercise:localization-score",
     "grade:race-task", "grade:race", "trace:runtimes", "trace:run",
     "graph:architecture", "graph:symbol-flow", "history:summary", "evidence:import", "search:query", "eval:run",
-    "learning:diagnose", "learning:probe", "agents:ask",
+    "learning:diagnose", "learning:probe", "learning:schedule", "learning:review", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
   assert.throws(() => schemaFor("repository:evil"), /is not a registered IPC channel/);
@@ -2406,4 +2408,270 @@ test("misconceptions are named and confidence is calibrated per skill", async (c
   assert.ok(withText.skills.every((skillReport) => skillReport.misconceptions.some((finding) => finding.id === "mutation-vs-copy")));
   assert.equal(withText.taxonomy.length, MISCONCEPTIONS.length);
   assert.equal(withText.taxonomy.every((entry) => !("patterns" in entry)), true, "detector patterns stay in the main process");
+});
+
+test("spaced repetition decays mastery and schedules reviews on the forgetting curve", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-recall-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "app"), { recursive: true });
+  await writeFile(path.join(rootPath, "app", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "app", "queue.py"), "def enqueue(job):\n    return job\n");
+  await writeFile(path.join(rootPath, "app", "worker.py"), "from app.queue import enqueue\n\n\ndef work(job):\n    return enqueue(job)\n");
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const course = generateStarterCourse(repository);
+  const skillGraph = buildSkillGraph(repository, course);
+  const now = "2026-06-01T00:00:00.000Z";
+  const at = (days) => new Date(Date.parse(now) + days * 86_400_000).toISOString();
+
+  assert.equal(SPACED_REPETITION_VERSION, 1);
+  assert.deepEqual(REVIEW_GRADE_IDS, ["again", "hard", "good", "easy"]);
+
+  // --- The forgetting curve ------------------------------------------------
+  // Stability is defined as "days until recall reaches the target", so the
+  // number a learner sees means something concrete.
+  assert.equal(retention(0, 10), 1);
+  assert.equal(round4(retention(10, 10)), DEFAULT_SCHEDULER.targetRetention);
+  const samples = [0, 1, 2, 5, 10, 20, 40].map((day) => retention(day, 10));
+  for (let index = 1; index < samples.length; index += 1) {
+    assert.ok(samples[index] < samples[index - 1], `retention must decrease: ${samples.join(", ")}`);
+  }
+  assert.ok(retention(1000, 10) < 0.01 && retention(1000, 10) >= 0);
+  // The interval is the exact inverse of the curve.
+  assert.equal(round4(intervalForRetention(10, DEFAULT_SCHEDULER.targetRetention)), 10);
+  assert.equal(round4(retention(intervalForRetention(7, 0.5), 7)), 0.5);
+  const curve = forgettingCurve({ stability: 8 }, { points: 6 });
+  assert.equal(curve.points.length, 6);
+  assert.equal(curve.dueDay, 8);
+  assert.equal(curve.points[0].retention, 1);
+  assert.ok(curve.points.at(-1).retention < 0.8);
+
+  // --- The spacing effect --------------------------------------------------
+  const learned = { stability: 10, difficulty: 2.2, reviews: 3, lapses: 0, lastReviewedAt: now, lastGrade: "good" };
+  const immediate = gradeReview(learned, { grade: "good", elapsedDays: 0, now });
+  const onTime = gradeReview(learned, { grade: "good", elapsedDays: 10, now });
+  const late = gradeReview(learned, { grade: "good", elapsedDays: 30, now });
+  assert.ok(immediate.state.stability > learned.stability, "a successful recall never shortens the interval");
+  assert.ok(onTime.state.stability > immediate.state.stability, `${immediate.state.stability} -> ${onTime.state.stability}`);
+  assert.ok(late.state.stability > onTime.state.stability, `${onTime.state.stability} -> ${late.state.stability}`);
+  assert.equal(round4(immediate.retrievability), 1);
+  assert.equal(round4(onTime.retrievability), 0.9);
+  assert.ok(late.retrievability < 0.75);
+  // Harder self-reports grow the interval less; easier ones grow it more.
+  const hard = gradeReview(learned, { grade: "hard", elapsedDays: 10, now });
+  const easy = gradeReview(learned, { grade: "easy", elapsedDays: 10, now });
+  assert.ok(hard.state.stability < onTime.state.stability, `${hard.state.stability} < ${onTime.state.stability}`);
+  assert.ok(easy.state.stability > onTime.state.stability, `${easy.state.stability} > ${onTime.state.stability}`);
+  assert.ok(hard.state.difficulty > onTime.state.difficulty);
+  assert.ok(easy.state.difficulty < onTime.state.difficulty);
+
+  // --- Lapses --------------------------------------------------------------
+  const lapse = gradeReview(learned, { grade: "again", elapsedDays: 40, now });
+  assert.equal(lapse.recalled, false);
+  assert.equal(lapse.state.lapses, 1);
+  assert.ok(lapse.state.stability < learned.stability, `${lapse.state.stability} < ${learned.stability}`);
+  assert.ok(lapse.state.stability >= DEFAULT_SCHEDULER.minimumStabilityDays, "relearning keeps a head start");
+  assert.ok(lapse.state.difficulty > learned.difficulty);
+  // A second lapse costs more than the first.
+  const secondLapse = gradeReview({ ...lapse.state, stability: learned.stability }, { grade: "again", elapsedDays: 40, now });
+  assert.ok(secondLapse.state.stability < lapse.state.stability, `${secondLapse.state.stability} < ${lapse.state.stability}`);
+  // Difficulty and stability are both bounded.
+  assert.ok(gradeReview({ ...learned, stability: 400 }, { grade: "easy", elapsedDays: 400, now }).state.stability <= DEFAULT_SCHEDULER.maximumStabilityDays);
+  let hardened = { ...learned };
+  for (let index = 0; index < 12; index += 1) hardened = gradeReview(hardened, { grade: "again", elapsedDays: 1, now }).state;
+  assert.ok(hardened.difficulty <= DEFAULT_SCHEDULER.difficultyCeiling);
+  assert.ok(hardened.stability >= DEFAULT_SCHEDULER.minimumStabilityDays);
+  assert.throws(() => gradeReview(learned, { grade: "perfect", now }), /Unknown review grade/);
+
+  // A first exposure is graded, not assumed: each grade sets a different start.
+  const fresh = { stability: 1, difficulty: 2.2, reviews: 0, lapses: 0, lastReviewedAt: null, lastGrade: null };
+  assert.ok(gradeReview(fresh, { grade: "easy", now }).state.stability > gradeReview(fresh, { grade: "good", now }).state.stability);
+  assert.ok(gradeReview(fresh, { grade: "good", now }).state.stability > gradeReview(fresh, { grade: "hard", now }).state.stability);
+  assert.equal(gradeReview(fresh, { grade: "good", now }).retrievability, null, "there is no curve before the first review");
+
+  // --- Mastery decay -------------------------------------------------------
+  assert.equal(decayedMastery(1, 1), 1);
+  assert.equal(decayedMastery(1, 0), DEFAULT_SCHEDULER.masteryFloor, "a skill once held is never fully lost");
+  assert.ok(decayedMastery(0.8, 0.5) < 0.8 && decayedMastery(0.8, 0.5) > 0.8 * DEFAULT_SCHEDULER.masteryFloor);
+  assert.equal(decayedMastery(0.8, null), 0.8, "with no curve the recorded value is reported unchanged");
+
+  // --- Scheduling one skill ------------------------------------------------
+  const [firstSkill, secondSkill] = skillGraph.nodes;
+  const retained = scheduleSkill(
+    { skillId: firstSkill.id, mastery: 0.9, status: "mastered", evidence: [], sourceFingerprint: firstSkill.sourceFingerprint, review: { stability: 30, difficulty: 2, reviews: 2, lapses: 0, lastReviewedAt: at(-2), lastGrade: "good" } },
+    firstSkill,
+    { now },
+  );
+  assert.equal(retained.state, "retained");
+  assert.equal(retained.due, false);
+  assert.ok(retained.retention > 0.9);
+  assert.ok(retained.retainedMastery < retained.recordedMastery, "even a retained skill has decayed a little");
+  assert.equal(Date.parse(retained.dueAt) - Date.parse(at(-2)), 30 * 86_400_000);
+
+  const overdue = scheduleSkill(
+    { skillId: firstSkill.id, mastery: 0.9, status: "mastered", evidence: [], sourceFingerprint: firstSkill.sourceFingerprint, review: { stability: 4, difficulty: 2.2, reviews: 2, lapses: 0, lastReviewedAt: at(-24), lastGrade: "good" } },
+    firstSkill,
+    { now },
+  );
+  assert.equal(overdue.state, "due");
+  assert.equal(overdue.due, true);
+  assert.ok(overdue.overdueDays > 19, String(overdue.overdueDays));
+  assert.ok(overdue.retention < 0.6, String(overdue.retention));
+  assert.ok(overdue.retainedMastery < overdue.recordedMastery * 0.75, `${overdue.retainedMastery} vs ${overdue.recordedMastery}`);
+  assert.match(overdue.explanation, /below the 90% target/);
+  assert.ok(overdue.priority > retained.priority);
+
+  // Never reviewed: honest "unknown", not a fabricated retention estimate.
+  const untouched = scheduleSkill({ skillId: secondSkill.id, mastery: 0.4, status: "available", evidence: [] }, secondSkill, { now });
+  assert.equal(untouched.state, "new");
+  assert.equal(untouched.retention, null);
+  assert.equal(untouched.reason, "never-reviewed");
+
+  // Source change invalidates the evidence rather than the schedule silently
+  // carrying retention of code that no longer exists.
+  const stale = scheduleSkill(
+    { skillId: firstSkill.id, mastery: 0.95, status: "mastered", evidence: [], sourceFingerprint: "an-older-fingerprint", review: { stability: 60, difficulty: 2, reviews: 5, lapses: 0, lastReviewedAt: at(-1), lastGrade: "easy" } },
+    firstSkill,
+    { now },
+  );
+  assert.equal(stale.state, "stale");
+  assert.equal(stale.reason, "source-changed");
+  assert.equal(stale.retention, null, "retention of changed source is not reported");
+  assert.equal(stale.due, true);
+  assert.ok(stale.priority > overdue.priority, `${stale.priority} > ${overdue.priority}`);
+
+  // --- The queue -----------------------------------------------------------
+  const graph = {
+    id: "g",
+    repositoryId: repository.id,
+    nodes: [
+      { id: "s-base", title: "Base", prerequisites: [], anchors: [], importance: 60, sourceFingerprint: "fp-base" },
+      { id: "s-mid", title: "Middle", prerequisites: ["s-base"], anchors: [], importance: 90, sourceFingerprint: "fp-mid" },
+      { id: "s-far", title: "Far", prerequisites: ["s-mid"], anchors: [], importance: 50, sourceFingerprint: "fp-far" },
+      { id: "s-fresh", title: "Fresh", prerequisites: [], anchors: [], importance: 70, sourceFingerprint: "fp-fresh" },
+      { id: "s-stale", title: "Changed", prerequisites: [], anchors: [], importance: 40, sourceFingerprint: "fp-stale-new" },
+    ],
+    diagnostic: [],
+  };
+  const state = {
+    repositoryId: repository.id,
+    diagnosticCompleted: true,
+    memory: [],
+    updatedAt: now,
+    mastery: {
+      "s-base": { skillId: "s-base", mastery: 0.8, status: "mastered", evidence: [], sourceFingerprint: "fp-base", review: { stability: 6, difficulty: 2.2, reviews: 2, lapses: 0, lastReviewedAt: at(-9), lastGrade: "good" } },
+      // Badly overdue, and therefore the most forgotten review.
+      "s-mid": { skillId: "s-mid", mastery: 0.8, status: "mastered", evidence: [], sourceFingerprint: "fp-mid", review: { stability: 3, difficulty: 2.2, reviews: 2, lapses: 0, lastReviewedAt: at(-40), lastGrade: "good" } },
+      // Comfortably retained: must not appear in the queue at all.
+      "s-far": { skillId: "s-far", mastery: 0.7, status: "mastered", evidence: [], sourceFingerprint: "fp-far", review: { stability: 90, difficulty: 2, reviews: 3, lapses: 0, lastReviewedAt: at(-1), lastGrade: "easy" } },
+      "s-fresh": { skillId: "s-fresh", mastery: 0.2, status: "available", evidence: [], sourceFingerprint: "fp-fresh" },
+      "s-stale": { skillId: "s-stale", mastery: 0.9, status: "mastered", evidence: [], sourceFingerprint: "fp-stale-old", review: { stability: 20, difficulty: 2, reviews: 4, lapses: 0, lastReviewedAt: at(-1), lastGrade: "good" } },
+    },
+  };
+  const plan = reviewPlan(state, graph, { now });
+  assert.equal(plan.version, 1);
+  assert.equal(plan.summary.skills, 5);
+  assert.equal(plan.summary.stale, 1);
+  assert.equal(plan.summary.new, 1);
+  assert.equal(plan.summary.retained, 1);
+  assert.equal(plan.summary.due, 4, JSON.stringify(plan.queue.map((entry) => entry.skillId)));
+  // The retained skill is reported as upcoming, never as work to do now.
+  assert.deepEqual(plan.upcoming.map((entry) => entry.skillId), ["s-far"]);
+  assert.equal(plan.queue.some((entry) => entry.skillId === "s-far"), false);
+  // Stale first, then the most forgotten review, then new material.
+  assert.equal(plan.queue[0].skillId, "s-stale");
+  assert.equal(plan.queue.at(-1).skillId, "s-fresh", JSON.stringify(plan.queue.map((entry) => entry.skillId)));
+  const midIndex = plan.queue.findIndex((entry) => entry.skillId === "s-mid");
+  const baseIndex = plan.queue.findIndex((entry) => entry.skillId === "s-base");
+  assert.ok(midIndex > baseIndex, "a prerequisite is never reviewed after the skill built on it");
+  // ...even though the dependent is the more forgotten of the two.
+  assert.ok(plan.skills.find((entry) => entry.skillId === "s-mid").retention < plan.skills.find((entry) => entry.skillId === "s-base").retention);
+  // Decay is reported against the record, not instead of it.
+  assert.ok(plan.summary.retainedMastery < plan.summary.recordedMastery);
+  assert.equal(round4(plan.summary.decayLoss), round4(plan.summary.recordedMastery - plan.summary.retainedMastery));
+  assert.ok(plan.summary.decayLoss > 0.1, String(plan.summary.decayLoss));
+  assert.equal(plan.summary.nextDueAt, plan.upcoming[0].dueAt);
+  assert.ok(Object.keys(plan.curves).length >= 1);
+  // The daily limit bounds the workload rather than dumping the backlog.
+  assert.equal(reviewPlan(state, graph, { now, dailyLimit: 2 }).queue.length, 2);
+  assert.deepEqual(reviewPlan(state, graph, { now, dailyLimit: 2 }).queue.map((entry) => entry.skillId), plan.queue.slice(0, 2).map((entry) => entry.skillId));
+  // Same inputs, same plan: nothing here depends on wall-clock time.
+  assert.deepEqual(reviewPlan(state, graph, { now }), plan);
+  // A locked skill is not review work.
+  const withLocked = reviewPlan({ ...state, mastery: { ...state.mastery, "s-fresh": { ...state.mastery["s-fresh"], status: "locked" } } }, graph, { now });
+  assert.equal(withLocked.summary.locked, 1);
+  assert.equal(withLocked.queue.some((entry) => entry.skillId === "s-fresh"), false);
+  // An empty graph degrades instead of throwing.
+  assert.equal(reviewPlan({ mastery: {} }, { nodes: [] }, { now }).queue.length, 0);
+  // Regression: callers forward optional request fields straight through, so an
+  // absent `dailyLimit` must not overwrite the default and empty the queue while
+  // the summary still reports work as due.
+  const forwarded = reviewPlan(state, graph, { now, dailyLimit: undefined, targetRetention: undefined });
+  assert.equal(forwarded.queue.length, plan.queue.length, "an undefined option must not clobber its default");
+  assert.equal(forwarded.summary.due, forwarded.queue.length);
+  assert.deepEqual(forwarded.queue.map((entry) => entry.skillId), plan.queue.map((entry) => entry.skillId));
+
+  // --- Recording a review --------------------------------------------------
+  const applied = applyReview(state, graph, { skillId: "s-mid", grade: "good", now });
+  const updated = applied.learnerState.mastery["s-mid"];
+  assert.equal(updated.review.reviews, 3);
+  assert.equal(updated.review.lastGrade, "good");
+  assert.equal(updated.review.lastReviewedAt, now);
+  assert.ok(updated.review.stability > 3, String(updated.review.stability));
+  // Recorded mastery moves toward the graded strength rather than jumping to it.
+  assert.equal(updated.mastery, 0.8, "a `good` recall on an already-0.80 skill is not a promotion");
+  assert.ok(applyReview(state, graph, { skillId: "s-mid", grade: "easy", now }).learnerState.mastery["s-mid"].mastery > 0.8);
+  assert.ok(applyReview(state, graph, { skillId: "s-mid", grade: "hard", now }).learnerState.mastery["s-mid"].mastery < 0.8);
+  assert.equal(updated.evidence.at(-1).kind, "review");
+  assert.equal(updated.evidence.at(-1).strength, 0.8);
+  assert.match(updated.evidence.at(-1).detail, /graded good after 40 day/);
+  // The reviewed skill leaves the due queue immediately.
+  assert.equal(applied.plan.queue.some((entry) => entry.skillId === "s-mid"), false);
+  assert.ok(applied.plan.upcoming.some((entry) => entry.skillId === "s-mid"));
+  assert.equal(applied.review.intervalDays, updated.review.stability);
+  // The new curve is returned even though the skill just left the queue.
+  assert.equal(applied.plan.curves["s-mid"].stabilityDays, updated.review.stability);
+  assert.equal(applied.plan.curves["s-mid"].points[0].retention, 1);
+  // Other skills are untouched.
+  assert.deepEqual(applied.learnerState.mastery["s-base"], state.mastery["s-base"]);
+
+  // Reviewing a stale skill re-fingerprints it: the recall was against the
+  // current source, which is exactly what staleness was waiting for.
+  const revived = applyReview(state, graph, { skillId: "s-stale", grade: "hard", now });
+  assert.equal(revived.learnerState.mastery["s-stale"].sourceFingerprint, "fp-stale-new");
+  assert.equal(revived.learnerState.mastery["s-stale"].status, "active");
+  assert.equal(revived.plan.summary.stale, 0);
+  assert.equal(revived.learnerState.mastery["s-stale"].review.reviews, 1, "a changed source restarts the curve");
+  assert.ok(revived.learnerState.mastery["s-stale"].review.stability < 20, "the old 20-day interval does not survive the change");
+
+  // Forgetting a mastered skill drops it out of "mastered" and shortens the interval.
+  const forgotten = applyReview(state, graph, { skillId: "s-base", grade: "again", now });
+  assert.equal(forgotten.learnerState.mastery["s-base"].status, "active");
+  assert.ok(forgotten.learnerState.mastery["s-base"].mastery < state.mastery["s-base"].mastery);
+  assert.ok(forgotten.review.intervalDays < 6);
+  assert.equal(forgotten.plan.queue[0].skillId !== "s-base" || forgotten.plan.queue[0].state === "relearning", true);
+  assert.throws(() => applyReview(state, graph, { skillId: "s-nope", grade: "good", now }), /not part of this repository/);
+  assert.throws(() => applyReview(state, graph, { skillId: "s-base", grade: "brilliant", now }), /Unknown review grade/);
+
+  // --- Calibration counts a delayed retrieval as strong evidence -----------
+  const calibratedFromReviews = calibrateSkill({ skillId: "s-mid", status: "active", evidence: updated.evidence.filter((item) => item.kind === "review") });
+  assert.ok(calibratedFromReviews.evidenceCount >= 1);
+  assert.ok(calibratedFromReviews.effectiveObservations > 1.5, `a delayed recall outweighs a note: ${calibratedFromReviews.effectiveObservations}`);
+
+  // --- End to end on the real index ----------------------------------------
+  const realPlan = reviewPlan(reconcileLearnerState(repository, skillGraph, null), skillGraph, { now });
+  assert.equal(realPlan.summary.skills, skillGraph.nodes.length);
+  assert.ok(realPlan.queue.length >= 1);
+  assert.ok(realPlan.queue.every((entry) => skillGraph.nodes.some((node) => node.id === entry.skillId)));
+  const realReviewed = applyReview(reconcileLearnerState(repository, skillGraph, null), skillGraph, { skillId: realPlan.queue[0].skillId, grade: "good", now });
+  // The updated state survives the reconciliation that runs on every reopen.
+  const reconciled = reconcileLearnerState(repository, skillGraph, realReviewed.learnerState);
+  assert.deepEqual(reconciled.mastery[realPlan.queue[0].skillId].review, realReviewed.learnerState.mastery[realPlan.queue[0].skillId].review);
+  // ...and persists through the redacting learner store.
+  const learningDirectory = path.join(workspace, "learning");
+  await saveLearnerState(learningDirectory, { ...realReviewed.learnerState, repositoryId: repository.id });
+  const reloaded = await loadLearnerState(learningDirectory, repository.id);
+  assert.deepEqual(reloaded.mastery[realPlan.queue[0].skillId].review, realReviewed.learnerState.mastery[realPlan.queue[0].skillId].review);
 });

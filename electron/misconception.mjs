@@ -165,7 +165,10 @@ export function gradeProbe(probe, choiceId) {
 
 // Evidence kinds differ in how much they say about understanding, so they carry
 // different weight in the posterior.
-const EVIDENCE_WEIGHT = { diagnostic: 0.6, lesson: 0.8, quiz: 1.4, practice: 1.6, "self-report": 0.4, note: 0.2 };
+// A spaced review is a retrieval attempt against a delay, which is stronger
+// evidence of durable understanding than answering a quiz immediately after
+// reading the lesson.
+const EVIDENCE_WEIGHT = { diagnostic: 0.6, lesson: 0.8, quiz: 1.4, practice: 1.6, review: 1.8, "self-report": 0.4, note: 0.2 };
 const PRIOR_ALPHA = 1;
 const PRIOR_BETA = 1;
 const SUCCESS_THRESHOLD = 0.6;
@@ -189,7 +192,7 @@ export function calibrateSkill(mastery) {
     alpha += weight * success;
     beta += weight * (1 - success);
     if (item.kind === "self-report") selfReport = success;
-    else if (["quiz", "practice", "diagnostic"].includes(item.kind)) {
+    else if (["quiz", "practice", "diagnostic", "review"].includes(item.kind)) {
       // Compare what the learner predicted about themselves with what happened.
       predictions.push({ predicted: selfReport ?? alpha / (alpha + beta), outcome: success >= SUCCESS_THRESHOLD ? 1 : 0 });
     }

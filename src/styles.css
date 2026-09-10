@@ -720,3 +720,35 @@ button { color: inherit; }
 .probe-result.incorrect { border: 1px solid #4a2f2f; background: #1a1113; color: #dfa2a2; }
 .probe-result p { color: #8d97a5; margin: 3px 0; }
 .probe-result button { padding: 2px 8px; border: 1px solid #262d3d; border-radius: 6px; background: none; color: #93a0b1; font-family: "SFMono-Regular", Menlo, monospace; font-size: calc(9px + var(--font-boost)); cursor: pointer; }
+
+/* Item 36: spaced repetition, forgetting curves, and mastery decay. */
+.schedule-panel { padding: 18px 26px 34px; display: flex; flex-direction: column; gap: 10px; border-top: 1px solid #1a2130; }
+.schedule-head { display: flex; align-items: center; gap: 10px; }
+.schedule-head span { color: #9ee66f; font-size: calc(9px + var(--font-boost)); letter-spacing: .14em; }
+.schedule-head .ghost { margin-left: auto; padding: 5px 12px; border: 1px solid #262d3d; border-radius: 8px; background: none; color: #93a0b1; font-size: calc(10px + var(--font-boost)); cursor: pointer; }
+.schedule-note { color: #616b7c; font-size: calc(10px + var(--font-boost)); }
+.schedule-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
+.schedule-summary div { padding: 6px 4px; border: 1px solid #1c2230; border-radius: 7px; background: #0c1017; text-align: center; }
+.schedule-summary em { display: block; font-style: normal; font-size: calc(13px + var(--font-boost)); color: #cfd6e2; }
+.schedule-summary small { color: #5b6474; font-size: calc(8px + var(--font-boost)); }
+.schedule-queue { display: flex; flex-direction: column; gap: 7px; }
+.schedule-item { padding: 9px 11px; border: 1px solid #1e2532; border-radius: 9px; background: #0e121a; display: flex; flex-direction: column; gap: 6px; }
+.schedule-item[data-state="stale"] { border-color: #4a3a2a; }
+.schedule-item[data-state="relearning"] { border-color: #4a2f2f; }
+.schedule-item-head { display: flex; align-items: baseline; gap: 8px; }
+.schedule-item-head strong { color: #dbe1ea; font-size: calc(11px + var(--font-boost)); }
+.schedule-item-head small { margin-left: auto; color: #9aa5b5; font-size: calc(10px + var(--font-boost)); }
+.schedule-item p { color: #7d8798; font-size: calc(9px + var(--font-boost)); }
+.schedule-grades { display: flex; gap: 5px; flex-wrap: wrap; }
+.schedule-grades button { padding: 4px 11px; border: 1px solid #262d3d; border-radius: 7px; background: #10141d; color: #a8b2c1; font-size: calc(9px + var(--font-boost)); cursor: pointer; }
+.schedule-grades button:hover { border-color: #3a4456; }
+.schedule-grades button[data-grade="again"] { color: #dfa2a2; }
+.schedule-grades button[data-grade="easy"] { color: #9ee66f; }
+.schedule-anchor { align-self: flex-start; padding: 3px 8px; border: 1px solid #232a38; border-radius: 6px; background: none; color: #7f8b9c; font-size: calc(9px + var(--font-boost)); cursor: pointer; }
+.schedule-result { padding: 7px 9px; border: 1px solid #253a2a; border-radius: 7px; background: #101a12; display: flex; gap: 8px; align-items: baseline; }
+.schedule-result strong { color: #9ee66f; font-size: calc(10px + var(--font-boost)); }
+.schedule-result span { color: #7d8798; font-size: calc(9px + var(--font-boost)); }
+.forgetting-curve { display: flex; flex-direction: column; gap: 4px; }
+.forgetting-curve svg { width: 100%; height: 42px; }
+.forgetting-curve polyline { fill: none; stroke: #9ee66f; stroke-width: 1; vector-effect: non-scaling-stroke; }
+.forgetting-curve small { color: #5b6474; font-size: calc(9px + var(--font-boost)); }

@@ -332,6 +332,31 @@ try {
   assert.match(await firstSkill.locator(".probe-result p").innerText(), /definition anchor/);
   await page.screenshot({ path: path.join(artifactDirectory, "diagnosis.png") });
 
+  // Item 36: spaced repetition, forgetting curves, and mastery decay.
+  const schedule = page.locator(".schedule-panel");
+  await schedule.waitFor();
+  await schedule.getByRole("button", { name: "Plan my reviews" }).click();
+  await schedule.locator(".schedule-summary").waitFor();
+  // The demo starts with one skill studied three weeks ago and one yesterday.
+  const retainedNow = Number((await schedule.locator('[data-summary="retained"]').innerText()).replace("%", ""));
+  const recordedNow = Number((await schedule.locator('[data-summary="recorded"]').innerText()).replace("%", ""));
+  assert.ok(recordedNow > retainedNow, `decay must be visible: recorded ${recordedNow}% vs retained ${retainedNow}%`);
+  // The overdue skill is queued; the one reviewed yesterday is not.
+  await schedule.locator('.schedule-item[data-skill="skill-prefix-cache"]').waitFor();
+  assert.equal(await schedule.locator('.schedule-item[data-skill="skill-sequence-state"]').count(), 0, "a retained skill is not review work");
+  const overdueRecall = Number(await schedule.locator('.schedule-item[data-skill="skill-prefix-cache"] [data-retention]').getAttribute("data-retention"));
+  assert.ok(overdueRecall > 0 && overdueRecall < 0.9, `21 days on a 4-day interval should be well below target: ${overdueRecall}`);
+  assert.equal(await schedule.locator('.schedule-item[data-skill="skill-prefix-cache"]').getAttribute("data-reason"), "retention-below-target");
+  // Grading the review extends the interval and draws the new curve.
+  await schedule.locator('.schedule-item[data-skill="skill-prefix-cache"] button[data-grade="good"]').click();
+  await schedule.locator(".schedule-result").waitFor();
+  const grantedInterval = Number(await schedule.locator(".schedule-result").getAttribute("data-interval"));
+  assert.ok(grantedInterval > 4, `a successful late recall must extend the 4-day interval: ${grantedInterval}`);
+  assert.equal(await schedule.locator('.schedule-item[data-skill="skill-prefix-cache"]').count(), 0, "a reviewed skill leaves the queue");
+  await schedule.locator(".forgetting-curve").waitFor();
+  assert.equal(Number(await schedule.locator(".forgetting-curve").getAttribute("data-stability")), grantedInterval);
+  await page.screenshot({ path: path.join(artifactDirectory, "recall-schedule.png") });
+
   await page.getByRole("button", { name: "Ask", exact: true }).click();
   await page.getByText("Ask without losing your place.").waitFor();
   await page.locator(".tutor-input textarea").fill("Where is Scheduler defined?");

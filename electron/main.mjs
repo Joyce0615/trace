@@ -23,6 +23,7 @@ import { evidenceForSkills, importEvidence } from "./evidence-import.mjs";
 import { buildSearchIndex, search } from "./search.mjs";
 import { runEvaluation } from "./evaluation.mjs";
 import { detectMisconceptions, diagnoseLearner, gradeProbe } from "./misconception.mjs";
+import { applyReview, reviewPlan } from "./spaced-repetition.mjs";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const openedRepositories = new Map();
@@ -419,6 +420,27 @@ const ipcHandlers = {
     const probe = learnerProbes.get(repository.id)?.[request.probeId];
     if (!probe) throw new Error("That probe is not active for this repository.");
     return gradeProbe(probe, request.choiceId);
+  },
+
+  "learning:schedule": (_event, request) => {
+    openedRepository(request.repository);
+    if (!Array.isArray(request.skillGraph?.nodes)) throw new Error("Invalid review-schedule request.");
+    return reviewPlan(request.learnerState ?? {}, request.skillGraph, { now: request.now, dailyLimit: request.dailyLimit });
+  },
+
+  "learning:review": async (_event, request) => {
+    const repository = openedRepository(request.repository);
+    if (!Array.isArray(request.skillGraph?.nodes)) throw new Error("Invalid review request.");
+    // The scheduler is the authority on the next interval, so the updated state
+    // is persisted here rather than trusting the renderer to save it back.
+    const result = applyReview(request.learnerState ?? { repositoryId: repository.id, mastery: {} }, request.skillGraph, {
+      skillId: request.skillId,
+      grade: request.grade,
+      now: request.now,
+    });
+    const learnerState = { ...result.learnerState, repositoryId: repository.id };
+    await saveLearnerState(path.join(app.getPath("userData"), "learning"), learnerState);
+    return { ...result, learnerState };
   },
 
   "agents:ask": async (_event, request) => {

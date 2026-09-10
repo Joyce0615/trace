@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { Icon, bridge, readableError, repositoryRef } from "./shell";
-import type { Course, LearnerState, Lesson, PredictionExercise, Repository, SkillGraph } from "./types";
-import type { ArchitectureState, ChainState, DiagnosisState, EvaluationState, EvidenceState, HistoryState, LocalizationState, ReviewState, TraceState } from "./exercise-state";
+import type { Course, LearnerState, Lesson, PredictionExercise, Repository, ReviewGradeId, SkillGraph } from "./types";
+import type { ArchitectureState, ChainState, DiagnosisState, EvaluationState, EvidenceState, HistoryState, LocalizationState, ReviewState, ScheduleState, TraceState } from "./exercise-state";
 
 /**
- * Exercise, visualization, quality, and diagnosis panels (items 26-35).
+ * Exercise, visualization, quality, and diagnosis panels (items 26-36).
  *
  * These are loaded lazily: a learner who never opens Chains, Locate, or Review
  * never downloads them, which keeps the application entry chunk inside the
@@ -579,6 +579,92 @@ export function DiagnosisPanel({ repository, skillGraph, learnerState, state, on
           </div>;
         })}
       </div>
+    </>}
+  </section>;
+}
+
+const GRADE_LABELS: Array<{ id: ReviewGradeId; label: string }> = [
+  { id: "again", label: "Forgot" },
+  { id: "hard", label: "Hard" },
+  { id: "good", label: "Good" },
+  { id: "easy", label: "Easy" },
+];
+
+/**
+ * Spaced repetition and mastery decay (item 36).
+ *
+ * The panel deliberately shows recorded mastery *and* retained mastery side by
+ * side: hiding the decay would flatter the learner, and replacing the recorded
+ * value would erase the evidence that they once knew it.
+ */
+export function SchedulePanel({ repository, skillGraph, learnerState, state, onState, onLearnerState, onAnchor }: {
+  repository: Repository;
+  skillGraph: SkillGraph | null;
+  learnerState: LearnerState | null;
+  state: ScheduleState;
+  onState: (update: Partial<ScheduleState>) => void;
+  onLearnerState: (next: LearnerState) => void;
+  onAnchor: (path: string, line: number) => void;
+}) {
+  const { plan, status, lastReview, lastSkillId } = state;
+  const load = async () => {
+    if (!skillGraph || !learnerState) return;
+    onState({ status: "loading" });
+    try {
+      onState({ plan: await bridge.reviewPlan({ repository: repositoryRef(repository), skillGraph, learnerState }), status: "ready" });
+    } catch {
+      onState({ status: "error" });
+    }
+  };
+  const grade = async (skillId: string, chosen: ReviewGradeId) => {
+    if (!skillGraph || !learnerState) return;
+    try {
+      const result = await bridge.recordReview({ repository: repositoryRef(repository), skillGraph, learnerState, skillId, grade: chosen });
+      onLearnerState(result.learnerState);
+      onState({ plan: result.plan, lastReview: result.review, lastSkillId: skillId, status: "ready" });
+    } catch {
+      onState({ status: "error" });
+    }
+  };
+
+  const curve = lastSkillId ? plan?.curves?.[lastSkillId] ?? null : null;
+  return <section className="schedule-panel" data-status={status}>
+    <div className="schedule-head">
+      <span>RECALL SCHEDULE</span>
+      <button className="ghost" disabled={status === "loading" || !skillGraph} onClick={() => void load()}>{status === "loading" ? "Scheduling…" : plan ? "Refresh" : "Plan my reviews"}</button>
+    </div>
+    {status === "error" && <p className="schedule-note">The review schedule is unavailable for this repository.</p>}
+    {plan && <>
+      <div className="schedule-summary" data-due={plan.summary.due} data-stale={plan.summary.stale}>
+        <div><em data-summary="due">{plan.summary.due}</em><small>due now</small></div>
+        <div><em data-summary="retention">{plan.summary.meanRetention === null ? "—" : `${Math.round(plan.summary.meanRetention * 100)}%`}</em><small>mean recall</small></div>
+        <div><em data-summary="recorded">{Math.round(plan.summary.recordedMastery * 100)}%</em><small>recorded</small></div>
+        <div><em data-summary="retained">{Math.round(plan.summary.retainedMastery * 100)}%</em><small>retained today</small></div>
+      </div>
+      <div className="schedule-queue">
+        {plan.queue.length === 0 && <p className="schedule-note">Nothing is due. The next review is {plan.summary.nextDueAt ? new Date(plan.summary.nextDueAt).toLocaleDateString() : "not scheduled yet"}.</p>}
+        {plan.queue.map((entry) => <div className="schedule-item" key={entry.skillId} data-skill={entry.skillId} data-state={entry.state} data-reason={entry.reason}>
+          <div className="schedule-item-head">
+            <strong>{entry.title ?? entry.skillId}</strong>
+            <small data-retention={entry.retention ?? ""}>{entry.retention === null ? "no curve yet" : `${Math.round(entry.retention * 100)}% recall`}</small>
+          </div>
+          <p>{entry.explanation}</p>
+          <div className="schedule-grades">
+            {GRADE_LABELS.map((option) => <button key={option.id} data-grade={option.id} onClick={() => void grade(entry.skillId, option.id)}>{option.label}</button>)}
+          </div>
+          {entry.anchors[0] && <button className="schedule-anchor" onClick={() => onAnchor(entry.anchors[0].path, entry.anchors[0].line)}>{entry.anchors[0].path.split("/").at(-1)}:{entry.anchors[0].line}</button>}
+        </div>)}
+      </div>
+      {lastReview && <div className="schedule-result" data-grade={lastReview.grade} data-interval={lastReview.intervalDays}>
+        <strong>Graded {lastReview.grade}</strong>
+        <span>Next review in {lastReview.intervalDays} day{lastReview.intervalDays === 1 ? "" : "s"} (was {lastReview.previous.stability}).</span>
+      </div>}
+      {curve && <div className="forgetting-curve" data-stability={curve.stabilityDays}>
+        <svg viewBox="0 0 100 32" preserveAspectRatio="none" aria-label="Forgetting curve">
+          <polyline points={curve.points.map((point) => `${(point.day / curve.horizonDays) * 100},${32 - point.retention * 30}`).join(" ")} />
+        </svg>
+        <small>Recall falls to {Math.round(plan.parameters.targetRetention * 100)}% after {curve.dueDay} day{curve.dueDay === 1 ? "" : "s"}.</small>
+      </div>}
     </>}
   </section>;
 }
