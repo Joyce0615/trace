@@ -604,6 +604,65 @@ try {
   assert.equal(diagnosisAudit.right.misconception, null);
   assert.match(diagnosisAudit.stale ?? "", /not active for this repository/);
 
+  // Item 37: an executable quiz built from FlashInfer's own Python, graded by
+  // running the learner's code in the resource-limited sandbox.
+  const quizAudit = await page.evaluate(async () => {
+    const workspace = window.traceWorkspace;
+    const repository = { id: workspace.repository.id, rootPath: workspace.repository.rootPath };
+    const startedAt = performance.now();
+    const quiz = await window.trace.buildQuiz({ repository });
+    const buildMs = performance.now() - startedAt;
+    if (!quiz.available) return { quiz, buildMs };
+    const constant = await window.trace.gradeQuiz({ repository, quizId: quiz.id, submission: `def ${quiz.entry}(*args, **kwargs):\n    return 0\n` });
+    const hostile = await window.trace.gradeQuiz({ repository, quizId: quiz.id, submission: `import subprocess\ndef ${quiz.entry}(*args, **kwargs):\n    return subprocess.run(['id'])\n` });
+    const looping = await window.trace.gradeQuiz({ repository, quizId: quiz.id, submission: `def ${quiz.entry}(*args, **kwargs):\n    while True:\n        pass\n` });
+    const network = await window.trace.gradeQuiz({ repository, quizId: quiz.id, submission: `def ${quiz.entry}(*args, **kwargs):\n    import sockets as s\n    return 1\n` });
+    let stale = null;
+    try {
+      await window.trace.gradeQuiz({ repository, quizId: "quiz-not-active", submission: "def f():\n    return 1\n" });
+    } catch (error) {
+      stale = error.message;
+    }
+    return { quiz, buildMs, constant, hostile, looping, network, stale, serialized: JSON.stringify(quiz) };
+  });
+  assert.equal(quizAudit.quiz.available, true, quizAudit.quiz.reason);
+  assert.equal(quizAudit.quiz.language, "python");
+  assert.ok(quizAudit.quiz.hiddenCases.length >= 4, String(quizAudit.quiz.hiddenCases.length));
+  assert.ok(quizAudit.quiz.example.expected.length > 0);
+  // The entry point and its anchor are real, indexed repository source.
+  const quizAnchorValid = await page.evaluate((anchor) => {
+    const workspace = window.traceWorkspace;
+    return {
+      fileIndexed: workspace.repository.files.some((file) => file.path === anchor.path),
+      symbolIndexed: workspace.repository.symbols.some((symbol) => symbol.path === anchor.path && symbol.name === anchor.symbol),
+    };
+  }, quizAudit.quiz.anchor);
+  assert.deepEqual(quizAnchorValid, { fileIndexed: true, symbolIndexed: true });
+  // Hidden tests ship a name and nothing else; the oracle stays behind the IPC boundary.
+  assert.ok(quizAudit.quiz.hiddenCases.every((item) => Object.keys(item).sort().join(",") === "id,name"), JSON.stringify(quizAudit.quiz.hiddenCases[0]));
+  assert.equal(quizAudit.serialized.includes('"expected"'), true, "only the worked example carries an expected value");
+  assert.equal((quizAudit.serialized.match(/"expected"/g) ?? []).length, 1);
+  // A constant answer cannot pass a discriminating suite.
+  assert.equal(quizAudit.constant.status, "ran");
+  assert.equal(quizAudit.constant.passed, false);
+  assert.ok(quizAudit.constant.passedCases < quizAudit.constant.totalCases, `${quizAudit.constant.passedCases}/${quizAudit.constant.totalCases}`);
+  assert.ok(quizAudit.constant.cases.filter((item) => !item.visible).every((item) => item.expected === undefined), "hidden answers must not be returned by grading");
+  assert.equal(quizAudit.constant.enforced.cpu, "rlimit");
+  assert.ok(["rlimit", "watchdog"].includes(quizAudit.constant.enforced.memory));
+  assert.equal(quizAudit.constant.enforced.fileWrite, "rlimit");
+  // Hostile submissions are refused before a process is spawned.
+  assert.equal(quizAudit.hostile.status, "refused");
+  assert.deepEqual(quizAudit.hostile.cases, []);
+  assert.ok(quizAudit.hostile.findings.some((finding) => finding.id === "process-spawn"), JSON.stringify(quizAudit.hostile.findings));
+  // An infinite loop is stopped by the CPU limit rather than hanging the app.
+  assert.ok(["cpu", "timeout"].includes(quizAudit.looping.status), JSON.stringify(quizAudit.looping).slice(0, 200));
+  assert.equal(quizAudit.looping.passed, false);
+  // An unlisted import fails inside the sandbox even when the screen lets it past.
+  assert.equal(quizAudit.network.status, "ran");
+  assert.ok(quizAudit.network.cases.every((item) => item.outcome === "raised"));
+  assert.match(quizAudit.network.cases[0].error, /not allowed inside the quiz sandbox/);
+  assert.match(quizAudit.stale ?? "", /not active for this repository/);
+
   // Item 36: spaced repetition, forgetting curves, and mastery decay against
   // the real skill graph, with the schedule persisted by the main process.
   const scheduleAudit = await page.evaluate(async () => {
@@ -831,6 +890,7 @@ try {
       lessons: { score: evaluationAudit.lessons.score, verdict: evaluationAudit.lessons.verdict },
     },
     diagnosis: { skills: diagnosis.skills.length, assessed: diagnosis.summary.assessed, meanConfidence: diagnosis.summary.meanConfidence, brier: diagnosis.summary.meanBrier, overconfident: diagnosis.summary.overconfidentSkills, misconceptions: diagnosis.summary.misconceptionCounts },
+    executableQuiz: { entry: quizAudit.quiz.entry, anchor: `${quizAudit.quiz.anchor.path}:${quizAudit.quiz.anchor.line}`, hiddenCases: quizAudit.quiz.hiddenCases.length, buildMs: Math.round(quizAudit.buildMs), constantScore: `${quizAudit.constant.passedCases}/${quizAudit.constant.totalCases}`, enforced: quizAudit.constant.enforced, loopingStatus: quizAudit.looping.status },
     schedule: { skills: schedulePlan.summary.skills, due: schedulePlan.summary.due, stale: schedulePlan.summary.stale, meanRetention: schedulePlan.summary.meanRetention, recordedMastery: schedulePlan.summary.recordedMastery, retainedMastery: schedulePlan.summary.retainedMastery, grantedIntervalDays: scheduleAudit.recorded.review.intervalDays },
     executionTrace: { runtime: traceAudit.runtimes.python.version, calls: traceAudit.ran.summary.callCount, transitions: traceAudit.ran.summary.transitions.length, confirmed: traceAudit.ran.summary.confirmedStaticEdges, dynamicOnly: traceAudit.ran.summary.dynamicOnlyEdges },
   }, null, 2));

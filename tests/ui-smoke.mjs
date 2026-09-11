@@ -211,6 +211,17 @@ try {
   assert.match(await tracePanel.locator(".trace-problem pre").innerText(), /only available in the Trace desktop app/);
   assert.equal(await tracePanel.locator(".trace-summary").count(), 0);
 
+  // Item 37: the browser has no interpreter and no sandbox, so the executable
+  // quiz refuses to exist rather than faking a graded run.
+  const quizPanel = page.locator(".quiz-panel");
+  await quizPanel.waitFor();
+  await quizPanel.getByRole("button", { name: "Build a quiz" }).click();
+  await quizPanel.locator('.quiz-note[data-reason="unavailable"]').waitFor();
+  assert.equal(await quizPanel.getAttribute("data-status"), "unavailable");
+  assert.match(await quizPanel.locator(".quiz-note").innerText(), /resource-limited local sandbox/);
+  assert.equal(await quizPanel.locator(".quiz-editor").count(), 0, "no editor is offered when nothing can run it");
+  assert.equal(await quizPanel.locator(".quiz-grade").count(), 0);
+
   // Item 30: module layers, boundaries, and the current symbol's callers/callees.
   await page.locator(".content-tabs").getByRole("button", { name: "Code" }).click();
   await page.locator(".explorer-search input").fill("engine/llm_engine.py");

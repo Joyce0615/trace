@@ -293,6 +293,15 @@ export const IPC_SCHEMAS = {
     probeId: s.string({ maxLength: 128 }),
     choiceId: s.string({ maxLength: 64 }),
   }),
+  "quiz:build": s.object({
+    repository: repositoryReference,
+    symbol: s.string({ maxLength: 200, optional: true }),
+  }),
+  "quiz:grade": s.object({
+    repository: repositoryReference,
+    quizId: s.string({ maxLength: 128 }),
+    submission: s.string({ maxLength: 16_000, minLength: 1 }),
+  }),
   "learning:schedule": s.object({
     repository: repositoryReference,
     skillGraph: s.opaque(),

@@ -1,4 +1,4 @@
-import type { Architecture, DiagnosisReport, EvaluationReport, EvidenceImport, HistorySummary, Lesson, ProbeGrade, ReviewPlan, ReviewResult, SymbolFlow, CallChain, LocalizationExercise, LocalizationHint, LocalizationScore, PredictionExercise, PredictionGrade, RaceReport, RaceTask, TraceRunResult, TraceRuntime } from "./types";
+import type { Architecture, DiagnosisReport, EvaluationReport, EvidenceImport, ExecutableQuiz, HistorySummary, Lesson, ProbeGrade, QuizGrade, ReviewPlan, ReviewResult, SymbolFlow, CallChain, LocalizationExercise, LocalizationHint, LocalizationScore, PredictionExercise, PredictionGrade, RaceReport, RaceTask, TraceRunResult, TraceRuntime } from "./types";
 
 /**
  * Exercise state shapes.
@@ -100,3 +100,13 @@ export const emptyScheduleState: ScheduleState = { plan: null, lastReview: null,
 export const emptyChainState: ChainState = { chains: [], exercises: [], activeChain: null, choice: {}, grades: {}, status: "idle" };
 export const emptyLocalizationState: LocalizationState = { exercise: null, trailStart: 0, selected: [], hints: [], score: null, error: null };
 export const emptyReviewState: ReviewState = { task: null, understanding: "", plan: "", files: [], report: null, error: null };
+
+export type ExecutableQuizState = {
+  quiz: ExecutableQuiz | null;
+  submission: string;
+  grade: QuizGrade | null;
+  busy: boolean;
+  status: "idle" | "loading" | "ready" | "unavailable" | "error";
+};
+
+export const emptyExecutableQuizState: ExecutableQuizState = { quiz: null, submission: "", grade: null, busy: false, status: "idle" };

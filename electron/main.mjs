@@ -24,6 +24,7 @@ import { buildSearchIndex, search } from "./search.mjs";
 import { runEvaluation } from "./evaluation.mjs";
 import { detectMisconceptions, diagnoseLearner, gradeProbe } from "./misconception.mjs";
 import { applyReview, reviewPlan } from "./spaced-repetition.mjs";
+import { buildExecutableQuiz, gradeSubmission, publicQuiz } from "./executable-quiz.mjs";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const openedRepositories = new Map();
@@ -34,6 +35,7 @@ const localizationExercises = new Map();
 const raceTasks = new Map();
 const searchIndexes = new Map();
 const learnerProbes = new Map();
+const executableQuizzes = new Map();
 
 function openedRepository(candidate) {
   const repository = candidate?.id ? openedRepositories.get(candidate.id) : null;
@@ -420,6 +422,39 @@ const ipcHandlers = {
     const probe = learnerProbes.get(repository.id)?.[request.probeId];
     if (!probe) throw new Error("That probe is not active for this repository.");
     return gradeProbe(probe, request.choiceId);
+  },
+
+  "quiz:build": async (_event, request) => {
+    const repository = openedRepository(request.repository);
+    // Only Python files that could hold a self-contained function are read, so
+    // building a quiz never turns into a whole-repository read.
+    const sources = {};
+    const indexedFunctionFiles = new Set(
+      (repository.symbols ?? []).filter((symbol) => symbol.kind === "function").map((symbol) => symbol.path),
+    );
+    // Only Python files that the index actually analyzed, most important first,
+    // so a quiz anchor is always openable and building never reads the whole tree.
+    const candidates = repository.files
+      .filter((file) => file.path.endsWith(".py") && file.size < 120_000 && indexedFunctionFiles.has(file.path))
+      .sort((left, right) => (right.importance ?? 0) - (left.importance ?? 0))
+      .slice(0, 200);
+    for (const file of candidates) {
+      try {
+        sources[file.path] = await readRepositoryFile(repository.rootPath, file.path);
+      } catch {
+        // A file that cannot be read simply yields no quiz candidate.
+      }
+    }
+    const quiz = await buildExecutableQuiz(repository, { sources, symbol: request.symbol });
+    if (quiz.available) executableQuizzes.set(repository.id, quiz);
+    return publicQuiz(quiz);
+  },
+
+  "quiz:grade": async (_event, request) => {
+    const repository = openedRepository(request.repository);
+    const quiz = executableQuizzes.get(repository.id);
+    if (!quiz || quiz.id !== request.quizId) throw new Error("That quiz is not active for this repository.");
+    return gradeSubmission(quiz, request.submission);
   },
 
   "learning:schedule": (_event, request) => {

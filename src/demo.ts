@@ -681,6 +681,27 @@ export const browserBridge: TraceBridge = {
     if (!probe) throw new Error("That probe is not active for this repository.");
     return model.gradeProbe(probe, request.choiceId);
   },
+  async buildQuiz() {
+    // The browser has no interpreter and no sandbox; saying so is more useful
+    // than pretending to run the learner's code.
+    return {
+      available: false,
+      version: 1,
+      reason: "Executable quizzes run learner-written code in a resource-limited local sandbox, which needs the desktop app.",
+    };
+  },
+  async gradeQuiz(request) {
+    return {
+      version: 1,
+      quizId: request.quizId,
+      status: "unavailable" as const,
+      passed: false,
+      reason: "Executable quizzes need the desktop app's sandbox.",
+      passedCases: 0,
+      totalCases: 0,
+      cases: [],
+    };
+  },
   async reviewPlan(request) {
     // The demo runs the same scheduler as the desktop app, so it cannot drift.
     const scheduler = await import("../electron/spaced-repetition.mjs");

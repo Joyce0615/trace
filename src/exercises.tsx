@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Icon, bridge, readableError, repositoryRef } from "./shell";
 import type { Course, LearnerState, Lesson, PredictionExercise, Repository, ReviewGradeId, SkillGraph } from "./types";
-import type { ArchitectureState, ChainState, DiagnosisState, EvaluationState, EvidenceState, HistoryState, LocalizationState, ReviewState, ScheduleState, TraceState } from "./exercise-state";
+import type { ArchitectureState, ChainState, DiagnosisState, EvaluationState, EvidenceState, ExecutableQuizState, HistoryState, LocalizationState, ReviewState, ScheduleState, TraceState } from "./exercise-state";
 
 /**
  * Exercise, visualization, quality, and diagnosis panels (items 26-36).
@@ -664,6 +664,79 @@ export function SchedulePanel({ repository, skillGraph, learnerState, state, onS
           <polyline points={curve.points.map((point) => `${(point.day / curve.horizonDays) * 100},${32 - point.retention * 30}`).join(" ")} />
         </svg>
         <small>Recall falls to {Math.round(plan.parameters.targetRetention * 100)}% after {curve.dueDay} day{curve.dueDay === 1 ? "" : "s"}.</small>
+      </div>}
+    </>}
+  </section>;
+}
+
+/**
+ * Executable quizzes (item 37). The learner writes the function; hidden tests
+ * recorded from the repository's own implementation decide whether it is right.
+ * Only the worked example carries an expected value — the hidden oracle stays in
+ * the main process, so it cannot be read out of the DOM.
+ */
+export function ExecutableQuizPanel({ repository, state, onState, onAnchor }: {
+  repository: Repository;
+  state: ExecutableQuizState;
+  onState: (update: Partial<ExecutableQuizState>) => void;
+  onAnchor: (path: string, line: number) => void;
+}) {
+  const { quiz, submission, grade, busy, status } = state;
+  const build = async () => {
+    onState({ status: "loading", grade: null });
+    try {
+      const next = await bridge.buildQuiz({ repository: repositoryRef(repository) });
+      onState({ quiz: next, submission: next.starter ?? "", status: next.available ? "ready" : "unavailable" });
+    } catch {
+      onState({ status: "error" });
+    }
+  };
+  const submit = async () => {
+    if (!quiz?.id) return;
+    onState({ busy: true });
+    try {
+      onState({ grade: await bridge.gradeQuiz({ repository: repositoryRef(repository), quizId: quiz.id, submission }), busy: false });
+    } catch (cause) {
+      onState({ busy: false, grade: null, status: "error" });
+      void readableError(cause);
+    }
+  };
+
+  return <section className="quiz-panel" data-status={status}>
+    <div className="quiz-head">
+      <span>EXECUTABLE QUIZ</span>
+      <button className="ghost" disabled={status === "loading"} onClick={() => void build()}>{status === "loading" ? "Building…" : quiz ? "New quiz" : "Build a quiz"}</button>
+    </div>
+    {status === "unavailable" && <p className="quiz-note" data-reason="unavailable">{quiz?.reason}</p>}
+    {status === "error" && <p className="quiz-note">The quiz sandbox is unavailable for this repository.</p>}
+    {quiz?.available && <>
+      <p className="quiz-prompt">{quiz.prompt}</p>
+      {quiz.anchor && <button className="quiz-anchor" onClick={() => onAnchor(quiz.anchor!.path, quiz.anchor!.line)}>{quiz.anchor.path}:{quiz.anchor.line}</button>}
+      {quiz.docstring && <blockquote className="quiz-doc">{quiz.docstring}</blockquote>}
+      <div className="quiz-example" data-case={quiz.example?.id}>
+        <span>WORKED EXAMPLE</span>
+        <code>{quiz.entry}({(quiz.example?.arguments ?? []).map((value) => JSON.stringify(value)).join(", ")}) → {quiz.example?.expected}</code>
+      </div>
+      <div className="quiz-hidden" data-hidden={quiz.hiddenCases?.length ?? 0}>
+        {(quiz.hiddenCases ?? []).map((item) => <span key={item.id} data-case={item.id}>{item.name}</span>)}
+      </div>
+      <textarea className="quiz-editor" spellCheck={false} value={submission} onChange={(event) => onState({ submission: event.target.value })} />
+      <div className="quiz-actions">
+        <button className="primary" disabled={busy || !submission.trim()} onClick={() => void submit()}>{busy ? "Running in the sandbox…" : "Run hidden tests"}</button>
+        <small>{quiz.limits?.cpuSeconds}s CPU · {Math.round((quiz.limits?.memoryBytes ?? 0) / 1_048_576)} MB · no network, no file writes</small>
+      </div>
+      {grade && <div className="quiz-grade" data-status={grade.status} data-passed={String(grade.passed)}>
+        <strong>{grade.status === "ran" ? `${grade.passedCases}/${grade.totalCases} tests passed` : grade.reason}</strong>
+        {grade.status === "ran" && <small data-hidden-passed={grade.hiddenPassed}>{grade.hiddenPassed}/{grade.hiddenTotal} hidden · {Math.round(grade.durationMs ?? 0)} ms</small>}
+        {(grade.findings ?? []).map((finding) => <em key={finding.id} data-finding={finding.id}>{finding.reason}</em>)}
+        <div className="quiz-cases">
+          {grade.cases.map((item) => <div key={item.id} className="quiz-case" data-case={item.id} data-passed={String(item.passed)} data-outcome={item.outcome}>
+            <span>{item.name}</span>
+            <code>({item.arguments.map((value) => JSON.stringify(value)).join(", ")})</code>
+            {item.visible && item.expected !== undefined && <em>expected {item.expected}{item.actual !== undefined ? `, got ${item.actual}` : ""}</em>}
+            {item.error && <em className="quiz-error">{item.error}</em>}
+          </div>)}
+        </div>
       </div>}
     </>}
   </section>;

@@ -20,6 +20,7 @@ import { SECRET_SCANNER_VERSION, anonymizePath, redact, redactValue, scanText, s
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
 import { GIT_HISTORY_VERSION, busFactor, historyLessons, historySummary, parseHistory, readCommits } from "../electron/git-history.mjs";
 import { MISCONCEPTIONS, MISCONCEPTION_VERSION, buildProbe, calibrateSkill, detectMisconceptions, diagnoseLearner, gradeProbe } from "../electron/misconception.mjs";
+import { DEFAULT_SANDBOX_LIMITS, EXECUTABLE_QUIZ_VERSION, buildExecutableQuiz, candidateValues, gradeSubmission, parseSignature, probeArguments, publicQuiz, runInSandbox, screenSubmission, selectCases, selfContainedFunctions } from "../electron/executable-quiz.mjs";
 import { DEFAULT_SCHEDULER, REVIEW_GRADE_IDS, SPACED_REPETITION_VERSION, applyReview, decayedMastery, forgettingCurve, gradeReview, intervalForRetention, retention, reviewPlan, scheduleSkill } from "../electron/spaced-repetition.mjs";
 import { EVALUATION_VERSION, evaluateLessons, evaluateRetrieval, evaluateTutorAnswer, runEvaluation } from "../electron/evaluation.mjs";
 import { EMBEDDING_DIMENSIONS, SEARCH_VERSION, buildSearchIndex, cosine, editDistance, embed, search, similarityScore, subsequenceScore, tokenize } from "../electron/search.mjs";
@@ -746,7 +747,8 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
     "exercise:localization", "exercise:localization-hint", "exercise:localization-score",
     "grade:race-task", "grade:race", "trace:runtimes", "trace:run",
     "graph:architecture", "graph:symbol-flow", "history:summary", "evidence:import", "search:query", "eval:run",
-    "learning:diagnose", "learning:probe", "learning:schedule", "learning:review", "agents:ask",
+    "learning:diagnose", "learning:probe", "learning:schedule", "learning:review",
+    "quiz:build", "quiz:grade", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
   assert.throws(() => schemaFor("repository:evil"), /is not a registered IPC channel/);
@@ -2674,4 +2676,209 @@ test("spaced repetition decays mastery and schedules reviews on the forgetting c
   await saveLearnerState(learningDirectory, { ...realReviewed.learnerState, repositoryId: repository.id });
   const reloaded = await loadLearnerState(learningDirectory, repository.id);
   assert.deepEqual(reloaded.mastery[realPlan.queue[0].skillId].review, realReviewed.learnerState.mastery[realPlan.queue[0].skillId].review);
+});
+
+test("executable quizzes hide their oracle and run inside a bounded sandbox", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-quiz-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "app"), { recursive: true });
+  await writeFile(path.join(rootPath, "app", "__init__.py"), "");
+  const tokensSource = [
+    "def normalize(text, keep_case=False):",
+    '    """Collapse runs of whitespace, optionally preserving case."""',
+    '    parts = [piece for piece in text.split(" ") if piece]',
+    '    joined = " ".join(parts)',
+    "    if keep_case:",
+    "        return joined",
+    "    return joined.lower()",
+    "",
+    "",
+    "def shout(text):",
+    "    return text.upper() + '!'",
+    "",
+    "",
+    "def constant(value):",
+    "    return 1",
+    "",
+    "",
+    "def needs_the_world(value):",
+    "    return HELPER_TABLE[value]",
+    "",
+  ].join("\n");
+  await writeFile(path.join(rootPath, "app", "tokens.py"), `${tokensSource}\n`);
+  await writeFile(path.join(rootPath, "app", "main.py"), "from app.tokens import normalize\n\n\ndef run(text):\n    return normalize(text)\n");
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const sources = { "app/tokens.py": tokensSource, "app/main.py": await readRepositoryFile(rootPath, "app/main.py") };
+  assert.equal(EXECUTABLE_QUIZ_VERSION, 1);
+
+  // --- Candidate selection -------------------------------------------------
+  const candidates = selfContainedFunctions(repository, sources);
+  const names = candidates.map((candidate) => candidate.name);
+  assert.ok(names.includes("normalize") && names.includes("shout") && names.includes("constant"), names.join(","));
+  // A function that reaches outside itself cannot be lifted into a sandbox.
+  assert.equal(names.includes("needs_the_world"), false, "a free variable must disqualify a candidate");
+  // Functions the repository actually calls come first.
+  assert.equal(names[0], "normalize", names.join(","));
+  assert.equal(candidates.find((candidate) => candidate.name === "normalize").callers, 1);
+  assert.equal(candidates.find((candidate) => candidate.name === "normalize").docstring, "Collapse runs of whitespace, optionally preserving case.");
+
+  assert.deepEqual(parseSignature("def f(a, b: int = 3, c: str = 'x'):"), {
+    name: "f",
+    parameters: [
+      { name: "a", annotation: null, defaultValue: null },
+      { name: "b", annotation: "int", defaultValue: "3" },
+      { name: "c", annotation: "str", defaultValue: "'x'" },
+    ],
+    returnAnnotation: null,
+  });
+  assert.equal(parseSignature("def f(*args):"), null, "variadic signatures cannot be probed");
+  assert.equal(parseSignature("x = 1"), null);
+  // Types come from the annotation, then the default, then the parameter name.
+  assert.deepEqual(candidateValues({ name: "anything", annotation: "int", defaultValue: null }).slice(0, 3), [0, 1, 2]);
+  assert.deepEqual(candidateValues({ name: "anything", annotation: null, defaultValue: "True" }), [true, false]);
+  assert.ok(candidateValues({ name: "text", annotation: null, defaultValue: null }).includes("abc"));
+  assert.ok(candidateValues({ name: "count", annotation: null, defaultValue: null }).includes(7));
+  assert.equal(probeArguments([{ name: "n" }], 5).length, 5);
+  assert.ok(probeArguments([{ name: "n" }, { name: "flag" }], 12).every((tuple) => tuple.length === 2));
+
+  // --- The static screen runs before any process exists --------------------
+  assert.equal(screenSubmission("def f(x):\n    return x + 1\n", { entry: "f" }).allowed, true);
+  const refused = screenSubmission("import subprocess\ndef f(x):\n    return subprocess.run(['ls'])\n", { entry: "f" });
+  assert.equal(refused.allowed, false);
+  assert.ok(refused.findings.some((finding) => finding.id === "process-spawn"), JSON.stringify(refused.findings));
+  assert.ok(screenSubmission("def f(x):\n    return open('/etc/passwd').read()\n", { entry: "f" }).findings.some((finding) => finding.id === "filesystem"));
+  assert.ok(screenSubmission("def f(x):\n    return eval('1+1')\n", { entry: "f" }).findings.some((finding) => finding.id === "dynamic-code"));
+  assert.ok(screenSubmission("def f(x):\n    return ().__class__.__bases__\n", { entry: "f" }).findings.some((finding) => finding.id === "introspection-escape"));
+  assert.ok(screenSubmission("def g(x):\n    return x\n", { entry: "f" }).findings.some((finding) => finding.id === "missing-entry"));
+  // A docstring that merely mentions a forbidden module is not an attempt to use it.
+  assert.equal(screenSubmission('def f(x):\n    """Unlike subprocess, this opens nothing."""\n    return x\n', { entry: "f" }).allowed, true);
+
+  const runtimes = await detectRuntimes();
+  if (!runtimes.python?.available) {
+    // Without an interpreter the feature must degrade, not fail.
+    const unavailable = await buildExecutableQuiz(repository, { sources });
+    assert.equal(unavailable.available, false);
+    assert.match(unavailable.reason, /Python runtime/);
+    return;
+  }
+
+  // --- The sandbox actually enforces its limits ----------------------------
+  const network = await runInSandbox({ moduleSource: "def f(n):\n    import socket\n    return socket.socket()\n", entry: "f", calls: [[1]] });
+  assert.equal(network.status, "ok");
+  assert.equal(network.results[0].ok, false);
+  assert.match(network.results[0].error, /Importing 'socket' is not allowed/);
+  const fileWrite = await runInSandbox({ moduleSource: "def f(n):\n    return open('/tmp/trace-quiz-escape.txt', 'w')\n", entry: "f", calls: [[1]] });
+  assert.equal(fileWrite.results[0].ok, false);
+  assert.match(fileWrite.results[0].error, /not allowed inside the quiz sandbox/);
+  await assert.rejects(access("/tmp/trace-quiz-escape.txt"), "the sandbox must not have created a file");
+  const allowed = await runInSandbox({ moduleSource: "def f(n):\n    import math\n    return math.floor(n)\n", entry: "f", calls: [[2.7]] });
+  assert.deepEqual(allowed.results[0], { index: 0, ok: true, value: "2" }, "allowlisted modules still work");
+  // CPU time is bounded by a real rlimit, not by hope.
+  const spin = await runInSandbox(
+    { moduleSource: "def f(n):\n    total = 0\n    while True:\n        total += 1\n    return total\n", entry: "f", calls: [[1]] },
+    { limits: { cpuSeconds: 1, wallClockMs: 20_000 } },
+  );
+  assert.equal(spin.status, "cpu", JSON.stringify(spin).slice(0, 300));
+  assert.equal(spin.enforced.cpu, "rlimit");
+  // Memory is bounded by whichever mechanism this platform actually honors.
+  const greedy = await runInSandbox(
+    { moduleSource: "def f(n):\n    return len(bytearray(n))\n", entry: "f", calls: [[900_000_000]] },
+    { limits: { memoryBytes: 128 * 1024 * 1024, wallClockMs: 20_000 } },
+  );
+  assert.equal(greedy.status, "memory", JSON.stringify(greedy).slice(0, 300));
+  assert.ok(["rlimit", "watchdog"].includes(greedy.enforced.memory));
+  // Wall-clock time is bounded by the parent even if the child ignores signals.
+  const sleeper = await runInSandbox(
+    { moduleSource: "def f(n):\n    import datetime\n    end = datetime.datetime.now() + datetime.timedelta(seconds=30)\n    while datetime.datetime.now() < end:\n        pass\n    return 1\n", entry: "f", calls: [[1]] },
+    { limits: { wallClockMs: 1_200, cpuSeconds: 60 } },
+  );
+  assert.ok(["timeout", "cpu"].includes(sleeper.status), JSON.stringify(sleeper).slice(0, 300));
+  // Broken code is a result, not an exception.
+  assert.equal((await runInSandbox({ moduleSource: "def f(:\n", entry: "f", calls: [[1]] })).status, "syntax-error");
+  assert.equal((await runInSandbox({ moduleSource: "value = 1\n", entry: "f", calls: [[1]] })).status, "no-entry");
+
+  // --- Building a quiz from the real implementation ------------------------
+  const quiz = await buildExecutableQuiz(repository, { sources });
+  assert.equal(quiz.available, true, quiz.reason);
+  assert.equal(quiz.entry, "normalize");
+  assert.equal(quiz.path, "app/tokens.py");
+  assert.equal(quiz.anchor.symbol, "normalize");
+  assert.equal(quiz.language, "python");
+  assert.ok(quiz.cases.length >= 5, String(quiz.cases.length));
+  assert.equal(quiz.cases.filter((item) => item.visible).length, 1);
+  // The oracle discriminates: several distinct outputs, so a constant answer fails.
+  assert.ok(new Set(quiz.cases.map((item) => item.expected)).size >= 3, JSON.stringify(quiz.cases.map((item) => item.expected)));
+  // The worked example is not a degenerate empty case.
+  assert.ok(!["''", "[]", "None", "0"].includes(quiz.cases[0].expected), quiz.cases[0].expected);
+  // A constant function is refused as a quiz because nothing could fail it.
+  const constantOnly = await buildExecutableQuiz(repository, { sources: { "app/tokens.py": tokensSource }, symbol: "constant" });
+  assert.equal(constantOnly.available, false);
+  assert.ok(constantOnly.rejectedCandidates.some((entry) => entry.name === "constant" && entry.reason === "not-discriminating"), JSON.stringify(constantOnly.rejectedCandidates));
+
+  // --- The oracle never reaches the renderer -------------------------------
+  const shipped = publicQuiz(quiz);
+  const serialized = JSON.stringify(shipped);
+  assert.equal(shipped.hiddenCases.length, quiz.cases.length - 1);
+  assert.ok(shipped.hiddenCases.every((item) => Object.keys(item).sort().join(",") === "id,name"));
+  assert.equal(shipped.cases, undefined);
+  for (const hidden of quiz.cases.slice(1)) {
+    assert.equal(serialized.includes(JSON.stringify(hidden.arguments)), false, `hidden input ${JSON.stringify(hidden.arguments)} leaked`);
+  }
+  assert.ok(shipped.example.expected === quiz.cases[0].expected, "the worked example does carry its answer");
+
+  // --- Grading -------------------------------------------------------------
+  const correct = await gradeSubmission(quiz, `${tokensSource.split("\n\n\n")[0]}\n`);
+  assert.equal(correct.status, "ran");
+  assert.equal(correct.passed, true, JSON.stringify(correct.cases.filter((item) => !item.passed)));
+  assert.equal(correct.passedCases, quiz.cases.length);
+  assert.equal(correct.hiddenPassed, correct.hiddenTotal);
+  assert.equal(correct.score, 1);
+  assert.equal(correct.enforced.cpu, "rlimit");
+  assert.equal(correct.enforced.fileWrite, "rlimit");
+
+  // A plausible-but-wrong implementation: keeps case unconditionally.
+  const wrong = await gradeSubmission(quiz, 'def normalize(text, keep_case=False):\n    return " ".join([p for p in text.split(" ") if p])\n');
+  assert.equal(wrong.status, "ran");
+  assert.equal(wrong.passed, false);
+  assert.ok(wrong.passedCases > 0 && wrong.passedCases < wrong.totalCases, `${wrong.passedCases}/${wrong.totalCases}`);
+  assert.ok(wrong.cases.some((item) => item.outcome === "wrong-value"));
+  // A failing hidden case reveals its input as a hint but never its answer.
+  const failedHidden = wrong.cases.find((item) => !item.visible && !item.passed);
+  assert.ok(failedHidden, "expected at least one failing hidden case");
+  assert.ok(Array.isArray(failedHidden.arguments));
+  assert.equal(failedHidden.expected, undefined, "a hidden expected value must never be returned");
+  assert.equal(failedHidden.actual, undefined);
+  assert.ok(wrong.cases.filter((item) => !item.visible).every((item) => item.expected === undefined && item.actual === undefined));
+  const gradeText = JSON.stringify(wrong);
+  const visibleExpected = quiz.cases[0].expected;
+  for (const hidden of quiz.cases.slice(1)) {
+    // Only values the worked example does not already reveal can count as a leak.
+    if (hidden.expected === visibleExpected) continue;
+    assert.equal(gradeText.includes(JSON.stringify(hidden.expected)), false, `hidden expected ${hidden.expected} leaked into the grade`);
+  }
+
+  // A constant answer cannot pass, which is what the discrimination gate buys.
+  const lazy = await gradeSubmission(quiz, "def normalize(text, keep_case=False):\n    return ''\n");
+  assert.equal(lazy.passed, false);
+  assert.ok(lazy.passedCases < quiz.cases.length);
+
+  // Refusals, crashes, and loops are all reported without running or hanging.
+  const hostile = await gradeSubmission(quiz, "import subprocess\ndef normalize(text, keep_case=False):\n    return subprocess.run(['id'])\n");
+  assert.equal(hostile.status, "refused");
+  assert.equal(hostile.passed, false);
+  assert.deepEqual(hostile.cases, []);
+  assert.ok(hostile.findings.some((finding) => finding.id === "process-spawn"));
+  const raises = await gradeSubmission(quiz, "def normalize(text, keep_case=False):\n    raise ValueError('nope')\n");
+  assert.equal(raises.status, "ran");
+  assert.equal(raises.passedCases, 0);
+  assert.ok(raises.cases.every((item) => item.outcome === "raised"));
+  assert.match(raises.cases[0].error, /ValueError: nope/);
+  assert.equal((await gradeSubmission(quiz, "def normalize(:\n")).status, "syntax-error");
+  assert.equal((await gradeSubmission(quiz, "x".repeat(20_000))).status, "refused");
+  const looping = await gradeSubmission(quiz, "def normalize(text, keep_case=False):\n    while True:\n        pass\n", { limits: { cpuSeconds: 1, wallClockMs: 20_000 } });
+  assert.equal(looping.status, "cpu");
+  assert.equal(looping.passed, false);
 });

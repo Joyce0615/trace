@@ -833,6 +833,57 @@ export interface ProbeGrade {
   anchor: CodeAnchor | null;
 }
 
+export interface ExecutableQuiz {
+  available: boolean;
+  version: number;
+  reason?: string;
+  id?: string;
+  language?: "python";
+  entry?: string;
+  anchor?: CodeAnchor;
+  header?: string;
+  docstring?: string | null;
+  callers?: number;
+  prompt?: string;
+  starter?: string;
+  limits?: { wallClockMs: number; cpuSeconds: number; memoryBytes: number; maxSubmissionBytes: number };
+  allowedModules?: string[];
+  example?: { id: string; arguments: unknown[]; expected: string };
+  hiddenCases?: Array<{ id: string; name: string }>;
+}
+
+export interface QuizCaseResult {
+  id: string;
+  name: string;
+  visible: boolean;
+  passed: boolean;
+  arguments: unknown[];
+  expected?: string;
+  actual?: string;
+  outcome: "passed" | "wrong-value" | "raised" | "no-result";
+  error?: string;
+}
+
+export interface QuizGrade {
+  version: number;
+  quizId: string;
+  status: "ran" | "refused" | "timeout" | "cpu" | "memory" | "syntax-error" | "no-entry" | "error" | "failed" | "unavailable";
+  passed: boolean;
+  reason?: string;
+  findings?: Array<{ id: string; reason: string }>;
+  passedCases: number;
+  totalCases: number;
+  hiddenPassed?: number;
+  hiddenTotal?: number;
+  score?: number;
+  durationMs?: number;
+  peakMemoryBytes?: number;
+  enforced?: Record<string, string>;
+  stdout?: string;
+  stderr?: string;
+  cases: QuizCaseResult[];
+}
+
 export type ReviewGradeId = "again" | "hard" | "good" | "easy";
 
 export interface ReviewSchedulingState {
@@ -969,6 +1020,8 @@ export interface TraceBridge {
   evaluate(request: { repository: RepositoryRef; course?: Course; skillGraph?: SkillGraph; answers?: unknown[]; sampleSize?: number }): Promise<EvaluationReport>;
   diagnose(request: { repository: RepositoryRef; skillGraph: SkillGraph; learnerState: LearnerState; text?: string }): Promise<DiagnosisReport>;
   answerProbe(request: { repository: RepositoryRef; probeId: string; choiceId: string }): Promise<ProbeGrade>;
+  buildQuiz(request: { repository: RepositoryRef; symbol?: string }): Promise<ExecutableQuiz>;
+  gradeQuiz(request: { repository: RepositoryRef; quizId: string; submission: string }): Promise<QuizGrade>;
   reviewPlan(request: { repository: RepositoryRef; skillGraph: SkillGraph; learnerState: LearnerState; now?: string; dailyLimit?: number }): Promise<ReviewPlan>;
   recordReview(request: { repository: RepositoryRef; skillGraph: SkillGraph; learnerState: LearnerState; skillId: string; grade: ReviewGradeId; now?: string }): Promise<{ learnerState: LearnerState; review: ReviewResult; plan: ReviewPlan }>;
   askAgent(request: {
