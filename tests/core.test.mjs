@@ -20,6 +20,7 @@ import { SECRET_SCANNER_VERSION, anonymizePath, redact, redactValue, scanText, s
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
 import { GIT_HISTORY_VERSION, busFactor, historyLessons, historySummary, parseHistory, readCommits } from "../electron/git-history.mjs";
 import { MISCONCEPTIONS, MISCONCEPTION_VERSION, buildProbe, calibrateSkill, detectMisconceptions, diagnoseLearner, gradeProbe } from "../electron/misconception.mjs";
+import { EXPLANATION_GRADER_VERSION, buildExplanationTask, checkCitations, claimsFailure, gradeExplanation, isNamedFunction, mentionedSymbols, publicExplanationTask } from "../electron/explanation-grader.mjs";
 import { DEFAULT_SANDBOX_LIMITS, EXECUTABLE_QUIZ_VERSION, buildExecutableQuiz, candidateValues, gradeSubmission, parseSignature, probeArguments, publicQuiz, runInSandbox, screenSubmission, selectCases, selfContainedFunctions } from "../electron/executable-quiz.mjs";
 import { DEFAULT_SCHEDULER, REVIEW_GRADE_IDS, SPACED_REPETITION_VERSION, applyReview, decayedMastery, forgettingCurve, gradeReview, intervalForRetention, retention, reviewPlan, scheduleSkill } from "../electron/spaced-repetition.mjs";
 import { EVALUATION_VERSION, evaluateLessons, evaluateRetrieval, evaluateTutorAnswer, runEvaluation } from "../electron/evaluation.mjs";
@@ -748,7 +749,7 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
     "grade:race-task", "grade:race", "trace:runtimes", "trace:run",
     "graph:architecture", "graph:symbol-flow", "history:summary", "evidence:import", "search:query", "eval:run",
     "learning:diagnose", "learning:probe", "learning:schedule", "learning:review",
-    "quiz:build", "quiz:grade", "agents:ask",
+    "quiz:build", "quiz:grade", "explain:task", "explain:grade", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
   assert.throws(() => schemaFor("repository:evil"), /is not a registered IPC channel/);
@@ -2881,4 +2882,166 @@ test("executable quizzes hide their oracle and run inside a bounded sandbox", as
   const looping = await gradeSubmission(quiz, "def normalize(text, keep_case=False):\n    while True:\n        pass\n", { limits: { cpuSeconds: 1, wallClockMs: 20_000 } });
   assert.equal(looping.status, "cpu");
   assert.equal(looping.passed, false);
+});
+
+test("explanations are graded against what the run actually did", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-explain-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "app"), { recursive: true });
+  await writeFile(path.join(rootPath, "app", "__init__.py"), "");
+  // `dormant` is indexed and sits next to the traced code, but the run never
+  // enters it, which is exactly the over-claim the grader has to catch.
+  await writeFile(path.join(rootPath, "app", "pipeline.py"), [
+    "def sanitize(value):",
+    "    return value.strip()",
+    "",
+    "",
+    "def enrich(value):",
+    "    return sanitize(value) + '!'",
+    "",
+    "",
+    "def handle(value):",
+    "    return enrich(value)",
+    "",
+    "",
+    "def dormant(value):",
+    "    return value * 2",
+    "",
+  ].join("\n"));
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  assert.equal(EXPLANATION_GRADER_VERSION, 1);
+
+  const runtimes = await detectRuntimes();
+  if (!runtimes.python?.available) {
+    assert.equal(buildExplanationTask(repository, null).available, false);
+    return;
+  }
+
+  const trace = await runExecutionTrace(repository, {
+    language: "python",
+    snippet: "import app.pipeline as p\nprint(p.handle('  hi  '))\n",
+  });
+  assert.equal(trace.status, "ok", JSON.stringify({ error: trace.error, stderr: trace.stderr }));
+  const summary = summarizeTrace(trace, repository);
+  const task = buildExplanationTask(repository, summary);
+  assert.equal(task.available, true);
+  // The entry point is the frame nothing called, not merely the busiest one.
+  assert.equal(task.entry.name, "handle");
+  assert.equal(task.anchor.path, "app/pipeline.py");
+  assert.deepEqual(task.observed.order, ["handle", "enrich", "sanitize"], JSON.stringify(task.observed.order));
+  assert.equal(task.observed.raised, false);
+  assert.equal(task.observed.returnValue.value, "'hi!'");
+  assert.ok(task.neighborhood.includes("dormant"), "the dormant sibling must be known so an over-claim is detectable");
+
+  // --- Nothing about the run reaches the renderer before the answer --------
+  const shipped = publicExplanationTask(task);
+  const serialized = JSON.stringify(shipped);
+  assert.equal(shipped.observed, undefined);
+  assert.equal(shipped.neighborhood, undefined);
+  assert.equal(serialized.includes("sanitize"), false, "the observed call order leaked into the shipped task");
+  assert.equal(serialized.includes("hi!"), false, "the observed return value leaked into the shipped task");
+  assert.equal(shipped.criteria.length, 7);
+  assert.equal(round4(shipped.criteria.reduce((sum, criterion) => sum + criterion.weight, 0)), 1);
+
+  // --- A correct explanation ----------------------------------------------
+  const good = gradeExplanation(task, [
+    "The run starts in `handle`, defined at app/pipeline.py:9, which immediately",
+    "delegates to `enrich`. `enrich` calls `sanitize` first to strip the surrounding",
+    "whitespace, then appends an exclamation mark to whatever came back. Nothing",
+    "raises, so the call returns normally and the final value that comes back out",
+    "of handle is 'hi!' which is what gets printed.",
+  ].join(" "), repository);
+  assert.equal(good.band, "expert", JSON.stringify({ score: good.score, criteria: good.criteria.filter((item) => !item.passed) }));
+  assert.ok(good.score > 0.9, String(good.score));
+  assert.equal(good.coverage, 1);
+  assert.equal(good.orderAccuracy, 1);
+  assert.deepEqual(good.missed, []);
+  assert.deepEqual(good.unsupported, []);
+  assert.deepEqual(good.contradictions, []);
+  assert.equal(good.criteria.find((item) => item.id === "cites-source").passed, true);
+  assert.ok(good.citations.some((citation) => citation.path === "app/pipeline.py" && citation.valid));
+
+  // --- Fluent but contradicted by the run ---------------------------------
+  // Right vocabulary, wrong order, and a function that never ran.
+  const wrongOrder = gradeExplanation(task, [
+    "When it executes, `sanitize` runs first and hands its result to `enrich`,",
+    "which finally calls `handle` to assemble the response. Along the way",
+    "`dormant` doubles the value before anything is returned, and the whole",
+    "thing raises a ValueError when the input has leading whitespace.",
+  ].join(" "), repository);
+  assert.equal(wrongOrder.criteria.find((item) => item.id === "call-order").passed, false);
+  assert.equal(wrongOrder.orderAccuracy, 0, String(wrongOrder.orderAccuracy));
+  assert.deepEqual(wrongOrder.unsupported, ["dormant"]);
+  assert.equal(wrongOrder.criteria.find((item) => item.id === "no-unobserved").passed, false);
+  // Inventing a failure in a run that succeeded is a contradiction, not a style note.
+  assert.equal(wrongOrder.criteria.find((item) => item.id === "error-path").passed, false);
+  assert.ok(wrongOrder.contradictions.some((item) => /dormant runs/.test(item.claim)), JSON.stringify(wrongOrder.contradictions));
+  assert.ok(wrongOrder.contradictions.some((item) => /the run fails/.test(item.claim)));
+  assert.ok(wrongOrder.contradictions.some((item) => /sanitize before enrich/.test(item.claim)), JSON.stringify(wrongOrder.contradictions.map((item) => item.claim)));
+  assert.ok(wrongOrder.contradictions.every((item) => item.evidence.length > 0));
+  // It still names every function, so a coverage-only grader would have passed it.
+  assert.equal(wrongOrder.coverage, 1);
+  assert.ok(wrongOrder.score < good.score - 0.3, `${wrongOrder.score} vs ${good.score}`);
+  assert.ok(["developing", "novice"].includes(wrongOrder.band), wrongOrder.band);
+
+  // --- Partial coverage ----------------------------------------------------
+  const shallow = gradeExplanation(task, [
+    "`handle` is the entry point and it returns 'hi!' after doing some work on",
+    "the string it was given. That is essentially all there is to it, the rest of",
+    "the module is not involved in this particular call at all as far as I can see.",
+  ].join(" "), repository);
+  assert.ok(shallow.coverage < 0.5, String(shallow.coverage));
+  assert.deepEqual(shallow.missed.sort(), ["enrich", "sanitize"]);
+  assert.equal(shallow.criteria.find((item) => item.id === "return-value").passed, true);
+  assert.equal(shallow.criteria.find((item) => item.id === "names-entry").passed, true);
+  assert.equal(shallow.criteria.find((item) => item.id === "covers-observed").passed, false);
+  assert.ok(shallow.score < good.score);
+  assert.equal(shallow.weakest !== null, true);
+  assert.match(shallow.next, /Strongest gain/);
+
+  // --- Keyword stuffing is capped -----------------------------------------
+  const stuffed = gradeExplanation(task, "handle enrich sanitize 'hi!'", repository);
+  assert.ok(stuffed.lengthFactor < 0.2, String(stuffed.lengthFactor));
+  assert.ok(stuffed.score < 0.2, `keyword stuffing scored ${stuffed.score}`);
+  assert.equal(gradeExplanation(task, "", repository).score, 0);
+
+  // --- The observed run is revealed only by grading ------------------------
+  assert.deepEqual(good.observed.order, task.observed.order);
+  assert.equal(good.observed.returnValue.value, "'hi!'");
+
+  // --- A run that raises ---------------------------------------------------
+  const failing = await runExecutionTrace(repository, {
+    language: "python",
+    snippet: "import app.pipeline as p\nprint(p.handle(None))\n",
+  });
+  const failingTask = buildExplanationTask(repository, summarizeTrace(failing, repository));
+  assert.equal(failingTask.available, true);
+  assert.equal(failingTask.observed.raised, true, JSON.stringify(failingTask.observed));
+  // Omitting the failure is now the contradiction, and describing it is the pass.
+  const silent = gradeExplanation(failingTask, "The call goes through `handle` and then `enrich` and `sanitize` and comes back with a cleaned string that the caller then prints out to the console.", repository);
+  assert.equal(silent.criteria.find((item) => item.id === "error-path").passed, false);
+  assert.ok(silent.contradictions.some((item) => /the run completes/.test(item.claim)), JSON.stringify(silent.contradictions));
+  const honest = gradeExplanation(failingTask, "The call reaches `handle`, which delegates to `enrich`, which calls `sanitize`. Because None has no strip method the call raises an AttributeError there and the exception propagates back out through both callers instead of returning.", repository);
+  assert.equal(honest.criteria.find((item) => item.id === "error-path").passed, true);
+  assert.ok(honest.score > silent.score, `${honest.score} vs ${silent.score}`);
+
+  // --- Degradation ---------------------------------------------------------
+  assert.equal(buildExplanationTask(repository, { callCount: 0, functions: [] }).available, false);
+  assert.match(buildExplanationTask(repository, null).reason, /no calls/);
+  // Helpers behave as documented on their own.
+  assert.deepEqual(mentionedSymbols("first `alpha` then beta() and gamma", ["alpha", "beta", "gamma"]).map((item) => item.name), ["alpha", "beta", "gamma"]);
+  assert.deepEqual(mentionedSymbols("the value is handled carefully", ["handle"]).map((item) => item.name), [], "prose must not become a symbol claim");
+  // A negated mention of failure is not a claim that the run failed.
+  assert.equal(claimsFailure("Nothing raises, so it returns normally."), false);
+  assert.equal(claimsFailure("It never throws for valid input."), false);
+  assert.equal(claimsFailure("The call returns without raising."), false);
+  assert.equal(claimsFailure("It raises a ValueError on bad input."), true);
+  assert.equal(claimsFailure("Nothing raises here. Later it throws an exception."), true, "a negation must not cover a later sentence");
+  assert.equal(claimsFailure("It just returns the value."), false);
+  const checked = checkCitations("see app/pipeline.py:9 and app/missing.py:3", repository);
+  assert.deepEqual(checked.map((item) => item.valid), [true, false]);
+  assert.equal(checked[1].reason, "unknown-file");
 });

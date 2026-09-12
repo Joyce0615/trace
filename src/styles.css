@@ -786,3 +786,37 @@ button { color: inherit; }
 .quiz-case code { color: #7f8b9c; font-size: calc(9px + var(--font-boost)); font-family: "SFMono-Regular", Menlo, monospace; }
 .quiz-case em { margin-left: auto; color: #616b7c; font-style: normal; font-size: calc(9px + var(--font-boost)); }
 .quiz-case em.quiz-error { color: #dfa2a2; }
+
+/* Item 38: explanations graded against traced behavior. */
+.explain-panel { padding: 18px 26px 34px; display: flex; flex-direction: column; gap: 10px; border-top: 1px solid #1a2130; }
+.explain-head { display: flex; align-items: center; gap: 10px; }
+.explain-head span { color: #c8b6ff; font-size: calc(9px + var(--font-boost)); letter-spacing: .14em; }
+.explain-head .ghost { margin-left: auto; padding: 5px 12px; border: 1px solid #262d3d; border-radius: 8px; background: none; color: #93a0b1; font-size: calc(10px + var(--font-boost)); cursor: pointer; }
+.explain-snippet { min-height: 64px; padding: 8px 10px; border: 1px solid #1c2230; border-radius: 8px; background: #0c1017; color: #cbd3df; font-family: "SFMono-Regular", Menlo, monospace; font-size: calc(10px + var(--font-boost)); resize: vertical; outline: none; }
+.explain-note { color: #616b7c; font-size: calc(10px + var(--font-boost)); }
+.explain-prompt { color: #9aa5b5; font-size: calc(10px + var(--font-boost)); }
+.explain-anchor { align-self: flex-start; padding: 3px 8px; border: 1px solid #232a38; border-radius: 6px; background: none; color: #7f8b9c; font-size: calc(9px + var(--font-boost)); cursor: pointer; }
+.explain-rubric { display: flex; flex-direction: column; gap: 3px; list-style: none; }
+.explain-rubric li { display: flex; align-items: baseline; gap: 8px; padding: 3px 8px; border-radius: 6px; background: #10141d; border-left: 2px solid #2a3345; }
+.explain-rubric li[data-passed="true"] { border-left-color: var(--green); }
+.explain-rubric li[data-passed="false"] { border-left-color: #b4585d; }
+.explain-rubric strong { color: #c3cbd8; font-size: calc(10px + var(--font-boost)); min-width: 190px; }
+.explain-rubric small { color: #6d7787; font-size: calc(9px + var(--font-boost)); }
+.explain-input { min-height: 110px; padding: 9px 11px; border: 1px solid #1c2230; border-radius: 8px; background: #0c1017; color: #cbd3df; font: inherit; font-size: calc(10px + var(--font-boost)); resize: vertical; outline: none; }
+.explain-panel .primary { align-self: flex-start; padding: 6px 14px; border: none; border-radius: 8px; background: #4f46e5; color: #fff; font-size: calc(10px + var(--font-boost)); cursor: pointer; }
+.explain-panel .primary:disabled { opacity: .5; cursor: default; }
+.explain-grade { padding: 9px 11px; border: 1px solid #1e2532; border-radius: 9px; background: #0e121a; display: flex; flex-direction: column; gap: 7px; }
+.explain-score { display: flex; align-items: baseline; gap: 10px; }
+.explain-score em { font-style: normal; color: #dbe1ea; font-size: calc(16px + var(--font-boost)); }
+.explain-score small { color: #6d7787; font-size: calc(9px + var(--font-boost)); }
+.explain-score span { margin-left: auto; padding: 2px 8px; border: 1px solid #2a3345; border-radius: 6px; color: #93a0b1; font-size: calc(9px + var(--font-boost)); }
+.explain-contradictions { display: flex; flex-direction: column; gap: 4px; }
+.explain-contradictions div { padding: 5px 8px; border: 1px solid #4a2f2f; border-radius: 7px; background: #1a1113; display: flex; flex-direction: column; }
+.explain-contradictions strong { color: #dfa2a2; font-size: calc(10px + var(--font-boost)); }
+.explain-contradictions small { color: #a58d8d; font-size: calc(9px + var(--font-boost)); }
+.explain-contradictions em { color: #7a6a6a; font-style: normal; font-size: calc(8px + var(--font-boost)); }
+.explain-observed { display: flex; flex-direction: column; gap: 3px; padding: 6px 9px; border: 1px solid #1e2532; border-radius: 7px; background: #0c1017; }
+.explain-observed span { color: #5b6474; font-size: calc(8px + var(--font-boost)); letter-spacing: .12em; }
+.explain-observed code { color: #a7e3a1; font-size: calc(10px + var(--font-boost)); font-family: "SFMono-Regular", Menlo, monospace; word-break: break-word; }
+.explain-observed small { color: #6d7787; font-size: calc(9px + var(--font-boost)); }
+.explain-next { color: #93a0b1; font-size: calc(10px + var(--font-boost)); }

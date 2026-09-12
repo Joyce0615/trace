@@ -293,6 +293,17 @@ export const IPC_SCHEMAS = {
     probeId: s.string({ maxLength: 128 }),
     choiceId: s.string({ maxLength: 64 }),
   }),
+  "explain:task": s.object({
+    repository: repositoryReference,
+    language: s.literal(["python"]),
+    snippet: s.string({ maxLength: 8_000, minLength: 1 }),
+    timeoutMs: s.number({ integer: true, min: 500, max: 60_000, optional: true }),
+  }),
+  "explain:grade": s.object({
+    repository: repositoryReference,
+    taskId: s.string({ maxLength: 400 }),
+    explanation: s.string({ maxLength: 8_000 }),
+  }),
   "quiz:build": s.object({
     repository: repositoryReference,
     symbol: s.string({ maxLength: 200, optional: true }),

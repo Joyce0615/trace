@@ -604,6 +604,66 @@ try {
   assert.equal(diagnosisAudit.right.misconception, null);
   assert.match(diagnosisAudit.stale ?? "", /not active for this repository/);
 
+  // Item 38: an explanation graded against a real FlashInfer run, not against
+  // the static call graph.
+  const explainAudit = await page.evaluate(async (target) => {
+    const repository = { id: window.traceWorkspace.repository.id, rootPath: window.traceWorkspace.repository.rootPath };
+    const snippet = [
+      "import importlib.util",
+      `spec = importlib.util.spec_from_file_location("traced_mod", "${target}")`,
+      "module = importlib.util.module_from_spec(spec)",
+      "spec.loader.exec_module(module)",
+      "print(module.moe_activation_w1_rows('silu', 4))",
+    ].join("\n");
+    const task = await window.trace.explanationTask({ repository, language: "python", snippet });
+    if (!task.available) return { task };
+    const grounded = await window.trace.gradeExplanation({
+      repository,
+      taskId: task.id,
+      explanation: "The run begins in `moe_activation_w1_rows`, which first calls `is_gated_moe_activation` to decide whether the activation is gated. That in turn calls `normalize_moe_activation` to canonicalise the activation name before the comparison happens. Nothing raises anywhere along the way, so control returns back up the chain and the entry point finally returns 8, which is the value that gets printed to standard output.",
+    });
+    const fabricated = await window.trace.gradeExplanation({
+      repository,
+      taskId: task.id,
+      explanation: "The call starts with `normalize_moe_activation`, which then hands off to `is_gated_moe_activation` and only afterwards reaches `moe_activation_w1_rows` at the very end of the chain. The whole thing raises a ValueError because the activation name is not recognised, so nothing is returned to the caller at all in this particular run.",
+    });
+    const empty = await window.trace.gradeExplanation({ repository, taskId: task.id, explanation: "" });
+    let stale = null;
+    try {
+      await window.trace.gradeExplanation({ repository, taskId: "explain-nope", explanation: "anything" });
+    } catch (error) {
+      stale = error.message;
+    }
+    return { task, grounded, fabricated, empty, stale, serializedTask: JSON.stringify(task) };
+  }, traceAudit.target);
+  assert.equal(explainAudit.task.available, true, explainAudit.task.reason);
+  assert.equal(explainAudit.task.entry.name, "moe_activation_w1_rows");
+  assert.equal(explainAudit.task.criteria.length, 7);
+  // The recorded run is the answer key and must not ship with the task.
+  assert.equal(explainAudit.serializedTask.includes("normalize_moe_activation"), false, "the observed call order leaked into the task");
+  assert.equal(explainAudit.task.observed, undefined);
+  assert.equal(explainAudit.task.neighborhood, undefined);
+  assert.equal(explainAudit.serializedTask.includes("is_gated_moe_activation"), false);
+  // A grounded explanation matches the run on every behavioural criterion.
+  assert.equal(explainAudit.grounded.band, "expert", JSON.stringify({ score: explainAudit.grounded.score, failed: explainAudit.grounded.criteria.filter((item) => !item.passed).map((item) => item.id) }));
+  assert.equal(explainAudit.grounded.coverage, 1);
+  assert.equal(explainAudit.grounded.orderAccuracy, 1);
+  assert.deepEqual(explainAudit.grounded.contradictions, []);
+  assert.deepEqual(explainAudit.grounded.unsupported, []);
+  assert.equal(explainAudit.grounded.observed.returnValue.value, "8");
+  assert.deepEqual(explainAudit.grounded.observed.order, ["moe_activation_w1_rows", "is_gated_moe_activation", "normalize_moe_activation"]);
+  // A fluent explanation that names every function but reverses the order and
+  // invents a failure is caught, which a coverage-only grader would not do.
+  assert.equal(explainAudit.fabricated.coverage, 1, "the fabricated answer does name everything");
+  assert.equal(explainAudit.fabricated.orderAccuracy, 0, String(explainAudit.fabricated.orderAccuracy));
+  assert.equal(explainAudit.fabricated.criteria.find((item) => item.id === "error-path").passed, false);
+  assert.equal(explainAudit.fabricated.criteria.find((item) => item.id === "return-value").passed, false);
+  assert.ok(explainAudit.fabricated.contradictions.length >= 2, JSON.stringify(explainAudit.fabricated.contradictions));
+  assert.ok(explainAudit.fabricated.contradictions.every((item) => item.evidence.length > 0));
+  assert.ok(explainAudit.fabricated.score < explainAudit.grounded.score - 0.4, `${explainAudit.fabricated.score} vs ${explainAudit.grounded.score}`);
+  assert.equal(explainAudit.empty.score, 0);
+  assert.match(explainAudit.stale ?? "", /not active for this repository/);
+
   // Item 37: an executable quiz built from FlashInfer's own Python, graded by
   // running the learner's code in the resource-limited sandbox.
   const quizAudit = await page.evaluate(async () => {
@@ -890,6 +950,7 @@ try {
       lessons: { score: evaluationAudit.lessons.score, verdict: evaluationAudit.lessons.verdict },
     },
     diagnosis: { skills: diagnosis.skills.length, assessed: diagnosis.summary.assessed, meanConfidence: diagnosis.summary.meanConfidence, brier: diagnosis.summary.meanBrier, overconfident: diagnosis.summary.overconfidentSkills, misconceptions: diagnosis.summary.misconceptionCounts },
+    explanation: { entry: explainAudit.task.entry.name, observedOrder: explainAudit.grounded.observed.order.join(" → "), groundedScore: explainAudit.grounded.score, groundedBand: explainAudit.grounded.band, fabricatedScore: explainAudit.fabricated.score, contradictions: explainAudit.fabricated.contradictions.map((item) => item.claim) },
     executableQuiz: { entry: quizAudit.quiz.entry, anchor: `${quizAudit.quiz.anchor.path}:${quizAudit.quiz.anchor.line}`, hiddenCases: quizAudit.quiz.hiddenCases.length, buildMs: Math.round(quizAudit.buildMs), constantScore: `${quizAudit.constant.passedCases}/${quizAudit.constant.totalCases}`, enforced: quizAudit.constant.enforced, loopingStatus: quizAudit.looping.status },
     schedule: { skills: schedulePlan.summary.skills, due: schedulePlan.summary.due, stale: schedulePlan.summary.stale, meanRetention: schedulePlan.summary.meanRetention, recordedMastery: schedulePlan.summary.recordedMastery, retainedMastery: schedulePlan.summary.retainedMastery, grantedIntervalDays: scheduleAudit.recorded.review.intervalDays },
     executionTrace: { runtime: traceAudit.runtimes.python.version, calls: traceAudit.ran.summary.callCount, transitions: traceAudit.ran.summary.transitions.length, confirmed: traceAudit.ran.summary.confirmedStaticEdges, dynamicOnly: traceAudit.ran.summary.dynamicOnlyEdges },

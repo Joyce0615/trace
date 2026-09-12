@@ -833,6 +833,47 @@ export interface ProbeGrade {
   anchor: CodeAnchor | null;
 }
 
+export interface ExplanationTask {
+  available: boolean;
+  version: number;
+  reason?: string;
+  traceStatus?: string;
+  id?: string;
+  anchor?: CodeAnchor;
+  prompt?: string;
+  criteria?: Array<{ id: string; title: string; weight: number; description: string }>;
+  entry?: { name: string };
+}
+
+export interface ExplanationGrade {
+  version: number;
+  taskId: string;
+  score: number;
+  band: "expert" | "proficient" | "developing" | "novice";
+  lengthFactor: number;
+  words: number;
+  criteria: Array<{ id: string; title: string; weight: number; description: string; passed: boolean; credit: number; evidence: string; detail: string }>;
+  coverage: number;
+  orderAccuracy: number;
+  named: string[];
+  missed: string[];
+  unsupported: string[];
+  contradictions: Array<{ claim: string; reason: string; evidence: string }>;
+  citations: Array<{ path: string; line: number; valid: boolean; reason: string | null }>;
+  weakest: string | null;
+  next: string;
+  observed: {
+    functions: Array<{ name: string; path: string; line: number; calls: number }>;
+    order: string[];
+    transitions: Array<{ from: string; to: string; count: number }>;
+    returnValue: { function: string; value: string; path?: string; line?: number } | null;
+    returnValues: Array<{ function: string; value: string }>;
+    raised: boolean;
+    maxDepth: number;
+    status: string;
+  };
+}
+
 export interface ExecutableQuiz {
   available: boolean;
   version: number;
@@ -1020,6 +1061,8 @@ export interface TraceBridge {
   evaluate(request: { repository: RepositoryRef; course?: Course; skillGraph?: SkillGraph; answers?: unknown[]; sampleSize?: number }): Promise<EvaluationReport>;
   diagnose(request: { repository: RepositoryRef; skillGraph: SkillGraph; learnerState: LearnerState; text?: string }): Promise<DiagnosisReport>;
   answerProbe(request: { repository: RepositoryRef; probeId: string; choiceId: string }): Promise<ProbeGrade>;
+  explanationTask(request: { repository: RepositoryRef; language: "python"; snippet: string; timeoutMs?: number }): Promise<ExplanationTask>;
+  gradeExplanation(request: { repository: RepositoryRef; taskId: string; explanation: string }): Promise<ExplanationGrade>;
   buildQuiz(request: { repository: RepositoryRef; symbol?: string }): Promise<ExecutableQuiz>;
   gradeQuiz(request: { repository: RepositoryRef; quizId: string; submission: string }): Promise<QuizGrade>;
   reviewPlan(request: { repository: RepositoryRef; skillGraph: SkillGraph; learnerState: LearnerState; now?: string; dailyLimit?: number }): Promise<ReviewPlan>;

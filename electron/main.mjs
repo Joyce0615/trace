@@ -25,6 +25,7 @@ import { runEvaluation } from "./evaluation.mjs";
 import { detectMisconceptions, diagnoseLearner, gradeProbe } from "./misconception.mjs";
 import { applyReview, reviewPlan } from "./spaced-repetition.mjs";
 import { buildExecutableQuiz, gradeSubmission, publicQuiz } from "./executable-quiz.mjs";
+import { buildExplanationTask, gradeExplanation, publicExplanationTask } from "./explanation-grader.mjs";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const openedRepositories = new Map();
@@ -36,6 +37,7 @@ const raceTasks = new Map();
 const searchIndexes = new Map();
 const learnerProbes = new Map();
 const executableQuizzes = new Map();
+const explanationTasks = new Map();
 
 function openedRepository(candidate) {
   const repository = candidate?.id ? openedRepositories.get(candidate.id) : null;
@@ -422,6 +424,26 @@ const ipcHandlers = {
     const probe = learnerProbes.get(repository.id)?.[request.probeId];
     if (!probe) throw new Error("That probe is not active for this repository.");
     return gradeProbe(probe, request.choiceId);
+  },
+
+  "explain:task": async (_event, request) => {
+    const repository = openedRepository(request.repository);
+    // The trace runs now, but the learner explains first: the recorded behavior
+    // is the answer key and is only revealed by grading.
+    const trace = await runExecutionTrace(repository, request);
+    if (!trace.events?.length) {
+      return { available: false, version: 1, reason: trace.reason ?? trace.error ?? `The run produced no trace (${trace.status}).`, traceStatus: trace.status };
+    }
+    const task = buildExplanationTask(repository, summarizeTrace(trace, repository));
+    if (task.available) explanationTasks.set(repository.id, task);
+    return publicExplanationTask(task);
+  },
+
+  "explain:grade": (_event, request) => {
+    const repository = openedRepository(request.repository);
+    const task = explanationTasks.get(repository.id);
+    if (!task || task.id !== request.taskId) throw new Error("That explanation task is not active for this repository.");
+    return gradeExplanation(task, request.explanation, repository);
   },
 
   "quiz:build": async (_event, request) => {

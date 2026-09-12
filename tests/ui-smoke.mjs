@@ -222,6 +222,18 @@ try {
   assert.equal(await quizPanel.locator(".quiz-editor").count(), 0, "no editor is offered when nothing can run it");
   assert.equal(await quizPanel.locator(".quiz-grade").count(), 0);
 
+  // Item 38: grading an explanation needs a real recorded run, so the browser
+  // says so rather than grading against a made-up trace.
+  const explainPanel = page.locator(".explain-panel");
+  await explainPanel.waitFor();
+  await explainPanel.locator(".explain-snippet").fill("import nanovllm\nprint(nanovllm.LLM)");
+  await explainPanel.getByRole("button", { name: "Record a run" }).click();
+  await explainPanel.locator('.explain-note[data-reason="unavailable"]').waitFor();
+  assert.equal(await explainPanel.getAttribute("data-status"), "unavailable");
+  assert.match(await explainPanel.locator(".explain-note").innerText(), /real recorded run/);
+  assert.equal(await explainPanel.locator(".explain-rubric").count(), 0, "no rubric is shown when nothing was recorded");
+  assert.equal(await explainPanel.locator(".explain-observed").count(), 0);
+
   // Item 30: module layers, boundaries, and the current symbol's callers/callees.
   await page.locator(".content-tabs").getByRole("button", { name: "Code" }).click();
   await page.locator(".explorer-search input").fill("engine/llm_engine.py");

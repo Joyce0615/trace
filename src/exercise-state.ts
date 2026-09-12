@@ -1,4 +1,4 @@
-import type { Architecture, DiagnosisReport, EvaluationReport, EvidenceImport, ExecutableQuiz, HistorySummary, Lesson, ProbeGrade, QuizGrade, ReviewPlan, ReviewResult, SymbolFlow, CallChain, LocalizationExercise, LocalizationHint, LocalizationScore, PredictionExercise, PredictionGrade, RaceReport, RaceTask, TraceRunResult, TraceRuntime } from "./types";
+import type { Architecture, DiagnosisReport, EvaluationReport, EvidenceImport, ExecutableQuiz, ExplanationGrade, ExplanationTask, HistorySummary, Lesson, ProbeGrade, QuizGrade, ReviewPlan, ReviewResult, SymbolFlow, CallChain, LocalizationExercise, LocalizationHint, LocalizationScore, PredictionExercise, PredictionGrade, RaceReport, RaceTask, TraceRunResult, TraceRuntime } from "./types";
 
 /**
  * Exercise state shapes.
@@ -110,3 +110,14 @@ export type ExecutableQuizState = {
 };
 
 export const emptyExecutableQuizState: ExecutableQuizState = { quiz: null, submission: "", grade: null, busy: false, status: "idle" };
+
+export type ExplanationState = {
+  task: ExplanationTask | null;
+  snippet: string;
+  explanation: string;
+  grade: ExplanationGrade | null;
+  busy: boolean;
+  status: "idle" | "loading" | "ready" | "unavailable" | "error";
+};
+
+export const emptyExplanationState: ExplanationState = { task: null, snippet: "", explanation: "", grade: null, busy: false, status: "idle" };

@@ -681,6 +681,18 @@ export const browserBridge: TraceBridge = {
     if (!probe) throw new Error("That probe is not active for this repository.");
     return model.gradeProbe(probe, request.choiceId);
   },
+  async explanationTask() {
+    // Grading an explanation against traced behavior needs a real trace, which
+    // needs an interpreter the browser does not have.
+    return {
+      available: false,
+      version: 1,
+      reason: "Explanations are graded against a real recorded run, which needs the desktop app's interpreter.",
+    };
+  },
+  async gradeExplanation() {
+    throw new Error("That explanation task is not active for this repository.");
+  },
   async buildQuiz() {
     // The browser has no interpreter and no sandbox; saying so is more useful
     // than pretending to run the learner's code.

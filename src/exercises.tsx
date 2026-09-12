@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Icon, bridge, readableError, repositoryRef } from "./shell";
 import type { Course, LearnerState, Lesson, PredictionExercise, Repository, ReviewGradeId, SkillGraph } from "./types";
-import type { ArchitectureState, ChainState, DiagnosisState, EvaluationState, EvidenceState, ExecutableQuizState, HistoryState, LocalizationState, ReviewState, ScheduleState, TraceState } from "./exercise-state";
+import type { ArchitectureState, ChainState, DiagnosisState, EvaluationState, EvidenceState, ExecutableQuizState, ExplanationState, HistoryState, LocalizationState, ReviewState, ScheduleState, TraceState } from "./exercise-state";
 
 /**
  * Exercise, visualization, quality, and diagnosis panels (items 26-36).
@@ -664,6 +664,84 @@ export function SchedulePanel({ repository, skillGraph, learnerState, state, onS
           <polyline points={curve.points.map((point) => `${(point.day / curve.horizonDays) * 100},${32 - point.retention * 30}`).join(" ")} />
         </svg>
         <small>Recall falls to {Math.round(plan.parameters.targetRetention * 100)}% after {curve.dueDay} day{curve.dueDay === 1 ? "" : "s"}.</small>
+      </div>}
+    </>}
+  </section>;
+}
+
+/**
+ * Explanations graded against traced behavior (item 38).
+ *
+ * The trace runs before the learner writes, but nothing about it is shown until
+ * the explanation is submitted: the recorded run is the answer key, and showing
+ * it first would turn the exercise into transcription.
+ */
+export function ExplanationPanel({ repository, state, onState, onAnchor }: {
+  repository: Repository;
+  state: ExplanationState;
+  onState: (update: Partial<ExplanationState>) => void;
+  onAnchor: (path: string, line: number) => void;
+}) {
+  const { task, snippet, explanation, grade, busy, status } = state;
+  const start = async () => {
+    if (!snippet.trim()) return;
+    onState({ status: "loading", grade: null });
+    try {
+      const next = await bridge.explanationTask({ repository: repositoryRef(repository), language: "python", snippet });
+      onState({ task: next, explanation: "", status: next.available ? "ready" : "unavailable" });
+    } catch {
+      onState({ status: "error" });
+    }
+  };
+  const submit = async () => {
+    if (!task?.id) return;
+    onState({ busy: true });
+    try {
+      onState({ grade: await bridge.gradeExplanation({ repository: repositoryRef(repository), taskId: task.id, explanation }), busy: false });
+    } catch (cause) {
+      onState({ busy: false, status: "error" });
+      void readableError(cause);
+    }
+  };
+
+  return <section className="explain-panel" data-status={status} data-band={grade?.band ?? ""}>
+    <div className="explain-head">
+      <span>EXPLAIN THE RUN</span>
+      <button className="ghost" disabled={status === "loading" || !snippet.trim()} onClick={() => void start()}>{status === "loading" ? "Running…" : task ? "New run" : "Record a run"}</button>
+    </div>
+    <textarea className="explain-snippet" spellCheck={false} value={snippet} onChange={(event) => onState({ snippet: event.target.value })} placeholder="A snippet that exercises this repository, for example: import mymodule; print(mymodule.entry(1))" />
+    {status === "unavailable" && <p className="explain-note" data-reason="unavailable">{task?.reason}</p>}
+    {status === "error" && <p className="explain-note">The explanation grader is unavailable for this repository.</p>}
+    {task?.available && <>
+      <p className="explain-prompt">{task.prompt}</p>
+      {task.anchor && <button className="explain-anchor" onClick={() => onAnchor(task.anchor!.path, task.anchor!.line)}>{task.anchor.path}:{task.anchor.line}</button>}
+      <ul className="explain-rubric">
+        {(task.criteria ?? []).map((criterion) => {
+          const verdict = grade?.criteria.find((item) => item.id === criterion.id);
+          return <li key={criterion.id} data-criterion={criterion.id} data-passed={verdict ? String(verdict.passed) : "pending"}>
+            <strong>{criterion.title}</strong>
+            <small>{verdict ? verdict.detail : criterion.description}</small>
+          </li>;
+        })}
+      </ul>
+      <textarea className="explain-input" value={explanation} onChange={(event) => onState({ explanation: event.target.value })} placeholder="Explain what happens when this runs: which functions it reaches, in what order, and what comes back…" />
+      <button className="primary" disabled={busy || !explanation.trim()} onClick={() => void submit()}>{busy ? "Grading…" : "Grade against the run"}</button>
+      {grade && <div className="explain-grade" data-score={grade.score}>
+        <div className="explain-score">
+          <em data-metric="score">{Math.round(grade.score * 100)}%</em>
+          <small data-metric="coverage">{Math.round(grade.coverage * 100)}% covered</small>
+          <small data-metric="order">{Math.round(grade.orderAccuracy * 100)}% order</small>
+          <span data-metric="band">{grade.band}</span>
+        </div>
+        {grade.contradictions.length > 0 && <div className="explain-contradictions" data-count={grade.contradictions.length}>
+          {grade.contradictions.map((item) => <div key={`${item.claim}-${item.reason}`}><strong>{item.claim}</strong><small>{item.reason}</small><em>{item.evidence}</em></div>)}
+        </div>}
+        <div className="explain-observed">
+          <span>WHAT ACTUALLY RAN</span>
+          <code>{grade.observed.order.join(" → ")}</code>
+          {grade.observed.returnValue && <small>{grade.observed.returnValue.function} returned {grade.observed.returnValue.value}</small>}
+        </div>
+        <p className="explain-next">{grade.next}</p>
       </div>}
     </>}
   </section>;
