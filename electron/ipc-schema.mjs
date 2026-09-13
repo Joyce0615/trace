@@ -293,6 +293,18 @@ export const IPC_SCHEMAS = {
     probeId: s.string({ maxLength: 128 }),
     choiceId: s.string({ maxLength: 64 }),
   }),
+  "activity:build": s.object({
+    repository: repositoryReference,
+    symbol: s.string({ maxLength: 200, optional: true }),
+  }),
+  "activity:grade": s.object({
+    repository: repositoryReference,
+    kind: s.literal(["teach-back", "prediction", "contrast"]),
+    id: s.string({ maxLength: 400 }),
+    answer: s.string({ maxLength: 8_000, optional: true }),
+    confidence: s.number({ min: 0, max: 1, optional: true }),
+    choiceId: s.string({ maxLength: 400, optional: true }),
+  }),
   "explain:task": s.object({
     repository: repositoryReference,
     language: s.literal(["python"]),

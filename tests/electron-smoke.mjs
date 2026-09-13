@@ -604,6 +604,81 @@ try {
   assert.equal(diagnosisAudit.right.misconception, null);
   assert.match(diagnosisAudit.stale ?? "", /not active for this repository/);
 
+  // Item 39: teach-back, prediction-before-reveal, and contrast, all built from
+  // the real index with every answer held in the main process.
+  const activityAudit = await page.evaluate(async () => {
+    const repository = { id: window.traceWorkspace.repository.id, rootPath: window.traceWorkspace.repository.rootPath };
+    const set = await window.trace.buildActivities({ repository });
+    const teachSymbol = set.teachBack.symbol;
+    const misleading = await window.trace.gradeActivity({
+      repository,
+      kind: "teach-back",
+      id: set.teachBack.id,
+      answer: `You can read \`${teachSymbol}\` straight down: it runs top to bottom in the order the lines appear, and nothing else calls it, so it is safe to change however you like. For example, calling it with the default arguments always returns immediately. See ${set.teachBack.anchor.path}:${set.teachBack.anchor.line} for the code itself.`,
+    });
+    const solid = await window.trace.gradeActivity({
+      repository,
+      kind: "teach-back",
+      id: set.teachBack.id,
+      answer: `Think of \`${teachSymbol}\` as the shared gatekeeper for this part of the system. It exists because several callers need the same decision made the same way, so centralising it means a change lands in one place instead of many. For example, when a caller hands it the usual arguments it works out the answer and hands it straight back, and the callers never repeat that reasoning themselves. You can read it at ${set.teachBack.anchor.path}:${set.teachBack.anchor.line} and then follow one of its callers to see the pattern.`,
+    });
+    const bold = await window.trace.gradeActivity({ repository, kind: "prediction", id: set.predictions[0].id, answer: "9999", confidence: 0.95 });
+    const humble = await window.trace.gradeActivity({ repository, kind: "prediction", id: set.predictions[0].id, answer: String(bold.answer), confidence: 0.25 });
+    let contrastRight = null;
+    let contrastWrong = null;
+    if (set.contrast.available) {
+      const first = await window.trace.gradeActivity({ repository, kind: "contrast", id: set.contrast.id, choiceId: set.contrast.options[0].id });
+      const other = set.contrast.options.find((option) => option.id !== first.answerId);
+      contrastRight = first.correct ? first : await window.trace.gradeActivity({ repository, kind: "contrast", id: set.contrast.id, choiceId: first.answerId });
+      contrastWrong = first.correct ? await window.trace.gradeActivity({ repository, kind: "contrast", id: set.contrast.id, choiceId: other.id }) : first;
+    }
+    let stale = null;
+    try {
+      await window.trace.gradeActivity({ repository, kind: "prediction", id: "predict-nope", answer: "1", confidence: 0.5 });
+    } catch (error) {
+      stale = error.message;
+    }
+    return { set, misleading, solid, bold, humble, contrastRight, contrastWrong, stale, serialized: JSON.stringify(set) };
+  });
+  const activitySet = activityAudit.set;
+  assert.equal(activitySet.teachBack.available, true, activitySet.teachBack.reason);
+  assert.ok(activitySet.predictions.length >= 3, String(activitySet.predictions.length));
+  // No answer key crosses the boundary: no counts, no reveals, no correct option.
+  assert.ok(activitySet.predictions.every((item) => item.answer === undefined && item.reveal === undefined && item.tolerance === undefined));
+  assert.equal(activitySet.teachBack.reference, undefined);
+  assert.equal(activitySet.contrast.answerId, undefined);
+  assert.equal(activityAudit.serialized.includes("\"answer\""), false, "an answer leaked into the shipped activity set");
+  assert.equal(activityAudit.serialized.includes("\"reveal\""), false);
+  // The teach-back target and anchor are real indexed source.
+  const teachAnchorValid = await page.evaluate((anchor) => window.traceWorkspace.repository.symbols
+    .some((symbol) => symbol.path === anchor.path && symbol.name === anchor.symbol), activitySet.teachBack.anchor);
+  assert.equal(teachAnchorValid, true);
+  // A fluent teach-back that would plant misconceptions is failed for that reason.
+  assert.equal(activityAudit.misleading.passed, false);
+  assert.ok(activityAudit.misleading.misconceptions.length >= 2, JSON.stringify(activityAudit.misleading.misconceptions.map((finding) => finding.id)));
+  assert.ok(activityAudit.misleading.misconceptions.some((finding) => finding.id === "execution-order"));
+  assert.equal(activityAudit.misleading.moves.find((move) => move.id === "cites-source").passed, true, "its surface moves are fine, which is the point");
+  assert.equal(activityAudit.solid.misconceptions.length, 0, JSON.stringify(activityAudit.solid.misconceptions));
+  assert.ok(activityAudit.solid.score > activityAudit.misleading.score, `${activityAudit.solid.score} vs ${activityAudit.misleading.score}`);
+  // Confidence is scored, not just correctness.
+  assert.equal(activityAudit.bold.correct, false);
+  assert.equal(activityAudit.bold.calibration, "overconfident");
+  assert.ok(activityAudit.bold.brier > 0.9, String(activityAudit.bold.brier));
+  assert.equal(activityAudit.humble.correct, true);
+  assert.equal(activityAudit.humble.calibration, "underconfident");
+  assert.ok(activityAudit.humble.brier < activityAudit.bold.brier);
+  assert.ok(activityAudit.humble.reveal.length > 0, "the answer is revealed only after committing");
+  assert.match(activityAudit.stale ?? "", /not active for this repository/);
+  // FlashInfer really does define the same function name in two files.
+  assert.equal(activitySet.contrast.available, true, activitySet.contrast.reason);
+  assert.equal(activitySet.contrast.options.length, 2);
+  assert.equal(new Set(activitySet.contrast.options.map((option) => option.path)).size, 2);
+  assert.equal(activityAudit.contrastRight.correct, true);
+  assert.equal(activityAudit.contrastWrong.correct, false);
+  assert.ok(activityAudit.contrastRight.differences.length >= 1, "the comparison is real, not decorative");
+  const contrastAnchorValid = await page.evaluate((anchor) => window.traceWorkspace.repository.files.some((file) => file.path === anchor.path), activityAudit.contrastRight.anchor);
+  assert.equal(contrastAnchorValid, true);
+
   // Item 38: an explanation graded against a real FlashInfer run, not against
   // the static call graph.
   const explainAudit = await page.evaluate(async (target) => {
@@ -950,6 +1025,7 @@ try {
       lessons: { score: evaluationAudit.lessons.score, verdict: evaluationAudit.lessons.verdict },
     },
     diagnosis: { skills: diagnosis.skills.length, assessed: diagnosis.summary.assessed, meanConfidence: diagnosis.summary.meanConfidence, brier: diagnosis.summary.meanBrier, overconfident: diagnosis.summary.overconfidentSkills, misconceptions: diagnosis.summary.misconceptionCounts },
+    activities: { teachBack: activitySet.teachBack.symbol, misleadingScore: activityAudit.misleading.score, misconceptions: activityAudit.misleading.misconceptions.map((finding) => finding.id), solidScore: activityAudit.solid.score, predictions: activitySet.predictions.map((item) => item.metric), boldBrier: activityAudit.bold.brier, humbleBrier: activityAudit.humble.brier, contrastSymbol: activitySet.contrast.symbol, contrastPaths: activitySet.contrast.options.map((option) => `${option.path}:${option.line}`), differences: activityAudit.contrastRight.differences.map((item) => item.id) },
     explanation: { entry: explainAudit.task.entry.name, observedOrder: explainAudit.grounded.observed.order.join(" → "), groundedScore: explainAudit.grounded.score, groundedBand: explainAudit.grounded.band, fabricatedScore: explainAudit.fabricated.score, contradictions: explainAudit.fabricated.contradictions.map((item) => item.claim) },
     executableQuiz: { entry: quizAudit.quiz.entry, anchor: `${quizAudit.quiz.anchor.path}:${quizAudit.quiz.anchor.line}`, hiddenCases: quizAudit.quiz.hiddenCases.length, buildMs: Math.round(quizAudit.buildMs), constantScore: `${quizAudit.constant.passedCases}/${quizAudit.constant.totalCases}`, enforced: quizAudit.constant.enforced, loopingStatus: quizAudit.looping.status },
     schedule: { skills: schedulePlan.summary.skills, due: schedulePlan.summary.due, stale: schedulePlan.summary.stale, meanRetention: schedulePlan.summary.meanRetention, recordedMastery: schedulePlan.summary.recordedMastery, retainedMastery: schedulePlan.summary.retainedMastery, grantedIntervalDays: scheduleAudit.recorded.review.intervalDays },

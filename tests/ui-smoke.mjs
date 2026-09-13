@@ -169,6 +169,47 @@ try {
   assert.equal(await drill.locator(".localization-hint em").innerText(), "-5%");
   await page.screenshot({ path: path.join(artifactDirectory, "localization-drill.png") });
 
+  // Item 39: teach-back, prediction-before-reveal, and contrast, all running the
+  // same graders as the desktop app.
+  const activities = page.locator(".activity-panel");
+  await activities.waitFor();
+  await activities.getByRole("button", { name: "Build activities" }).click();
+  await activities.locator('.activity-block[data-block="teach-back"][data-available="true"]').waitFor();
+  // A fluent teach-back that would plant a misconception must not pass.
+  await activities.locator(".teach-input").fill(
+    "It runs top to bottom in the order the lines appear, and nothing else calls it, so it is safe to change. For example, step() always returns a token straight away without waiting for anything, which is why the loop stays simple. See nanovllm/engine/llm_engine.py:9 for the code.",
+  );
+  await activities.getByRole("button", { name: "Check my explanation" }).click();
+  await activities.locator(".teach-grade").waitFor();
+  assert.equal(await activities.locator(".teach-grade").getAttribute("data-passed"), "false");
+  await activities.locator('[data-misconception="execution-order"]').waitFor();
+  await activities.locator('[data-misconception="single-caller"]').waitFor();
+  // ...even though its surface moves are fine.
+  assert.equal(await activities.locator('li[data-move="gives-example"]').getAttribute("data-passed"), "true");
+  assert.equal(await activities.locator('li[data-move="cites-source"]').getAttribute("data-passed"), "true");
+
+  // A prediction is answered before anything is revealed.
+  const prediction = activities.locator('.prediction-item[data-metric="fan-in"]').first();
+  await prediction.waitFor();
+  const beforeCommit = await prediction.innerText();
+  assert.equal(/is called from/.test(beforeCommit), false, `the answer was revealed before committing: ${beforeCommit}`);
+  await prediction.locator("input").fill("97");
+  await prediction.locator('button[data-confidence="0.95"]').click();
+  await prediction.getByRole("button", { name: "Commit" }).click();
+  await prediction.locator(".prediction-outcome").waitFor();
+  assert.equal(await prediction.locator(".prediction-outcome").getAttribute("data-correct"), "false");
+  assert.equal(await prediction.locator(".prediction-outcome").getAttribute("data-calibration"), "overconfident");
+  assert.ok(Number(await prediction.locator("[data-brier]").getAttribute("data-brier")) > 0.9);
+  assert.match(await prediction.locator(".prediction-outcome small").innerText(), /is called from \d+ file/);
+
+  // nano-vllm defines no function name twice, so the contrast honestly reports
+  // that there is no ambiguity to contrast rather than inventing one.
+  const contrast = activities.locator('.activity-block[data-block="contrast"]');
+  assert.equal(await contrast.getAttribute("data-available"), "false");
+  assert.match(await contrast.locator(".activity-note").innerText(), /defined in two files/);
+  assert.equal(await contrast.locator(".contrast-options").count(), 0);
+  await page.screenshot({ path: path.join(artifactDirectory, "activities.png") });
+
   // Item 28: RACE-style review grades three stages against three rubrics.
   await page.locator(".content-tabs").getByRole("button", { name: "Review" }).click();
   await page.getByRole("button", { name: "Start graded review" }).click();

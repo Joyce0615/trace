@@ -13,6 +13,7 @@ export const demoLearnerState = nanoLearnerState;
 let savedLearning: LearnerState = structuredClone(nanoLearnerState);
 let demoSearchIndex: SearchIndex | null = null;
 let demoProbes: Record<string, Parameters<typeof import("../electron/misconception.mjs").gradeProbe>[0]> = {};
+let demoActivities: import("../electron/activities.mjs").InternalActivitySet | null = null;
 
 const demoGraphNodes: KnowledgeGraphNode[] = [
   { id: `repository:${nanoRepository.id}`, kind: "repository", key: nanoRepository.id, label: nanoRepository.name },
@@ -680,6 +681,27 @@ export const browserBridge: TraceBridge = {
     const probe = demoProbes[request.probeId];
     if (!probe) throw new Error("That probe is not active for this repository.");
     return model.gradeProbe(probe, request.choiceId);
+  },
+  async buildActivities(request) {
+    // Node-free, so the demo runs the very same activity builders and graders.
+    const activities = await import("../electron/activities.mjs");
+    demoActivities = activities.buildActivitySet(nanoRepository, nanoSourceByPath, { symbol: request.symbol });
+    return activities.publicActivitySet(demoActivities);
+  },
+  async gradeActivity(request) {
+    const activities = await import("../electron/activities.mjs");
+    if (!demoActivities) throw new Error("No activities are active for this repository.");
+    if (request.kind === "teach-back") {
+      if (demoActivities.teachBack?.id !== request.id) throw new Error("That teach-back task is not active for this repository.");
+      return activities.gradeTeachBack(demoActivities.teachBack, request.answer ?? "", nanoRepository);
+    }
+    if (request.kind === "prediction") {
+      const prediction = demoActivities.predictions.find((item) => item.id === request.id);
+      if (!prediction) throw new Error("That prediction is not active for this repository.");
+      return activities.gradePrediction(prediction, request.answer ?? "", request.confidence);
+    }
+    if (demoActivities.contrast?.id !== request.id) throw new Error("That contrast is not active for this repository.");
+    return activities.gradeContrast(demoActivities.contrast, request.choiceId);
   },
   async explanationTask() {
     // Grading an explanation against traced behavior needs a real trace, which

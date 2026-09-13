@@ -833,6 +833,88 @@ export interface ProbeGrade {
   anchor: CodeAnchor | null;
 }
 
+export interface TeachBackTask {
+  available: boolean;
+  kind: "teach-back";
+  reason?: string;
+  id?: string;
+  symbol?: string;
+  anchor?: CodeAnchor;
+  prompt?: string;
+  moves?: Array<{ id: string; title: string; weight: number; description: string }>;
+  excerpt?: { path: string; startLine: number; text: string } | null;
+}
+
+export interface TeachBackGrade {
+  version: number;
+  kind: "teach-back";
+  taskId: string;
+  score: number;
+  words: number;
+  lengthFactor: number;
+  restatement: number;
+  moves: Array<{ id: string; title: string; weight: number; description: string; passed: boolean; credit: number; detail: string }>;
+  citations: Array<{ path: string; line: number; valid: boolean }>;
+  misconceptions: MisconceptionFinding[];
+  passed: boolean;
+  next: string;
+}
+
+export interface PredictionItem {
+  id: string;
+  kind: "numeric" | "path";
+  metric: string;
+  prompt: string;
+  unit: string;
+  anchor: CodeAnchor;
+}
+
+export interface PredictionOutcome {
+  version: number;
+  kind: "prediction";
+  predictionId: string;
+  correct: boolean;
+  close: boolean;
+  credit: number;
+  distance: number | null;
+  confidence: number;
+  brier: number;
+  calibration: "confident-and-right" | "underconfident" | "overconfident" | "appropriately-unsure";
+  answer: number | string;
+  reveal: string;
+  anchor: CodeAnchor;
+}
+
+export interface ContrastTask {
+  available: boolean;
+  kind: "contrast";
+  reason?: string;
+  id?: string;
+  symbol?: string;
+  callSite?: { path: string; line: number; caller: string | null };
+  prompt?: string;
+  options?: Array<{ id: string; path: string; line: number; excerpt: { path: string; startLine: number; text: string } | null }>;
+}
+
+export interface ContrastGrade {
+  version: number;
+  kind: "contrast";
+  taskId: string;
+  correct: boolean;
+  choiceId: string | null;
+  answerId: string;
+  differences: Array<{ id: string; detail: string }>;
+  explanation: string;
+  anchor: CodeAnchor;
+}
+
+export interface ActivitySet {
+  version: number;
+  teachBack: TeachBackTask;
+  predictions: PredictionItem[];
+  contrast: ContrastTask;
+}
+
 export interface ExplanationTask {
   available: boolean;
   version: number;
@@ -1061,6 +1143,9 @@ export interface TraceBridge {
   evaluate(request: { repository: RepositoryRef; course?: Course; skillGraph?: SkillGraph; answers?: unknown[]; sampleSize?: number }): Promise<EvaluationReport>;
   diagnose(request: { repository: RepositoryRef; skillGraph: SkillGraph; learnerState: LearnerState; text?: string }): Promise<DiagnosisReport>;
   answerProbe(request: { repository: RepositoryRef; probeId: string; choiceId: string }): Promise<ProbeGrade>;
+  buildActivities(request: { repository: RepositoryRef; symbol?: string }): Promise<ActivitySet>;
+  /** One channel for all three activity kinds; the caller narrows the result by `kind`. */
+  gradeActivity(request: { repository: RepositoryRef; kind: "teach-back" | "prediction" | "contrast"; id: string; answer?: string; confidence?: number; choiceId?: string }): Promise<TeachBackGrade | PredictionOutcome | ContrastGrade>;
   explanationTask(request: { repository: RepositoryRef; language: "python"; snippet: string; timeoutMs?: number }): Promise<ExplanationTask>;
   gradeExplanation(request: { repository: RepositoryRef; taskId: string; explanation: string }): Promise<ExplanationGrade>;
   buildQuiz(request: { repository: RepositoryRef; symbol?: string }): Promise<ExecutableQuiz>;

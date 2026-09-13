@@ -1,4 +1,4 @@
-import type { Architecture, DiagnosisReport, EvaluationReport, EvidenceImport, ExecutableQuiz, ExplanationGrade, ExplanationTask, HistorySummary, Lesson, ProbeGrade, QuizGrade, ReviewPlan, ReviewResult, SymbolFlow, CallChain, LocalizationExercise, LocalizationHint, LocalizationScore, PredictionExercise, PredictionGrade, RaceReport, RaceTask, TraceRunResult, TraceRuntime } from "./types";
+import type { ActivitySet, Architecture, ContrastGrade, DiagnosisReport, EvaluationReport, EvidenceImport, ExecutableQuiz, ExplanationGrade, ExplanationTask, HistorySummary, PredictionOutcome, TeachBackGrade, Lesson, ProbeGrade, QuizGrade, ReviewPlan, ReviewResult, SymbolFlow, CallChain, LocalizationExercise, LocalizationHint, LocalizationScore, PredictionExercise, PredictionGrade, RaceReport, RaceTask, TraceRunResult, TraceRuntime } from "./types";
 
 /**
  * Exercise state shapes.
@@ -121,3 +121,25 @@ export type ExplanationState = {
 };
 
 export const emptyExplanationState: ExplanationState = { task: null, snippet: "", explanation: "", grade: null, busy: false, status: "idle" };
+
+export type ActivityState = {
+  set: ActivitySet | null;
+  teachBackText: string;
+  teachBackGrade: TeachBackGrade | null;
+  guesses: Record<string, string>;
+  confidences: Record<string, number>;
+  outcomes: Record<string, PredictionOutcome>;
+  contrastGrade: ContrastGrade | null;
+  status: "idle" | "loading" | "ready" | "error";
+};
+
+export const emptyActivityState: ActivityState = {
+  set: null,
+  teachBackText: "",
+  teachBackGrade: null,
+  guesses: {},
+  confidences: {},
+  outcomes: {},
+  contrastGrade: null,
+  status: "idle",
+};

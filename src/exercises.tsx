@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Icon, bridge, readableError, repositoryRef } from "./shell";
-import type { Course, LearnerState, Lesson, PredictionExercise, Repository, ReviewGradeId, SkillGraph } from "./types";
-import type { ArchitectureState, ChainState, DiagnosisState, EvaluationState, EvidenceState, ExecutableQuizState, ExplanationState, HistoryState, LocalizationState, ReviewState, ScheduleState, TraceState } from "./exercise-state";
+import type { ContrastGrade, Course, LearnerState, Lesson, PredictionExercise, PredictionOutcome, Repository, ReviewGradeId, SkillGraph, TeachBackGrade } from "./types";
+import type { ActivityState, ArchitectureState, ChainState, DiagnosisState, EvaluationState, EvidenceState, ExecutableQuizState, ExplanationState, HistoryState, LocalizationState, ReviewState, ScheduleState, TraceState } from "./exercise-state";
 
 /**
  * Exercise, visualization, quality, and diagnosis panels (items 26-36).
@@ -665,6 +665,129 @@ export function SchedulePanel({ repository, skillGraph, learnerState, state, onS
         </svg>
         <small>Recall falls to {Math.round(plan.parameters.targetRetention * 100)}% after {curve.dueDay} day{curve.dueDay === 1 ? "" : "s"}.</small>
       </div>}
+    </>}
+  </section>;
+}
+
+const CONFIDENCE_STEPS = [0.25, 0.5, 0.75, 0.95];
+
+/**
+ * Teach-back, prediction-before-reveal, and contrastive examples (item 39).
+ *
+ * Every answer key is held in the main process, so a prediction cannot be read
+ * out of the DOM before it is committed to, and a contrast's correct definition
+ * is only named after a choice is made.
+ */
+export function ActivityPanel({ repository, state, onState, onAnchor }: {
+  repository: Repository;
+  state: ActivityState;
+  onState: (update: Partial<ActivityState>) => void;
+  onAnchor: (path: string, line: number) => void;
+}) {
+  const { set, teachBackText, teachBackGrade, guesses, confidences, outcomes, contrastGrade, status } = state;
+  const load = async () => {
+    onState({ status: "loading" });
+    try {
+      onState({ set: await bridge.buildActivities({ repository: repositoryRef(repository) }), status: "ready", teachBackGrade: null, outcomes: {}, contrastGrade: null });
+    } catch {
+      onState({ status: "error" });
+    }
+  };
+  const gradeTeach = async () => {
+    if (!set?.teachBack.id) return;
+    onState({ teachBackGrade: await bridge.gradeActivity({ repository: repositoryRef(repository), kind: "teach-back", id: set.teachBack.id, answer: teachBackText }) as TeachBackGrade });
+  };
+  const commit = async (id: string) => {
+    const outcome = await bridge.gradeActivity({
+      repository: repositoryRef(repository),
+      kind: "prediction",
+      id,
+      answer: guesses[id] ?? "",
+      confidence: confidences[id] ?? 0.5,
+    }) as PredictionOutcome;
+    onState({ outcomes: { ...outcomes, [id]: outcome } });
+  };
+  const chooseContrast = async (choiceId: string) => {
+    if (!set?.contrast.id) return;
+    onState({ contrastGrade: await bridge.gradeActivity({ repository: repositoryRef(repository), kind: "contrast", id: set.contrast.id, choiceId }) as ContrastGrade });
+  };
+
+  return <section className="activity-panel" data-status={status}>
+    <div className="activity-head">
+      <span>TEACH · PREDICT · CONTRAST</span>
+      <button className="ghost" disabled={status === "loading"} onClick={() => void load()}>{status === "loading" ? "Building…" : set ? "New set" : "Build activities"}</button>
+    </div>
+    {status === "error" && <p className="activity-note">Activities are unavailable for this repository.</p>}
+    {set && <>
+      <div className="activity-block" data-block="teach-back" data-available={String(set.teachBack.available)}>
+        <h4>Teach it back</h4>
+        {set.teachBack.available ? <>
+          <p>{set.teachBack.prompt}</p>
+          {set.teachBack.anchor && <button className="activity-anchor" onClick={() => onAnchor(set.teachBack.anchor!.path, set.teachBack.anchor!.line)}>{set.teachBack.anchor.path}:{set.teachBack.anchor.line}</button>}
+          <textarea className="teach-input" value={teachBackText} onChange={(event) => onState({ teachBackText: event.target.value })} placeholder="Explain it to someone who has never opened this repository…" />
+          <button className="primary" disabled={!teachBackText.trim()} onClick={() => void gradeTeach()}>Check my explanation</button>
+          {teachBackGrade && <div className="teach-grade" data-score={teachBackGrade.score} data-passed={String(teachBackGrade.passed)}>
+            <strong data-metric="teach-score">{Math.round(teachBackGrade.score * 100)}%</strong>
+            <ul>
+              {teachBackGrade.moves.map((move) => <li key={move.id} data-move={move.id} data-passed={String(move.passed)}><strong>{move.title}</strong><small>{move.detail}</small></li>)}
+            </ul>
+            {teachBackGrade.misconceptions.map((finding) => <div className="teach-misconception" key={finding.id} data-misconception={finding.id}>
+              <strong>You would teach: {finding.title}</strong><p>{finding.remediation}</p>
+            </div>)}
+          </div>}
+        </> : <p className="activity-note">{set.teachBack.reason}</p>}
+      </div>
+
+      <div className="activity-block" data-block="predictions" data-count={set.predictions.length}>
+        <h4>Predict before you look</h4>
+        {set.predictions.map((prediction) => {
+          const outcome = outcomes[prediction.id];
+          return <div className="prediction-item" key={prediction.id} data-prediction={prediction.id} data-metric={prediction.metric} data-answered={String(Boolean(outcome))}>
+            <p>{prediction.prompt}</p>
+            {!outcome && <div className="prediction-input">
+              <input value={guesses[prediction.id] ?? ""} onChange={(event) => onState({ guesses: { ...guesses, [prediction.id]: event.target.value } })} placeholder={prediction.unit} />
+              <div className="confidence-steps">
+                {CONFIDENCE_STEPS.map((level) => <button
+                  key={level}
+                  data-confidence={level}
+                  className={(confidences[prediction.id] ?? 0.5) === level ? "active" : ""}
+                  onClick={() => onState({ confidences: { ...confidences, [prediction.id]: level } })}
+                >{Math.round(level * 100)}%</button>)}
+              </div>
+              <button className="primary" disabled={!(guesses[prediction.id] ?? "").trim()} onClick={() => void commit(prediction.id)}>Commit</button>
+            </div>}
+            {outcome && <div className="prediction-outcome" data-correct={String(outcome.correct)} data-calibration={outcome.calibration}>
+              <strong>{outcome.correct ? "Correct" : outcome.close ? "Close" : "Not this time"}</strong>
+              <small>{outcome.reveal}</small>
+              <em data-brier={outcome.brier}>{outcome.calibration.replace(/-/g, " ")}</em>
+              <button onClick={() => onAnchor(outcome.anchor.path, outcome.anchor.line)}>{outcome.anchor.path.split("/").at(-1)}:{outcome.anchor.line}</button>
+            </div>}
+          </div>;
+        })}
+      </div>
+
+      <div className="activity-block" data-block="contrast" data-available={String(set.contrast.available)}>
+        <h4>Which one does this call reach?</h4>
+        {set.contrast.available ? <>
+          <p>{set.contrast.prompt}</p>
+          <div className="contrast-options">
+            {(set.contrast.options ?? []).map((option) => <button
+              key={option.id}
+              data-option={option.id}
+              data-chosen={String(contrastGrade?.choiceId === option.id)}
+              data-correct={contrastGrade ? String(contrastGrade.answerId === option.id) : "pending"}
+              onClick={() => void chooseContrast(option.id)}
+            >
+              <strong>{option.path}:{option.line}</strong>
+              <pre>{option.excerpt?.text}</pre>
+            </button>)}
+          </div>
+          {contrastGrade && <div className="contrast-grade" data-correct={String(contrastGrade.correct)}>
+            <strong>{contrastGrade.explanation}</strong>
+            {contrastGrade.differences.map((difference) => <small key={difference.id} data-difference={difference.id}>{difference.detail}</small>)}
+          </div>}
+        </> : <p className="activity-note">{set.contrast.reason}</p>}
+      </div>
     </>}
   </section>;
 }

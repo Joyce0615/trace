@@ -20,6 +20,7 @@ import { SECRET_SCANNER_VERSION, anonymizePath, redact, redactValue, scanText, s
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
 import { GIT_HISTORY_VERSION, busFactor, historyLessons, historySummary, parseHistory, readCommits } from "../electron/git-history.mjs";
 import { MISCONCEPTIONS, MISCONCEPTION_VERSION, buildProbe, calibrateSkill, detectMisconceptions, diagnoseLearner, gradeProbe } from "../electron/misconception.mjs";
+import { ACTIVITY_VERSION, buildActivitySet, excerptFor, gradeContrast, gradePrediction, gradeTeachBack, headerParameters, publicActivitySet, restatementRatio, summarizePredictions } from "../electron/activities.mjs";
 import { EXPLANATION_GRADER_VERSION, buildExplanationTask, checkCitations, claimsFailure, gradeExplanation, isNamedFunction, mentionedSymbols, publicExplanationTask } from "../electron/explanation-grader.mjs";
 import { DEFAULT_SANDBOX_LIMITS, EXECUTABLE_QUIZ_VERSION, buildExecutableQuiz, candidateValues, gradeSubmission, parseSignature, probeArguments, publicQuiz, runInSandbox, screenSubmission, selectCases, selfContainedFunctions } from "../electron/executable-quiz.mjs";
 import { DEFAULT_SCHEDULER, REVIEW_GRADE_IDS, SPACED_REPETITION_VERSION, applyReview, decayedMastery, forgettingCurve, gradeReview, intervalForRetention, retention, reviewPlan, scheduleSkill } from "../electron/spaced-repetition.mjs";
@@ -749,7 +750,8 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
     "grade:race-task", "grade:race", "trace:runtimes", "trace:run",
     "graph:architecture", "graph:symbol-flow", "history:summary", "evidence:import", "search:query", "eval:run",
     "learning:diagnose", "learning:probe", "learning:schedule", "learning:review",
-    "quiz:build", "quiz:grade", "explain:task", "explain:grade", "agents:ask",
+    "quiz:build", "quiz:grade", "explain:task", "explain:grade",
+    "activity:build", "activity:grade", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
   assert.throws(() => schemaFor("repository:evil"), /is not a registered IPC channel/);
@@ -3044,4 +3046,172 @@ test("explanations are graded against what the run actually did", async (context
   const checked = checkCitations("see app/pipeline.py:9 and app/missing.py:3", repository);
   assert.deepEqual(checked.map((item) => item.valid), [true, false]);
   assert.equal(checked[1].reason, "unknown-file");
+});
+
+test("teach-back, prediction-before-reveal, and contrast activities hold their answers back", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-activity-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "app", "legacy"), { recursive: true });
+  await writeFile(path.join(rootPath, "app", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "app", "legacy", "__init__.py"), "");
+  // Two definitions of `retry`, and a call site that resolves to exactly one.
+  await writeFile(path.join(rootPath, "app", "retry.py"), "def retry(action, attempts):\n    for _ in range(attempts):\n        result = action()\n        if result:\n            return result\n    return None\n");
+  await writeFile(path.join(rootPath, "app", "legacy", "retry.py"), "def retry(action):\n    return action()\n");
+  await writeFile(path.join(rootPath, "app", "client.py"), "from app.retry import retry\n\n\ndef fetch(action):\n    return retry(action, 3)\n");
+  await writeFile(path.join(rootPath, "app", "worker.py"), "from app.retry import retry\n\n\ndef work(action):\n    return retry(action, 5)\n");
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const sources = {};
+  for (const file of repository.files) sources[file.path] = await readRepositoryFile(rootPath, file.path);
+  assert.equal(ACTIVITY_VERSION, 1);
+
+  const set = buildActivitySet(repository, sources);
+
+  // --- Teach-back ----------------------------------------------------------
+  const teachBack = set.teachBack;
+  assert.equal(teachBack.available, true, teachBack.reason);
+  assert.equal(teachBack.symbol, "retry");
+  assert.equal(teachBack.anchor.path, "app/retry.py");
+  assert.ok(teachBack.fanIn >= 2, String(teachBack.fanIn));
+  assert.equal(round4(teachBack.moves.reduce((sum, move) => sum + move.weight, 0)), 1);
+
+  const good = gradeTeachBack(teachBack, [
+    "Think of `retry` as a persistent doorbell. You hand it something to try and a",
+    "number of attempts, and it keeps ringing until somebody answers. It matters",
+    "because the network is flaky, so a single failed call should not become a",
+    "failed request. For example, retry(fetch_page, 3) will call fetch_page up to",
+    "three times and hand back the first truthy result; if every attempt comes back",
+    "empty it returns None instead, which is how the caller knows to give up.",
+    "The implementation is at app/retry.py:1.",
+  ].join(" "), repository);
+  assert.ok(good.score > 0.9, JSON.stringify({ score: good.score, failed: good.moves.filter((move) => !move.passed).map((move) => move.id) }));
+  assert.equal(good.passed, true);
+  assert.deepEqual(good.misconceptions, []);
+  assert.ok(good.citations.some((citation) => citation.valid));
+
+  // A restatement of the declaration is not teaching, however fluent.
+  const restated = gradeTeachBack(teachBack, [
+    "The retry function takes an action and attempts. For each attempt in range",
+    "attempts it calls action and assigns the result, and if the result is truthy",
+    "it returns the result, and at the end of the loop it returns None.",
+  ].join(" "), repository);
+  assert.ok(restated.restatement > 0.45, String(restated.restatement));
+  assert.equal(restated.moves.find((move) => move.id === "not-restatement").passed, false);
+  assert.equal(restated.moves.find((move) => move.id === "gives-mechanism").passed, false);
+  assert.ok(restated.score < good.score - 0.25, `${restated.score} vs ${good.score}`);
+
+  // The distinguishing check: a fluent teach-back that would plant a misconception.
+  const misleading = gradeTeachBack(teachBack, [
+    "You can read it straight down: it runs top to bottom in the order the lines",
+    "appear, because there is only one caller and nothing else uses this, so it is",
+    "safe to change. For example, retry(fetch_page, 3) always returns a page.",
+    "See app/retry.py:1 for the details of how that works in practice.",
+  ].join(" "), repository);
+  assert.equal(misleading.passed, false, "a fluent explanation that teaches a misconception must not pass");
+  assert.ok(misleading.misconceptions.length >= 2, JSON.stringify(misleading.misconceptions.map((finding) => finding.id)));
+  assert.ok(misleading.misconceptions.some((finding) => finding.id === "execution-order"));
+  assert.ok(misleading.misconceptions.some((finding) => finding.id === "single-caller"));
+  assert.equal(misleading.moves.find((move) => move.id === "teaches-no-misconception").passed, false);
+  // It scores well on the surface moves, which is exactly why the check matters.
+  assert.equal(misleading.moves.find((move) => move.id === "gives-example").passed, true);
+  assert.equal(misleading.moves.find((move) => move.id === "cites-source").passed, true);
+  // Short answers cannot buy full credit on keywords alone.
+  assert.ok(gradeTeachBack(teachBack, "retry because for example app/retry.py:1").score < 0.35);
+
+  // --- Prediction before reveal -------------------------------------------
+  assert.ok(set.predictions.length >= 3, String(set.predictions.length));
+  const fanIn = set.predictions.find((item) => item.metric === "fan-in");
+  const parameters = set.predictions.find((item) => item.metric === "parameters");
+  assert.equal(fanIn.answer, 2, `retry is called from two files, got ${fanIn.answer}`);
+  assert.equal(parameters.answer, 2, `retry takes two parameters, got ${parameters.answer}`);
+  assert.equal(parameters.tolerance, 0, "an arity is exact or it is wrong");
+
+  const spotOn = gradePrediction(fanIn, "2", 0.8);
+  assert.equal(spotOn.correct, true);
+  assert.equal(spotOn.distance, 0);
+  assert.equal(spotOn.calibration, "confident-and-right");
+  assert.equal(spotOn.brier, round4((0.8 - 1) ** 2));
+  assert.match(spotOn.reveal, /called from 2 files/);
+  // Right answer, low confidence: correct but underconfident.
+  assert.equal(gradePrediction(fanIn, "2", 0.25).calibration, "underconfident");
+  // Confidently wrong is the case that must be named.
+  const bold = gradePrediction(fanIn, "40", 0.95);
+  assert.equal(bold.correct, false);
+  assert.equal(bold.close, false);
+  assert.equal(bold.calibration, "overconfident");
+  assert.ok(bold.brier > 0.9, String(bold.brier));
+  assert.equal(bold.distance, 38);
+  assert.equal(gradePrediction(fanIn, "13", 0.3).calibration, "appropriately-unsure");
+  // A near miss on a count earns partial credit; an exact-answer question does not.
+  const fanOut = set.predictions.find((item) => item.metric === "fan-out") ?? null;
+  assert.equal(gradePrediction(parameters, "3", 0.5).credit, 0, "arity has no tolerance");
+  if (fanOut && fanOut.answer >= 4) assert.equal(gradePrediction(fanOut, String(fanOut.answer + 1), 0.5).credit, 0.5);
+  assert.equal(gradePrediction(fanIn, "not a number", 0.5).credit, 0);
+
+  const importPrediction = set.predictions.find((item) => item.metric === "import-target");
+  if (importPrediction) {
+    assert.equal(gradePrediction(importPrediction, importPrediction.answer, 0.9).correct, true);
+    assert.equal(gradePrediction(importPrediction, "app/nope.py", 0.9).correct, false);
+  }
+
+  const rollup = summarizePredictions([spotOn, bold, gradePrediction(parameters, "2", 0.6)]);
+  assert.equal(rollup.predictions, 3);
+  assert.equal(rollup.accuracy, round4(2 / 3));
+  assert.equal(rollup.overconfident, 1);
+  assert.ok(rollup.brier > 0 && rollup.brier < 1);
+  assert.equal(summarizePredictions([]).predictions, 0);
+
+  // --- Contrastive example -------------------------------------------------
+  const contrast = set.contrast;
+  assert.equal(contrast.available, true, contrast.reason);
+  assert.equal(contrast.symbol, "retry");
+  assert.equal(contrast.options.length, 2);
+  assert.deepEqual(contrast.options.map((option) => option.path).sort(), ["app/legacy/retry.py", "app/retry.py"]);
+  assert.equal(contrast.answerId, "app/retry.py:1");
+  assert.ok(contrast.options.every((option) => option.excerpt?.text.includes("def retry")));
+  // The differences are real and derived from the two excerpts.
+  assert.ok(contrast.differences.some((difference) => difference.id === "arity"), JSON.stringify(contrast.differences));
+  assert.match(contrast.differences.find((difference) => difference.id === "arity").detail, /2 parameter\(s\).*1/);
+
+  const rightChoice = gradeContrast(contrast, "app/retry.py:1");
+  assert.equal(rightChoice.correct, true);
+  assert.match(rightChoice.explanation, /resolves to app\/retry\.py:1/);
+  assert.equal(rightChoice.anchor.path, "app/retry.py");
+  const wrongChoice = gradeContrast(contrast, "app/legacy/retry.py:1");
+  assert.equal(wrongChoice.correct, false);
+  assert.match(wrongChoice.explanation, /also defines `retry`/);
+  assert.ok(wrongChoice.differences.length >= 1, "a wrong answer still gets the comparison");
+  assert.equal(gradeContrast(contrast, "app/nowhere.py:9").correct, false);
+  assert.match(gradeContrast(contrast, "app/nowhere.py:9").explanation, /not one of the definitions/);
+
+  // --- Nothing that answers a question crosses the boundary ---------------
+  const shipped = publicActivitySet(set);
+  const serialized = JSON.stringify(shipped);
+  assert.equal(shipped.teachBack.reference, undefined, "the source to be out-explained is not shipped");
+  assert.ok(shipped.predictions.every((item) => item.answer === undefined && item.reveal === undefined && item.tolerance === undefined));
+  assert.equal(shipped.contrast.answerId, undefined, "the correct definition must not ship with the contrast");
+  assert.equal(shipped.contrast.differences, undefined);
+  for (const prediction of set.predictions) {
+    if (prediction.kind !== "numeric") continue;
+    assert.equal(serialized.includes(`"answer":${prediction.answer}`), false, `prediction answer ${prediction.answer} leaked`);
+  }
+  assert.equal(serialized.includes("called from 2 files"), false, "a reveal leaked into the shipped set");
+  // The contrast still ships both excerpts, because comparing them is the exercise.
+  assert.equal(shipped.contrast.options.length, 2);
+
+  // --- Degradation ---------------------------------------------------------
+  const bare = buildActivitySet({ symbols: [], callEdges: [], imports: [], files: [] }, {});
+  assert.equal(bare.teachBack.available, false);
+  assert.match(bare.teachBack.reason, /no indexed function/);
+  assert.equal(bare.contrast.available, false);
+  assert.match(bare.contrast.reason, /defined in two files/);
+  assert.deepEqual(bare.predictions, []);
+  // Helper behaviour.
+  assert.deepEqual(headerParameters(sources, "app/retry.py", 1), ["action", "attempts"]);
+  assert.equal(headerParameters(sources, "app/nope.py", 1), null);
+  assert.equal(excerptFor(sources, "app/retry.py", 1, 2).text.split("\n").length, 2);
+  assert.equal(restatementRatio("", "anything"), 0);
+  assert.equal(restatementRatio("completely different vocabulary entirely", "def retry action attempts"), 0);
 });

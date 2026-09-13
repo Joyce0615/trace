@@ -26,6 +26,7 @@ import { detectMisconceptions, diagnoseLearner, gradeProbe } from "./misconcepti
 import { applyReview, reviewPlan } from "./spaced-repetition.mjs";
 import { buildExecutableQuiz, gradeSubmission, publicQuiz } from "./executable-quiz.mjs";
 import { buildExplanationTask, gradeExplanation, publicExplanationTask } from "./explanation-grader.mjs";
+import { buildActivitySet, gradeContrast, gradePrediction, gradeTeachBack, publicActivitySet } from "./activities.mjs";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const openedRepositories = new Map();
@@ -38,6 +39,7 @@ const searchIndexes = new Map();
 const learnerProbes = new Map();
 const executableQuizzes = new Map();
 const explanationTasks = new Map();
+const activitySets = new Map();
 
 function openedRepository(candidate) {
   const repository = candidate?.id ? openedRepositories.get(candidate.id) : null;
@@ -424,6 +426,41 @@ const ipcHandlers = {
     const probe = learnerProbes.get(repository.id)?.[request.probeId];
     if (!probe) throw new Error("That probe is not active for this repository.");
     return gradeProbe(probe, request.choiceId);
+  },
+
+  "activity:build": async (_event, request) => {
+    const repository = openedRepository(request.repository);
+    // Only the files the three activities actually anchor into are read.
+    const wanted = new Set();
+    for (const symbol of repository.symbols ?? []) wanted.add(symbol.path);
+    const sources = {};
+    for (const filePath of [...wanted].slice(0, 300)) {
+      try {
+        sources[filePath] = await readRepositoryFile(repository.rootPath, filePath);
+      } catch {
+        // A file that cannot be read yields no excerpt, not a failed activity.
+      }
+    }
+    const set = buildActivitySet(repository, sources, { symbol: request.symbol });
+    activitySets.set(repository.id, set);
+    return publicActivitySet(set);
+  },
+
+  "activity:grade": (_event, request) => {
+    const repository = openedRepository(request.repository);
+    const set = activitySets.get(repository.id);
+    if (!set) throw new Error("No activities are active for this repository.");
+    if (request.kind === "teach-back") {
+      if (set.teachBack?.id !== request.id) throw new Error("That teach-back task is not active for this repository.");
+      return gradeTeachBack(set.teachBack, request.answer ?? "", repository);
+    }
+    if (request.kind === "prediction") {
+      const prediction = set.predictions.find((item) => item.id === request.id);
+      if (!prediction) throw new Error("That prediction is not active for this repository.");
+      return gradePrediction(prediction, request.answer ?? "", request.confidence);
+    }
+    if (set.contrast?.id !== request.id) throw new Error("That contrast is not active for this repository.");
+    return gradeContrast(set.contrast, request.choiceId);
   },
 
   "explain:task": async (_event, request) => {
