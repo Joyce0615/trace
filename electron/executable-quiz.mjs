@@ -630,7 +630,9 @@ export function publicQuiz(quiz) {
     starter: quiz.starter,
     limits: quiz.limits,
     allowedModules: ALLOWED_MODULES,
-    example: { id: example.id, arguments: example.arguments, expected: example.expected },
+    // Named `result` rather than `expected` so item 40's egress guard can treat
+    // *any* `expected` field on this channel as a leak without exception.
+    example: { id: example.id, arguments: example.arguments, result: example.expected },
     hiddenCases: quiz.cases.slice(1).map((item) => ({ id: item.id, name: item.name })),
   };
 }

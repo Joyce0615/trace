@@ -27,6 +27,7 @@ import { applyReview, reviewPlan } from "./spaced-repetition.mjs";
 import { buildExecutableQuiz, gradeSubmission, publicQuiz } from "./executable-quiz.mjs";
 import { buildExplanationTask, gradeExplanation, publicExplanationTask } from "./explanation-grader.mjs";
 import { buildActivitySet, gradeContrast, gradePrediction, gradeTeachBack, publicActivitySet } from "./activities.mjs";
+import { applyScaffold, buildScaffold, guardResponse, nextHintRung, publicScaffold, registerAnswerSecrets } from "./answer-guard.mjs";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const openedRepositories = new Map();
@@ -40,6 +41,12 @@ const learnerProbes = new Map();
 const executableQuizzes = new Map();
 const explanationTasks = new Map();
 const activitySets = new Map();
+const scaffolds = new Map();
+
+/** One key per active hint ladder, so a rung can only be served for a live task. */
+function scaffoldKey(repositoryId, kind, taskId) {
+  return `${repositoryId}|${kind}|${taskId}`;
+}
 
 function openedRepository(candidate) {
   const repository = candidate?.id ? openedRepositories.get(candidate.id) : null;
@@ -443,6 +450,22 @@ const ipcHandlers = {
     }
     const set = buildActivitySet(repository, sources, { symbol: request.symbol });
     activitySets.set(repository.id, set);
+    // The reveal sentences are answers by construction; the numeric answers and
+    // the contrast's `path:line` are covered structurally instead, because they
+    // also occur as ordinary repository facts.
+    registerAnswerSecrets(set.predictions.map((item) => item.reveal).filter(Boolean));
+    for (const prediction of set.predictions) {
+      scaffolds.set(scaffoldKey(repository.id, "prediction", prediction.id), buildScaffold("prediction", {
+        answer: prediction.answer,
+        anchorPath: prediction.anchor.path,
+      }));
+    }
+    if (set.contrast.available) {
+      scaffolds.set(scaffoldKey(repository.id, "contrast", set.contrast.id), buildScaffold("contrast", {
+        difference: set.contrast.differences[0]?.detail ?? null,
+        answer: set.contrast.answerId,
+      }));
+    }
     return publicActivitySet(set);
   },
 
@@ -472,7 +495,17 @@ const ipcHandlers = {
       return { available: false, version: 1, reason: trace.reason ?? trace.error ?? `The run produced no trace (${trace.status}).`, traceStatus: trace.status };
     }
     const task = buildExplanationTask(repository, summarizeTrace(trace, repository));
-    if (task.available) explanationTasks.set(repository.id, task);
+    if (!task.available) return publicExplanationTask(task);
+    explanationTasks.set(repository.id, task);
+    // Only the observed result is registered as a value: the function names are
+    // ordinary index data that other channels legitimately return.
+    registerAnswerSecrets([task.observed.returnValue?.value].filter(Boolean));
+    scaffolds.set(scaffoldKey(repository.id, "explanation", task.id), buildScaffold("explanation", {
+      functionCount: task.observed.functions.length,
+      maxDepth: task.observed.maxDepth,
+      entryPath: task.entry.path,
+      answer: task.observed.returnValue?.value ?? null,
+    }));
     return publicExplanationTask(task);
   },
 
@@ -481,6 +514,18 @@ const ipcHandlers = {
     const task = explanationTasks.get(repository.id);
     if (!task || task.id !== request.taskId) throw new Error("That explanation task is not active for this repository.");
     return gradeExplanation(task, request.explanation, repository);
+  },
+
+  "hint:next": (_event, request) => {
+    const repository = openedRepository(request.repository);
+    // Localization keeps its own item-27 ladder; everything else uses the
+    // shared one, and either way only the *next* rung is ever served.
+    const scaffold = request.kind === "localization"
+      ? buildScaffold("localization", { hints: localizationExercises.get(repository.id)?.get(request.taskId)?.hints ?? [] })
+      : scaffolds.get(scaffoldKey(repository.id, request.kind, request.taskId));
+    if (!scaffold?.available) throw new Error("No hint ladder is active for that task.");
+    const rung = nextHintRung(scaffold, request.used ?? []);
+    return { ...publicScaffold(scaffold), rung, used: (request.used ?? []).length, penalty: applyScaffold(1, scaffold, [...(request.used ?? []), rung?.id].filter(Boolean)).penalty };
   },
 
   "quiz:build": async (_event, request) => {
@@ -505,7 +550,17 @@ const ipcHandlers = {
       }
     }
     const quiz = await buildExecutableQuiz(repository, { sources, symbol: request.symbol });
-    if (quiz.available) executableQuizzes.set(repository.id, quiz);
+    if (!quiz.available) return publicQuiz(quiz);
+    executableQuizzes.set(repository.id, quiz);
+    // Item 40: the oracle is registered so the egress guard can prove it never
+    // comes back out, and the hint ladder is built from the same facts.
+    registerAnswerSecrets(quiz.cases.slice(1).map((item) => item.expected));
+    scaffolds.set(scaffoldKey(repository.id, "executable-quiz", quiz.id), buildScaffold("executable-quiz", {
+      parameters: (quiz.header.match(/\(([^)]*)\)/)?.[1] ?? "").split(",").filter((piece) => piece.trim()).length,
+      hiddenCases: quiz.cases.length - 1,
+      sampleInput: JSON.stringify(quiz.cases[1]?.arguments ?? []),
+      answer: quiz.cases[1]?.expected ?? null,
+    }));
     return publicQuiz(quiz);
   },
 
@@ -592,7 +647,13 @@ const ipcHandlers = {
   "practice:remove": (_event, request) => removePracticeSession(request.sessionId, Boolean(request.discardChanges)),
 };
 
-export const registeredIpcChannels = registerValidatedHandlers(ipcMain, ipcHandlers);
+// Item 40: the outbound guard. Every response is audited for structural and
+// value-level answer leakage before the renderer can see it, and a leak throws
+// rather than being logged, because a silently compromised exercise is worse
+// than a broken one.
+export const registeredIpcChannels = registerValidatedHandlers(ipcMain, ipcHandlers, {
+  onResponse: (channel, result) => guardResponse(channel, result),
+});
 
 app.whenReady().then(() => {
   createWindow();

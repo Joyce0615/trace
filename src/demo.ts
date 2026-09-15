@@ -682,6 +682,24 @@ export const browserBridge: TraceBridge = {
     if (!probe) throw new Error("That probe is not active for this repository.");
     return model.gradeProbe(probe, request.choiceId);
   },
+  async nextHint(request) {
+    // The demo runs the same ladder builder, so a rung is never a giveaway here
+    // either, and rungs are still served strictly one at a time.
+    const guard = await import("../electron/answer-guard.mjs");
+    if (!demoActivities) throw new Error("No hint ladder is active for that task.");
+    const prediction = demoActivities.predictions.find((item) => item.id === request.taskId);
+    const scaffold = request.kind === "prediction" && prediction
+      ? guard.buildScaffold("prediction", { answer: prediction.answer, anchorPath: prediction.anchor.path })
+      : { kind: request.kind, available: false as const, reason: "No hint ladder is active for that task.", rungs: [] };
+    if (!scaffold.available) throw new Error("No hint ladder is active for that task.");
+    const rung = guard.nextHintRung(scaffold, request.used ?? []);
+    return {
+      ...guard.publicScaffold(scaffold),
+      rung,
+      used: (request.used ?? []).length,
+      penalty: guard.applyScaffold(1, scaffold, [...(request.used ?? []), rung?.id].filter(Boolean) as string[]).penalty,
+    };
+  },
   async buildActivities(request) {
     // Node-free, so the demo runs the very same activity builders and graders.
     const activities = await import("../electron/activities.mjs");

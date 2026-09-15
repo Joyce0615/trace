@@ -604,6 +604,63 @@ try {
   assert.equal(diagnosisAudit.right.misconception, null);
   assert.match(diagnosisAudit.stale ?? "", /not active for this repository/);
 
+  // Item 40: the outbound answer guard, live on every channel, plus the shared
+  // progressive hint ladder.
+  const guardAudit = await page.evaluate(async () => {
+    const repository = { id: window.traceWorkspace.repository.id, rootPath: window.traceWorkspace.repository.rootPath };
+    const set = await window.trace.buildActivities({ repository });
+    const prediction = set.predictions[0];
+    const rungs = [];
+    const used = [];
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const response = await window.trace.nextHint({ repository, kind: "prediction", taskId: prediction.id, used });
+      if (!response.rung) { rungs.push({ exhausted: true, penalty: response.penalty, total: response.total }); break; }
+      rungs.push({ id: response.rung.id, level: response.rung.level, price: response.rung.price, text: response.rung.text, penalty: response.penalty, remaining: response.rung.remaining });
+      used.push(response.rung.id);
+    }
+    // Asking for the same rung twice must not skip ahead.
+    const repeated = await window.trace.nextHint({ repository, kind: "prediction", taskId: prediction.id, used: [] });
+    const outcome = await window.trace.gradeActivity({ repository, kind: "prediction", id: prediction.id, answer: "1", confidence: 0.5 });
+    let unknownLadder = null;
+    try {
+      await window.trace.nextHint({ repository, kind: "prediction", taskId: "predict-nope", used: [] });
+    } catch (error) {
+      unknownLadder = error.message;
+    }
+    // Data channels still work: the guard must not have made them unusable.
+    const readBack = await window.trace.readFile(repository.rootPath, window.traceWorkspace.repository.files[0].path);
+    const searched = await window.trace.search({ repository, query: window.traceWorkspace.repository.symbols[0].name, limit: 5 });
+    return { set, rungs, repeated, outcome, unknownLadder, readOk: typeof readBack === "string", searchOk: Array.isArray(searched.results) };
+  });
+  // Rungs are served one at a time, in order, and priced cumulatively.
+  const servedRungs = guardAudit.rungs.filter((item) => !item.exhausted);
+  assert.ok(servedRungs.length >= 2, JSON.stringify(guardAudit.rungs));
+  assert.deepEqual(servedRungs.map((item) => item.level), servedRungs.map((_unused, index) => index + 1));
+  assert.equal(new Set(servedRungs.map((item) => item.id)).size, servedRungs.length, "the ladder must advance, not repeat");
+  assert.ok(servedRungs.at(-1).penalty > servedRungs[0].penalty, JSON.stringify(servedRungs.map((item) => item.penalty)));
+  assert.ok(servedRungs.at(-1).penalty <= 0.45, String(servedRungs.at(-1).penalty));
+  assert.ok(guardAudit.rungs.at(-1).exhausted, "the ladder ends rather than looping");
+  assert.equal(guardAudit.repeated.rung.id, servedRungs[0].id, "asking again with no history returns the first rung, not a later one");
+  // The invariant: no rung spells the answer the learner is about to commit to.
+  const revealedNumber = String(guardAudit.outcome.answer);
+  for (const rung of servedRungs) {
+    assert.equal(
+      new RegExp(`(?:^|[^0-9])${revealedNumber}(?:[^0-9]|$)`).test(rung.text),
+      false,
+      `rung ${rung.id} spelled the answer ${revealedNumber}: ${rung.text}`,
+    );
+  }
+  assert.match(guardAudit.unknownLadder ?? "", /No hint ladder is active/);
+  // The guard is live: every response above passed it, and data channels still work.
+  assert.equal(guardAudit.readOk, true);
+  assert.equal(guardAudit.searchOk, true);
+  // A handler that tried to return an answer would be stopped, not logged.
+  const guardBlocks = await page.evaluate(async () => {
+    const module = await import("./electron/answer-guard.mjs").catch(() => null);
+    return module === null;
+  });
+  assert.equal(guardBlocks, true, "the renderer cannot import the main-process guard");
+
   // Item 39: teach-back, prediction-before-reveal, and contrast, all built from
   // the real index with every answer held in the main process.
   const activityAudit = await page.evaluate(async () => {
@@ -763,7 +820,7 @@ try {
   assert.equal(quizAudit.quiz.available, true, quizAudit.quiz.reason);
   assert.equal(quizAudit.quiz.language, "python");
   assert.ok(quizAudit.quiz.hiddenCases.length >= 4, String(quizAudit.quiz.hiddenCases.length));
-  assert.ok(quizAudit.quiz.example.expected.length > 0);
+  assert.ok(quizAudit.quiz.example.result.length > 0);
   // The entry point and its anchor are real, indexed repository source.
   const quizAnchorValid = await page.evaluate((anchor) => {
     const workspace = window.traceWorkspace;
@@ -775,8 +832,10 @@ try {
   assert.deepEqual(quizAnchorValid, { fileIndexed: true, symbolIndexed: true });
   // Hidden tests ship a name and nothing else; the oracle stays behind the IPC boundary.
   assert.ok(quizAudit.quiz.hiddenCases.every((item) => Object.keys(item).sort().join(",") === "id,name"), JSON.stringify(quizAudit.quiz.hiddenCases[0]));
-  assert.equal(quizAudit.serialized.includes('"expected"'), true, "only the worked example carries an expected value");
-  assert.equal((quizAudit.serialized.match(/"expected"/g) ?? []).length, 1);
+  // Item 40: the field is called `result`, so `expected` can be banned outright
+  // on this channel and the hidden oracle has nowhere to hide.
+  assert.equal(quizAudit.serialized.includes('"expected"'), false, "no `expected` field may cross this channel");
+  assert.equal((quizAudit.serialized.match(/"result"/g) ?? []).length, 1, "exactly one worked-example result crosses IPC");
   // A constant answer cannot pass a discriminating suite.
   assert.equal(quizAudit.constant.status, "ran");
   assert.equal(quizAudit.constant.passed, false);
@@ -1025,6 +1084,7 @@ try {
       lessons: { score: evaluationAudit.lessons.score, verdict: evaluationAudit.lessons.verdict },
     },
     diagnosis: { skills: diagnosis.skills.length, assessed: diagnosis.summary.assessed, meanConfidence: diagnosis.summary.meanConfidence, brier: diagnosis.summary.meanBrier, overconfident: diagnosis.summary.overconfidentSkills, misconceptions: diagnosis.summary.misconceptionCounts },
+    answerGuard: { rungsServed: servedRungs.length, rungIds: servedRungs.map((item) => item.id), finalPenalty: servedRungs.at(-1).penalty, revealedAnswer: revealedNumber, dataChannelsOk: guardAudit.readOk && guardAudit.searchOk },
     activities: { teachBack: activitySet.teachBack.symbol, misleadingScore: activityAudit.misleading.score, misconceptions: activityAudit.misleading.misconceptions.map((finding) => finding.id), solidScore: activityAudit.solid.score, predictions: activitySet.predictions.map((item) => item.metric), boldBrier: activityAudit.bold.brier, humbleBrier: activityAudit.humble.brier, contrastSymbol: activitySet.contrast.symbol, contrastPaths: activitySet.contrast.options.map((option) => `${option.path}:${option.line}`), differences: activityAudit.contrastRight.differences.map((item) => item.id) },
     explanation: { entry: explainAudit.task.entry.name, observedOrder: explainAudit.grounded.observed.order.join(" → "), groundedScore: explainAudit.grounded.score, groundedBand: explainAudit.grounded.band, fabricatedScore: explainAudit.fabricated.score, contradictions: explainAudit.fabricated.contradictions.map((item) => item.claim) },
     executableQuiz: { entry: quizAudit.quiz.entry, anchor: `${quizAudit.quiz.anchor.path}:${quizAudit.quiz.anchor.line}`, hiddenCases: quizAudit.quiz.hiddenCases.length, buildMs: Math.round(quizAudit.buildMs), constantScore: `${quizAudit.constant.passedCases}/${quizAudit.constant.totalCases}`, enforced: quizAudit.constant.enforced, loopingStatus: quizAudit.looping.status },

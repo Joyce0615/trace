@@ -833,6 +833,27 @@ export interface ProbeGrade {
   anchor: CodeAnchor | null;
 }
 
+export interface HintRung {
+  id: string;
+  level: number;
+  price: number;
+  text: string;
+  remaining: number;
+}
+
+export interface HintResponse {
+  version: number;
+  kind: "executable-quiz" | "explanation" | "contrast" | "prediction" | "localization";
+  available: boolean;
+  reason?: string;
+  total: number;
+  prices: number[];
+  maxPenalty: number;
+  rung: HintRung | null;
+  used: number;
+  penalty: number;
+}
+
 export interface TeachBackTask {
   available: boolean;
   kind: "teach-back";
@@ -971,7 +992,7 @@ export interface ExecutableQuiz {
   starter?: string;
   limits?: { wallClockMs: number; cpuSeconds: number; memoryBytes: number; maxSubmissionBytes: number };
   allowedModules?: string[];
-  example?: { id: string; arguments: unknown[]; expected: string };
+  example?: { id: string; arguments: unknown[]; result: string };
   hiddenCases?: Array<{ id: string; name: string }>;
 }
 
@@ -1143,6 +1164,7 @@ export interface TraceBridge {
   evaluate(request: { repository: RepositoryRef; course?: Course; skillGraph?: SkillGraph; answers?: unknown[]; sampleSize?: number }): Promise<EvaluationReport>;
   diagnose(request: { repository: RepositoryRef; skillGraph: SkillGraph; learnerState: LearnerState; text?: string }): Promise<DiagnosisReport>;
   answerProbe(request: { repository: RepositoryRef; probeId: string; choiceId: string }): Promise<ProbeGrade>;
+  nextHint(request: { repository: RepositoryRef; kind: HintResponse["kind"]; taskId: string; used?: string[] }): Promise<HintResponse>;
   buildActivities(request: { repository: RepositoryRef; symbol?: string }): Promise<ActivitySet>;
   /** One channel for all three activity kinds; the caller narrows the result by `kind`. */
   gradeActivity(request: { repository: RepositoryRef; kind: "teach-back" | "prediction" | "contrast"; id: string; answer?: string; confidence?: number; choiceId?: string }): Promise<TeachBackGrade | PredictionOutcome | ContrastGrade>;

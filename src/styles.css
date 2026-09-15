@@ -867,3 +867,10 @@ button { color: inherit; }
 .contrast-grade { display: flex; flex-direction: column; gap: 3px; padding: 7px 9px; border: 1px solid #1e2532; border-radius: 8px; background: #10141d; }
 .contrast-grade strong { color: #dbe1ea; font-size: calc(10px + var(--font-boost)); }
 .contrast-grade small { color: #7d8798; font-size: calc(9px + var(--font-boost)); }
+
+/* Item 40: priced, progressive hint rungs. */
+.hint-button { padding: 3px 10px; border: 1px dashed #3a4456; border-radius: 7px; background: none; color: #93a0b1; font-size: calc(9px + var(--font-boost)); cursor: pointer; }
+.hint-ladder { display: flex; flex-direction: column; gap: 3px; }
+.hint-rung { display: flex; align-items: baseline; gap: 8px; padding: 4px 8px; border-left: 2px solid #f0b866; border-radius: 5px; background: #14110c; }
+.hint-rung span { color: #cbbf9f; font-size: calc(9px + var(--font-boost)); }
+.hint-rung em { margin-left: auto; color: #8a7a55; font-style: normal; font-size: calc(9px + var(--font-boost)); }

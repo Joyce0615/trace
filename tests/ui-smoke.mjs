@@ -202,6 +202,30 @@ try {
   assert.ok(Number(await prediction.locator("[data-brier]").getAttribute("data-brier")) > 0.9);
   assert.match(await prediction.locator(".prediction-outcome small").innerText(), /is called from \d+ file/);
 
+  // Item 40: the hint ladder is progressive, priced, and never spells the answer.
+  const hintTargetId = await activities.locator('.prediction-item[data-answered="false"]').first().getAttribute("data-prediction");
+  const hintTarget = activities.locator(`.prediction-item[data-prediction="${hintTargetId}"]`);
+  await hintTarget.waitFor();
+  await hintTarget.getByRole("button", { name: /^Hint \(0\)$/ }).click();
+  await hintTarget.locator(".hint-rung").waitFor();
+  assert.equal(await hintTarget.locator(".hint-rung").count(), 1, "only the next rung is served");
+  const firstRungId = await hintTarget.locator(".hint-rung").first().getAttribute("data-rung");
+  await hintTarget.getByRole("button", { name: /^Hint \(1\)$/ }).click();
+  await hintTarget.locator(".hint-rung").nth(1).waitFor();
+  const secondRungId = await hintTarget.locator(".hint-rung").nth(1).getAttribute("data-rung");
+  assert.notEqual(secondRungId, firstRungId, "the ladder must advance, not repeat");
+  // Hints cost, and the cost accumulates.
+  const penalty = Number(await hintTarget.locator(".hint-ladder").getAttribute("data-penalty"));
+  assert.ok(penalty > 0 && penalty <= 0.45, String(penalty));
+  // No rung contains the answer the learner is about to commit to.
+  const rungText = await hintTarget.locator(".hint-ladder").innerText();
+  await hintTarget.locator("input").fill("1");
+  await hintTarget.getByRole("button", { name: "Commit" }).click();
+  await hintTarget.locator(".prediction-outcome").waitFor();
+  const revealedAnswer = (await hintTarget.locator(".prediction-outcome small").innerText()).match(/\b(\d+)\b/)?.[1];
+  assert.ok(revealedAnswer, "the reveal names the real answer");
+  assert.equal(new RegExp(`(?:^|[^0-9])${revealedAnswer}(?:[^0-9]|$)`).test(rungText), false, `a hint rung spelled the answer: ${rungText}`);
+
   // nano-vllm defines no function name twice, so the contrast honestly reports
   // that there is no ambiguity to contrast rather than inventing one.
   const contrast = activities.locator('.activity-block[data-block="contrast"]');

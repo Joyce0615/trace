@@ -316,6 +316,12 @@ export const IPC_SCHEMAS = {
     taskId: s.string({ maxLength: 400 }),
     explanation: s.string({ maxLength: 8_000 }),
   }),
+  "hint:next": s.object({
+    repository: repositoryReference,
+    kind: s.literal(["executable-quiz", "explanation", "contrast", "prediction", "localization"]),
+    taskId: s.string({ maxLength: 400 }),
+    used: s.array(s.string({ maxLength: 64 }), { maxItems: 12, optional: true }),
+  }),
   "quiz:build": s.object({
     repository: repositoryReference,
     symbol: s.string({ maxLength: 200, optional: true }),
@@ -400,12 +406,16 @@ export function schemaFor(channel) {
 /**
  * Wrap `ipcMain.handle` so no handler can be registered without a schema and no
  * handler can run on an unvalidated payload.
+ *
+ * `onResponse` is the matching guard on the way out (item 40): it sees every
+ * response before the renderer does and may throw to stop it.
  */
-export function registerValidatedHandlers(ipcMain, handlers) {
+export function registerValidatedHandlers(ipcMain, handlers, options = {}) {
   const registered = [];
+  const onResponse = options.onResponse ?? ((_channel, result) => result);
   for (const [channel, handler] of Object.entries(handlers)) {
     const schema = schemaFor(channel);
-    ipcMain.handle(channel, async (event, payload) => handler(event, validatePayload(channel, schema, payload)));
+    ipcMain.handle(channel, async (event, payload) => onResponse(channel, await handler(event, validatePayload(channel, schema, payload))));
     registered.push(channel);
   }
   const missing = Object.keys(IPC_SCHEMAS).filter((channel) => !registered.includes(channel));

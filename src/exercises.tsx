@@ -684,7 +684,7 @@ export function ActivityPanel({ repository, state, onState, onAnchor }: {
   onState: (update: Partial<ActivityState>) => void;
   onAnchor: (path: string, line: number) => void;
 }) {
-  const { set, teachBackText, teachBackGrade, guesses, confidences, outcomes, contrastGrade, status } = state;
+  const { set, teachBackText, teachBackGrade, guesses, confidences, outcomes, contrastGrade, hints, penalties, status } = state;
   const load = async () => {
     onState({ status: "loading" });
     try {
@@ -706,6 +706,14 @@ export function ActivityPanel({ repository, state, onState, onAnchor }: {
       confidence: confidences[id] ?? 0.5,
     }) as PredictionOutcome;
     onState({ outcomes: { ...outcomes, [id]: outcome } });
+  };
+  // Item 40: rungs are fetched one at a time from the main process and priced,
+  // so a stuck learner has somewhere to go without the answer being available.
+  const revealHint = async (id: string) => {
+    const used = (hints[id] ?? []).map((rung) => rung.id);
+    const response = await bridge.nextHint({ repository: repositoryRef(repository), kind: "prediction", taskId: id, used });
+    if (!response.rung) return;
+    onState({ hints: { ...hints, [id]: [...(hints[id] ?? []), response.rung] }, penalties: { ...penalties, [id]: response.penalty } });
   };
   const chooseContrast = async (choiceId: string) => {
     if (!set?.contrast.id) return;
@@ -755,6 +763,12 @@ export function ActivityPanel({ repository, state, onState, onAnchor }: {
                 >{Math.round(level * 100)}%</button>)}
               </div>
               <button className="primary" disabled={!(guesses[prediction.id] ?? "").trim()} onClick={() => void commit(prediction.id)}>Commit</button>
+              <button className="hint-button" onClick={() => void revealHint(prediction.id)}>Hint ({(hints[prediction.id] ?? []).length})</button>
+            </div>}
+            {(hints[prediction.id] ?? []).length > 0 && <div className="hint-ladder" data-revealed={(hints[prediction.id] ?? []).length} data-penalty={penalties[prediction.id] ?? 0}>
+              {(hints[prediction.id] ?? []).map((rung) => <div key={rung.id} className="hint-rung" data-rung={rung.id} data-level={rung.level}>
+                <span>{rung.text}</span><em>-{Math.round(rung.price * 100)}%</em>
+              </div>)}
             </div>}
             {outcome && <div className="prediction-outcome" data-correct={String(outcome.correct)} data-calibration={outcome.calibration}>
               <strong>{outcome.correct ? "Correct" : outcome.close ? "Close" : "Not this time"}</strong>
@@ -916,7 +930,7 @@ export function ExecutableQuizPanel({ repository, state, onState, onAnchor }: {
       {quiz.docstring && <blockquote className="quiz-doc">{quiz.docstring}</blockquote>}
       <div className="quiz-example" data-case={quiz.example?.id}>
         <span>WORKED EXAMPLE</span>
-        <code>{quiz.entry}({(quiz.example?.arguments ?? []).map((value) => JSON.stringify(value)).join(", ")}) → {quiz.example?.expected}</code>
+        <code>{quiz.entry}({(quiz.example?.arguments ?? []).map((value) => JSON.stringify(value)).join(", ")}) → {quiz.example?.result}</code>
       </div>
       <div className="quiz-hidden" data-hidden={quiz.hiddenCases?.length ?? 0}>
         {(quiz.hiddenCases ?? []).map((item) => <span key={item.id} data-case={item.id}>{item.name}</span>)}

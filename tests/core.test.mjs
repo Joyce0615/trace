@@ -20,6 +20,7 @@ import { SECRET_SCANNER_VERSION, anonymizePath, redact, redactValue, scanText, s
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
 import { GIT_HISTORY_VERSION, busFactor, historyLessons, historySummary, parseHistory, readCommits } from "../electron/git-history.mjs";
 import { MISCONCEPTIONS, MISCONCEPTION_VERSION, buildProbe, calibrateSkill, detectMisconceptions, diagnoseLearner, gradeProbe } from "../electron/misconception.mjs";
+import { ALWAYS_FORBIDDEN, ANSWER_GUARD_VERSION, MAX_HINT_PENALTY, SCANNED_CHANNELS, answerSecrets, applyScaffold, auditResponse, buildScaffold, clearAnswerSecrets, findForbiddenKeys, findLeakedValues, forbiddenKeysFor, guardResponse, nextHintRung, publicScaffold, registerAnswerSecrets, scaffoldPenalty } from "../electron/answer-guard.mjs";
 import { ACTIVITY_VERSION, buildActivitySet, excerptFor, gradeContrast, gradePrediction, gradeTeachBack, headerParameters, publicActivitySet, restatementRatio, summarizePredictions } from "../electron/activities.mjs";
 import { EXPLANATION_GRADER_VERSION, buildExplanationTask, checkCitations, claimsFailure, gradeExplanation, isNamedFunction, mentionedSymbols, publicExplanationTask } from "../electron/explanation-grader.mjs";
 import { DEFAULT_SANDBOX_LIMITS, EXECUTABLE_QUIZ_VERSION, buildExecutableQuiz, candidateValues, gradeSubmission, parseSignature, probeArguments, publicQuiz, runInSandbox, screenSubmission, selectCases, selfContainedFunctions } from "../electron/executable-quiz.mjs";
@@ -751,7 +752,7 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
     "graph:architecture", "graph:symbol-flow", "history:summary", "evidence:import", "search:query", "eval:run",
     "learning:diagnose", "learning:probe", "learning:schedule", "learning:review",
     "quiz:build", "quiz:grade", "explain:task", "explain:grade",
-    "activity:build", "activity:grade", "agents:ask",
+    "activity:build", "activity:grade", "hint:next", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
   assert.throws(() => schemaFor("repository:evil"), /is not a registered IPC channel/);
@@ -2830,7 +2831,10 @@ test("executable quizzes hide their oracle and run inside a bounded sandbox", as
   for (const hidden of quiz.cases.slice(1)) {
     assert.equal(serialized.includes(JSON.stringify(hidden.arguments)), false, `hidden input ${JSON.stringify(hidden.arguments)} leaked`);
   }
-  assert.ok(shipped.example.expected === quiz.cases[0].expected, "the worked example does carry its answer");
+  assert.equal(shipped.example.result, quiz.cases[0].expected, "the worked example does carry its answer");
+  assert.equal(shipped.example.expected, undefined, "and it is not called `expected`, so the egress guard can ban that field outright");
+  assert.equal(auditResponse("quiz:build", shipped).ok, true, JSON.stringify(auditResponse("quiz:build", shipped)));
+  assert.equal(auditResponse("quiz:build", quiz).ok, false, "the internal quiz with its oracle would be stopped");
 
   // --- Grading -------------------------------------------------------------
   const correct = await gradeSubmission(quiz, `${tokensSource.split("\n\n\n")[0]}\n`);
@@ -3214,4 +3218,135 @@ test("teach-back, prediction-before-reveal, and contrast activities hold their a
   assert.equal(excerptFor(sources, "app/retry.py", 1, 2).text.split("\n").length, 2);
   assert.equal(restatementRatio("", "anything"), 0);
   assert.equal(restatementRatio("completely different vocabulary entirely", "def retry action attempts"), 0);
+});
+
+test("the egress guard blocks answer leaks and the hint ladder never gives one away", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-guard-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  context.after(() => clearAnswerSecrets());
+  await mkdir(path.join(rootPath, "app", "legacy"), { recursive: true });
+  await writeFile(path.join(rootPath, "app", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "app", "legacy", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "app", "retry.py"), "def retry(action, attempts):\n    for _ in range(attempts):\n        result = action()\n        if result:\n            return result\n    return None\n");
+  await writeFile(path.join(rootPath, "app", "legacy", "retry.py"), "def retry(action):\n    return action()\n");
+  await writeFile(path.join(rootPath, "app", "client.py"), "from app.retry import retry\n\n\ndef fetch(action):\n    return retry(action, 3)\n");
+  await writeFile(path.join(rootPath, "app", "worker.py"), "from app.retry import retry\n\n\ndef work(action):\n    return retry(action, 5)\n");
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const sources = {};
+  for (const file of repository.files) sources[file.path] = await readRepositoryFile(rootPath, file.path);
+  assert.equal(ANSWER_GUARD_VERSION, 1);
+
+  // --- Structural leaks ----------------------------------------------------
+  clearAnswerSecrets();
+  // `answerId` is feedback on a grade and a leak on a task, so it is per-channel.
+  assert.ok(forbiddenKeysFor("activity:build").includes("answerId"));
+  assert.equal(forbiddenKeysFor("activity:grade").includes("answerId"), false, "revealing the answer after answering is feedback");
+  assert.ok(ALWAYS_FORBIDDEN.includes("answerKey"));
+  // Depth does not matter.
+  assert.deepEqual(
+    findForbiddenKeys({ a: { b: [{ answerKey: "x" }] } }, ["answerKey"]),
+    [".a.b[0].answerKey"],
+  );
+  // Explicitly stripping a field is how the graders remove an answer, and that
+  // must not be reported as a leak.
+  assert.deepEqual(findForbiddenKeys({ probe: { answerKey: undefined } }, ["answerKey"]), []);
+  assert.equal(auditResponse("activity:build", { predictions: [{ id: "p", answer: 4 }] }).ok, false);
+  assert.deepEqual(auditResponse("activity:build", { predictions: [{ id: "p", answer: 4 }] }).forbiddenKeys, [".predictions[0].answer"]);
+  assert.equal(auditResponse("activity:build", { predictions: [{ id: "p" }] }).ok, true);
+  assert.throws(() => guardResponse("quiz:build", { cases: [{ expected: "1" }] }), (error) => error.name === "AnswerLeakError" && /field \.cases/.test(error.message));
+  assert.deepEqual(guardResponse("quiz:build", { id: "q", hiddenCases: [{ id: "c", name: "hidden test 1" }] }), { id: "q", hiddenCases: [{ id: "c", name: "hidden test 1" }] });
+
+  // --- Value leaks ---------------------------------------------------------
+  clearAnswerSecrets();
+  registerAnswerSecrets(["`retry` is called from 2 files: app/client.py, app/worker.py.", "short"]);
+  assert.equal(answerSecrets().length, 1, "a value shorter than the scan floor is not registered");
+  assert.equal(findLeakedValues({ note: "nothing here" }).length, 0);
+  assert.equal(findLeakedValues({ hint: "`retry` is called from 2 files: app/client.py, app/worker.py." }).length, 1);
+  assert.throws(
+    () => guardResponse("activity:build", { predictions: [{ id: "p", prompt: "`retry` is called from 2 files: app/client.py, app/worker.py." }] }),
+    /would have leaked an answer: value/,
+  );
+  // Only exercise channels are scanned: a function name or reveal-shaped string
+  // is legitimate content on a data channel, and breaking those protects nothing.
+  assert.equal(SCANNED_CHANNELS.has("repository:read-file"), false);
+  assert.doesNotThrow(() => guardResponse("repository:read-file", "`retry` is called from 2 files: app/client.py, app/worker.py."));
+  assert.doesNotThrow(() => guardResponse("search:query", { results: [{ snippet: { text: "`retry` is called from 2 files: app/client.py, app/worker.py." } }] }));
+  clearAnswerSecrets();
+
+  // --- Every real exercise payload passes the guard ------------------------
+  const set = buildActivitySet(repository, sources);
+  registerAnswerSecrets(set.predictions.map((item) => item.reveal));
+  const shippedActivities = publicActivitySet(set);
+  assert.equal(auditResponse("activity:build", shippedActivities).ok, true, JSON.stringify(auditResponse("activity:build", shippedActivities)));
+  // ...and the internal set with its answers would not.
+  assert.equal(auditResponse("activity:build", set).ok, false);
+  assert.ok(auditResponse("activity:build", set).forbiddenKeys.length >= 3);
+  assert.ok(auditResponse("activity:build", set).leakedValues.length >= 1);
+  // The same for the localization exercise and the diagnosis report.
+  const localization = buildLocalizationExercise(repository);
+  assert.equal(auditResponse("exercise:localization", publicLocalizationExercise(localization)).ok, true);
+  assert.equal(auditResponse("exercise:localization", localization).ok, false);
+  const skillGraph = buildSkillGraph(repository, generateStarterCourse(repository));
+  const diagnosis = diagnoseLearner({ mastery: {} }, skillGraph, repository);
+  assert.equal(auditResponse("learning:diagnose", { ...diagnosis, probes: undefined }).ok, true, JSON.stringify(auditResponse("learning:diagnose", { ...diagnosis, probes: undefined })));
+  assert.equal(auditResponse("learning:diagnose", diagnosis).ok, false, "the probe answer key must be caught");
+  clearAnswerSecrets();
+
+  // --- The hint ladder -----------------------------------------------------
+  const fanIn = set.predictions.find((item) => item.metric === "fan-in");
+  const ladder = buildScaffold("prediction", { answer: fanIn.answer, anchorPath: fanIn.anchor.path });
+  assert.equal(ladder.available, true);
+  assert.ok(ladder.rungs.length >= 2, String(ladder.rungs.length));
+  assert.deepEqual(ladder.rungs.map((rung) => rung.level), ladder.rungs.map((_unused, index) => index + 1));
+  // The invariant: no rung spells the answer out.
+  for (const rung of ladder.rungs) {
+    assert.equal(new RegExp(`(?:^|[^0-9])${fanIn.answer}(?:[^0-9]|$)`).test(rung.text), false, `rung ${rung.id} spells the answer: ${rung.text}`);
+  }
+  // A rung that would have contained the answer is dropped, not shown.
+  const risky = buildScaffold("contrast", { difference: "the answer is app/retry.py:1", answer: "app/retry.py:1" });
+  assert.ok(risky.dropped.includes("contrast-difference"), JSON.stringify(risky));
+  assert.equal(risky.rungs.some((rung) => rung.text.includes("app/retry.py:1")), false);
+  // Rungs are served one at a time; a learner cannot jump to the strongest hint.
+  const first = nextHintRung(ladder, []);
+  assert.equal(first.id, ladder.rungs[0].id);
+  assert.equal(first.remaining, ladder.rungs.length - 1);
+  const second = nextHintRung(ladder, [first.id]);
+  assert.equal(second.id, ladder.rungs[1].id);
+  assert.notEqual(second.id, first.id);
+  assert.equal(nextHintRung(ladder, ladder.rungs.map((rung) => rung.id)), null);
+  // Hints are priced, cumulative, capped, and a fabricated id is ignored.
+  assert.equal(scaffoldPenalty(ladder, []).penalty, 0);
+  assert.ok(scaffoldPenalty(ladder, [first.id]).penalty > 0);
+  assert.ok(scaffoldPenalty(ladder, [first.id, second.id]).penalty > scaffoldPenalty(ladder, [first.id]).penalty);
+  assert.deepEqual(scaffoldPenalty(ladder, ["not-a-rung"]), { revealed: [], ignored: ["not-a-rung"], penalty: 0 });
+  assert.ok(scaffoldPenalty(ladder, ladder.rungs.map((rung) => rung.id)).penalty <= MAX_HINT_PENALTY);
+  const applied = applyScaffold(1, ladder, [first.id, second.id]);
+  assert.equal(applied.raw, 1);
+  assert.ok(applied.score < 1 && applied.score > 0.5, JSON.stringify(applied));
+  assert.equal(applied.score, round4(1 - applied.penalty));
+  // Scaffolding reduces a score; it never erases it.
+  assert.ok(applyScaffold(1, ladder, ladder.rungs.map((rung) => rung.id)).score >= 1 - MAX_HINT_PENALTY);
+  assert.equal(applyScaffold(0, ladder, [first.id]).score, 0);
+  // The shipped ladder lists prices but not texts, so rungs must be fetched.
+  const publicLadder = publicScaffold(ladder);
+  assert.equal(publicLadder.total, ladder.rungs.length);
+  assert.deepEqual(publicLadder.prices, ladder.rungs.map((rung) => rung.price));
+  assert.equal(JSON.stringify(publicLadder).includes(ladder.rungs[0].text), false, "a ladder must not ship its rung texts");
+  assert.equal(auditResponse("hint:next", { ...publicLadder, rung: first }).ok, true);
+
+  // Every activity kind has a ladder, and an unknown kind degrades honestly.
+  for (const kind of ["executable-quiz", "explanation", "contrast", "prediction"]) {
+    const built = buildScaffold(kind, { answer: null });
+    assert.equal(built.available, true, kind);
+    assert.ok(built.rungs.every((rung) => rung.price > 0 && rung.text.length > 10), kind);
+  }
+  assert.equal(buildScaffold("nonsense", {}).available, false);
+  assert.match(buildScaffold("nonsense", {}).reason, /No hint ladder/);
+  // The localization ladder is adopted from item 27 rather than duplicated.
+  const adopted = buildScaffold("localization", { hints: localization.hints });
+  assert.equal(adopted.rungs.length, localization.hints.length);
+  assert.equal(adopted.rungs[0].text, localization.hints[0].text);
 });

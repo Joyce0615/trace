@@ -1,4 +1,4 @@
-import type { ActivitySet, Architecture, ContrastGrade, DiagnosisReport, EvaluationReport, EvidenceImport, ExecutableQuiz, ExplanationGrade, ExplanationTask, HistorySummary, PredictionOutcome, TeachBackGrade, Lesson, ProbeGrade, QuizGrade, ReviewPlan, ReviewResult, SymbolFlow, CallChain, LocalizationExercise, LocalizationHint, LocalizationScore, PredictionExercise, PredictionGrade, RaceReport, RaceTask, TraceRunResult, TraceRuntime } from "./types";
+import type { ActivitySet, Architecture, ContrastGrade, DiagnosisReport, EvaluationReport, EvidenceImport, ExecutableQuiz, ExplanationGrade, ExplanationTask, HintRung, HistorySummary, PredictionOutcome, TeachBackGrade, Lesson, ProbeGrade, QuizGrade, ReviewPlan, ReviewResult, SymbolFlow, CallChain, LocalizationExercise, LocalizationHint, LocalizationScore, PredictionExercise, PredictionGrade, RaceReport, RaceTask, TraceRunResult, TraceRuntime } from "./types";
 
 /**
  * Exercise state shapes.
@@ -130,6 +130,9 @@ export type ActivityState = {
   confidences: Record<string, number>;
   outcomes: Record<string, PredictionOutcome>;
   contrastGrade: ContrastGrade | null;
+  /** Revealed hint rungs per prediction, and what they have cost so far. */
+  hints: Record<string, HintRung[]>;
+  penalties: Record<string, number>;
   status: "idle" | "loading" | "ready" | "error";
 };
 
@@ -141,5 +144,7 @@ export const emptyActivityState: ActivityState = {
   confidences: {},
   outcomes: {},
   contrastGrade: null,
+  hints: {},
+  penalties: {},
   status: "idle",
 };
