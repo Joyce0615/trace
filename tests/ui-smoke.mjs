@@ -234,6 +234,29 @@ try {
   assert.equal(await contrast.locator(".contrast-options").count(), 0);
   await page.screenshot({ path: path.join(artifactDirectory, "activities.png") });
 
+  // Item 41: analytics over the events this session actually produced.
+  await page.locator(".content-tabs").getByRole("button", { name: "Diagram" }).click();
+  const analytics = page.locator(".analytics-panel");
+  await analytics.waitFor();
+  await analytics.getByRole("button", { name: "Measure my learning" }).click();
+  await analytics.locator(".analytics-cards").waitFor();
+  assert.equal(await analytics.locator(".analytics-card").count(), 4, "four measures, never averaged");
+  // The teach-back, predictions, and contrast completed above are real events.
+  const measuredEvents = Number(await analytics.getAttribute("data-events"));
+  assert.ok(measuredEvents >= 3, `expected the session's activities to be logged, got ${measuredEvents}`);
+  // Hints were revealed above, so hint dependence has something to report.
+  const hintedShare = analytics.locator('.analytics-card[data-card="hints"] [data-rate="attempts with a hint"]');
+  assert.ok(Number(await hintedShare.getAttribute("data-samples")) >= 3, await hintedShare.getAttribute("data-samples"));
+  assert.ok(Number(await hintedShare.getAttribute("data-value")) > 0, "at least one attempt used a hint");
+  // A measure without enough evidence says so instead of showing a number.
+  const retentionRate = analytics.locator('.analytics-card[data-card="retention"] [data-rate="recalled"]');
+  assert.equal(await retentionRate.getAttribute("data-value"), "", "no reviews yet means no retention rate");
+  await analytics.locator('.analytics-warnings [data-warning="retention"]').waitFor();
+  assert.match(await analytics.locator('[data-warning="retention"]').innerText(), /insufficient evidence/);
+  // Time on task is labelled as time between actions, not as attention.
+  assert.match(await analytics.locator('.analytics-card[data-card="time"] .analytics-note').innerText(), /idle time/i);
+  await page.screenshot({ path: path.join(artifactDirectory, "analytics.png") });
+
   // Item 28: RACE-style review grades three stages against three rubrics.
   await page.locator(".content-tabs").getByRole("button", { name: "Review" }).click();
   await page.getByRole("button", { name: "Start graded review" }).click();

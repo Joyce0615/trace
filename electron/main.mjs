@@ -28,6 +28,8 @@ import { buildExecutableQuiz, gradeSubmission, publicQuiz } from "./executable-q
 import { buildExplanationTask, gradeExplanation, publicExplanationTask } from "./explanation-grader.mjs";
 import { buildActivitySet, gradeContrast, gradePrediction, gradeTeachBack, publicActivitySet } from "./activities.mjs";
 import { applyScaffold, buildScaffold, guardResponse, nextHintRung, publicScaffold, registerAnswerSecrets } from "./answer-guard.mjs";
+import { appendEvent, readEvents } from "./activity-log.mjs";
+import { analyticsReport } from "./analytics.mjs";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const openedRepositories = new Map();
@@ -46,6 +48,29 @@ const scaffolds = new Map();
 /** One key per active hint ladder, so a rung can only be served for a live task. */
 function scaffoldKey(repositoryId, kind, taskId) {
   return `${repositoryId}|${kind}|${taskId}`;
+}
+
+// How many hint rungs the learner has taken per task, so a graded attempt can
+// record what it cost. The main process owns this: a renderer that could report
+// its own hint usage could also report none.
+const hintsTaken = new Map();
+
+// Files the learner has opened, which is what makes an activity "near" transfer.
+const inspectedPaths = new Map();
+
+function activityLogDirectory() {
+  return path.join(app.getPath("userData"), "activity-log");
+}
+
+/**
+ * Record one graded attempt for item 41's analytics.
+ *
+ * Awaited so the log is consistent by the time the grade is returned — appends
+ * are serialized in the log itself — but `appendEvent` never throws, so
+ * analytics can never fail the activity the learner just completed.
+ */
+function recordActivity(repository, event) {
+  return appendEvent(activityLogDirectory(), repository.id, event);
 }
 
 function openedRepository(candidate) {
@@ -200,9 +225,11 @@ const ipcHandlers = {
   },
 
   "repository:read-file": async (_event, request) => {
-    if (![...openedRepositories.values()].some((repository) => repository.rootPath === request.rootPath)) {
-      throw new Error("Repository is not open in this workspace.");
-    }
+    const repository = [...openedRepositories.values()].find((candidate) => candidate.rootPath === request.rootPath);
+    if (!repository) throw new Error("Repository is not open in this workspace.");
+    // Opening a file is what makes later work in it "near" transfer (item 41).
+    if (!inspectedPaths.has(repository.id)) inspectedPaths.set(repository.id, new Set());
+    inspectedPaths.get(repository.id).add(request.filePath);
     return readRepositoryFile(request.rootPath, request.filePath);
   },
 
@@ -270,11 +297,13 @@ const ipcHandlers = {
     return { version: CALL_CHAIN_VERSION, chains, exercises: exercises.map(publicExercise) };
   },
 
-  "lessons:grade-prediction": (_event, request) => {
+  "lessons:grade-prediction": async (_event, request) => {
     const repository = openedRepository(request.repository);
     const exercise = callChainSets.get(repository.id)?.get(request.exerciseId);
     if (!exercise) throw new Error("That prediction exercise is not active for this repository.");
-    return gradeCallChainAnswer(exercise, request.choiceId);
+    const grade = gradeCallChainAnswer(exercise, request.choiceId);
+    await recordActivity(repository, { kind: "call-chain", taskId: exercise.id, path: grade.anchor?.path ?? null, correct: grade.correct, score: grade.correct ? 1 : 0, hints: 0, hintPenalty: 0 });
+    return grade;
   },
 
   "exercise:localization": (_event, request) => {
@@ -294,11 +323,13 @@ const ipcHandlers = {
     return nextHint(exercise, request.used ?? []);
   },
 
-  "exercise:localization-score": (_event, request) => {
+  "exercise:localization-score": async (_event, request) => {
     const repository = openedRepository(request.repository);
     const exercise = localizationExercises.get(repository.id)?.get(request.exerciseId);
     if (!exercise) throw new Error("That localization exercise is not active for this repository.");
-    return scoreLocalization(exercise, request, repository);
+    const score = scoreLocalization(exercise, request, repository);
+    await recordActivity(repository, { kind: "localization", taskId: exercise.id, path: exercise.definition.path, symbol: exercise.symbol, correct: score.passed, score: score.score, hints: (request.hintsUsed ?? []).length, hintPenalty: score.hintPenalty ?? 0 });
+    return score;
   },
 
   "grade:race-task": async (_event, request) => {
@@ -428,11 +459,13 @@ const ipcHandlers = {
     return { ...diagnosis, probes: undefined };
   },
 
-  "learning:probe": (_event, request) => {
+  "learning:probe": async (_event, request) => {
     const repository = openedRepository(request.repository);
     const probe = learnerProbes.get(repository.id)?.[request.probeId];
     if (!probe) throw new Error("That probe is not active for this repository.");
-    return gradeProbe(probe, request.choiceId);
+    const grade = gradeProbe(probe, request.choiceId);
+    await recordActivity(repository, { kind: "probe", taskId: probe.id, path: probe.anchor?.path ?? null, skillId: probe.skillId, correct: grade.correct, score: grade.correct ? 1 : 0, hints: 0, hintPenalty: 0 });
+    return grade;
   },
 
   "activity:build": async (_event, request) => {
@@ -469,21 +502,29 @@ const ipcHandlers = {
     return publicActivitySet(set);
   },
 
-  "activity:grade": (_event, request) => {
+  "activity:grade": async (_event, request) => {
     const repository = openedRepository(request.repository);
     const set = activitySets.get(repository.id);
     if (!set) throw new Error("No activities are active for this repository.");
     if (request.kind === "teach-back") {
       if (set.teachBack?.id !== request.id) throw new Error("That teach-back task is not active for this repository.");
-      return gradeTeachBack(set.teachBack, request.answer ?? "", repository);
+      const grade = gradeTeachBack(set.teachBack, request.answer ?? "", repository);
+      await recordActivity(repository, { kind: "teach-back", taskId: set.teachBack.id, path: set.teachBack.anchor.path, symbol: set.teachBack.symbol, correct: grade.passed, score: grade.score, hints: 0, hintPenalty: 0 });
+      return grade;
     }
     if (request.kind === "prediction") {
       const prediction = set.predictions.find((item) => item.id === request.id);
       if (!prediction) throw new Error("That prediction is not active for this repository.");
-      return gradePrediction(prediction, request.answer ?? "", request.confidence);
+      const outcome = gradePrediction(prediction, request.answer ?? "", request.confidence);
+      const hints = hintsTaken.get(`${repository.id}|${prediction.id}`) ?? { count: 0, penalty: 0 };
+      await recordActivity(repository, { kind: "prediction", taskId: prediction.id, path: prediction.anchor.path, correct: outcome.correct, score: outcome.credit, hints: hints.count, hintPenalty: hints.penalty, confidence: outcome.confidence });
+      return outcome;
     }
     if (set.contrast?.id !== request.id) throw new Error("That contrast is not active for this repository.");
-    return gradeContrast(set.contrast, request.choiceId);
+    const grade = gradeContrast(set.contrast, request.choiceId);
+    const hints = hintsTaken.get(`${repository.id}|${set.contrast.id}`) ?? { count: 0, penalty: 0 };
+    await recordActivity(repository, { kind: "contrast", taskId: set.contrast.id, path: grade.anchor.path, symbol: set.contrast.symbol, correct: grade.correct, score: grade.correct ? 1 : 0, hints: hints.count, hintPenalty: hints.penalty });
+    return grade;
   },
 
   "explain:task": async (_event, request) => {
@@ -509,11 +550,26 @@ const ipcHandlers = {
     return publicExplanationTask(task);
   },
 
-  "explain:grade": (_event, request) => {
+  "explain:grade": async (_event, request) => {
     const repository = openedRepository(request.repository);
     const task = explanationTasks.get(repository.id);
     if (!task || task.id !== request.taskId) throw new Error("That explanation task is not active for this repository.");
-    return gradeExplanation(task, request.explanation, repository);
+    const grade = gradeExplanation(task, request.explanation, repository);
+    const hints = hintsTaken.get(`${repository.id}|${task.id}`) ?? { count: 0, penalty: 0 };
+    await recordActivity(repository, { kind: "explanation", taskId: task.id, path: task.entry.path, symbol: task.entry.name, correct: grade.score >= 0.65, score: grade.score, hints: hints.count, hintPenalty: hints.penalty });
+    return grade;
+  },
+
+  "analytics:report": async (_event, request) => {
+    const repository = openedRepository(request.repository);
+    return analyticsReport({
+      events: await readEvents(activityLogDirectory(), repository.id),
+      learnerState: request.learnerState ?? null,
+      skillGraph: request.skillGraph ?? null,
+      now: request.now,
+      // Files the learner has actually opened count as studied ground.
+      studiedPaths: [...(inspectedPaths.get(repository.id) ?? [])],
+    });
   },
 
   "hint:next": (_event, request) => {
@@ -525,7 +581,10 @@ const ipcHandlers = {
       : scaffolds.get(scaffoldKey(repository.id, request.kind, request.taskId));
     if (!scaffold?.available) throw new Error("No hint ladder is active for that task.");
     const rung = nextHintRung(scaffold, request.used ?? []);
-    return { ...publicScaffold(scaffold), rung, used: (request.used ?? []).length, penalty: applyScaffold(1, scaffold, [...(request.used ?? []), rung?.id].filter(Boolean)).penalty };
+    const revealed = [...(request.used ?? []), rung?.id].filter(Boolean);
+    const penalty = applyScaffold(1, scaffold, revealed).penalty;
+    hintsTaken.set(`${repository.id}|${request.taskId}`, { count: revealed.length, penalty });
+    return { ...publicScaffold(scaffold), rung, used: (request.used ?? []).length, penalty };
   },
 
   "quiz:build": async (_event, request) => {
@@ -568,7 +627,10 @@ const ipcHandlers = {
     const repository = openedRepository(request.repository);
     const quiz = executableQuizzes.get(repository.id);
     if (!quiz || quiz.id !== request.quizId) throw new Error("That quiz is not active for this repository.");
-    return gradeSubmission(quiz, request.submission);
+    const grade = await gradeSubmission(quiz, request.submission);
+    const hints = hintsTaken.get(`${repository.id}|${quiz.id}`) ?? { count: 0, penalty: 0 };
+    await recordActivity(repository, { kind: "executable-quiz", taskId: quiz.id, path: quiz.path, symbol: quiz.entry, correct: grade.passed, score: grade.score ?? 0, hints: hints.count, hintPenalty: hints.penalty });
+    return grade;
   },
 
   "learning:schedule": (_event, request) => {
@@ -589,6 +651,19 @@ const ipcHandlers = {
     });
     const learnerState = { ...result.learnerState, repositoryId: repository.id };
     await saveLearnerState(path.join(app.getPath("userData"), "learning"), learnerState);
+    await recordActivity(repository, {
+      kind: "review",
+      taskId: request.skillId,
+      skillId: request.skillId,
+      correct: result.review.recalled,
+      score: result.review.strength,
+      // The delay and the interval it was recalled against are what turn a set
+      // of reviews into a measured retention curve.
+      elapsedDays: result.review.elapsedDays,
+      stability: result.review.previous.stability,
+      hints: 0,
+      hintPenalty: 0,
+    });
     return { ...result, learnerState };
   },
 

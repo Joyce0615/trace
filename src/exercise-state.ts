@@ -1,4 +1,4 @@
-import type { ActivitySet, Architecture, ContrastGrade, DiagnosisReport, EvaluationReport, EvidenceImport, ExecutableQuiz, ExplanationGrade, ExplanationTask, HintRung, HistorySummary, PredictionOutcome, TeachBackGrade, Lesson, ProbeGrade, QuizGrade, ReviewPlan, ReviewResult, SymbolFlow, CallChain, LocalizationExercise, LocalizationHint, LocalizationScore, PredictionExercise, PredictionGrade, RaceReport, RaceTask, TraceRunResult, TraceRuntime } from "./types";
+import type { ActivitySet, AnalyticsReport, Architecture, ContrastGrade, DiagnosisReport, EvaluationReport, EvidenceImport, ExecutableQuiz, ExplanationGrade, ExplanationTask, HintRung, HistorySummary, PredictionOutcome, TeachBackGrade, Lesson, ProbeGrade, QuizGrade, ReviewPlan, ReviewResult, SymbolFlow, CallChain, LocalizationExercise, LocalizationHint, LocalizationScore, PredictionExercise, PredictionGrade, RaceReport, RaceTask, TraceRunResult, TraceRuntime } from "./types";
 
 /**
  * Exercise state shapes.
@@ -148,3 +148,10 @@ export const emptyActivityState: ActivityState = {
   penalties: {},
   status: "idle",
 };
+
+export type AnalyticsState = {
+  report: AnalyticsReport | null;
+  status: "idle" | "loading" | "ready" | "error";
+};
+
+export const emptyAnalyticsState: AnalyticsState = { report: null, status: "idle" };

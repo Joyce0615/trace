@@ -833,6 +833,73 @@ export interface ProbeGrade {
   anchor: CodeAnchor | null;
 }
 
+export interface AnalyticsRate {
+  value: number | null;
+  samples: number;
+  reason: string | null;
+  required: number;
+}
+
+export interface AnalyticsReport {
+  version: number;
+  separate: true;
+  generatedAt: string;
+  events: number;
+  retention: {
+    kind: "retention";
+    trackedSkills: number;
+    meanPredicted: number | null;
+    weakest: { skillId: string; title: string; elapsedDays: number; predicted: number; stability: number } | null;
+    recalls: number;
+    successRate: AnalyticsRate;
+    buckets: Array<{ id: string; label: string; observed: AnalyticsRate; predicted: number | null; gap: number | null }>;
+    modelGap: number | null;
+    modelVerdict: string;
+  };
+  transfer: {
+    kind: "transfer";
+    activities: number;
+    studiedFiles: number;
+    novelFiles: number;
+    near: AnalyticsRate;
+    far: AnalyticsRate;
+    gap: number | null;
+    verdict: string;
+    byKind: Array<{ kind: string; attempts: number; success: AnalyticsRate }>;
+  };
+  timeOnTask: {
+    kind: "time-on-task";
+    sessions: number;
+    events: number;
+    activeMs: number;
+    activeMinutes?: number;
+    excludedMs: number;
+    excludedMinutes?: number;
+    medianSessionMs: number;
+    longestSessionMs: number;
+    eventsPerSession?: number;
+    firstAt?: string;
+    lastAt?: string;
+    byKind: Array<{ kind: string; events: number }>;
+    note: string;
+  };
+  hints: {
+    kind: "hint-dependence";
+    attempts: number;
+    hintsRevealed: number;
+    hintedAttempts: number;
+    hintedShare: AnalyticsRate;
+    hintsPerAttempt: number;
+    successWithHints: AnalyticsRate;
+    successWithoutHints: AnalyticsRate;
+    scoreWithHints: number | null;
+    scoreWithoutHints: number | null;
+    penaltyCarried: number;
+    trend: { direction: string; reason: string | null; early: number | null; late: number | null };
+  };
+  warnings: Array<{ measure: string; reason: string; have: number; need: number }>;
+}
+
 export interface HintRung {
   id: string;
   level: number;
@@ -1164,6 +1231,7 @@ export interface TraceBridge {
   evaluate(request: { repository: RepositoryRef; course?: Course; skillGraph?: SkillGraph; answers?: unknown[]; sampleSize?: number }): Promise<EvaluationReport>;
   diagnose(request: { repository: RepositoryRef; skillGraph: SkillGraph; learnerState: LearnerState; text?: string }): Promise<DiagnosisReport>;
   answerProbe(request: { repository: RepositoryRef; probeId: string; choiceId: string }): Promise<ProbeGrade>;
+  analytics(request: { repository: RepositoryRef; skillGraph?: SkillGraph; learnerState?: LearnerState; now?: string }): Promise<AnalyticsReport>;
   nextHint(request: { repository: RepositoryRef; kind: HintResponse["kind"]; taskId: string; used?: string[] }): Promise<HintResponse>;
   buildActivities(request: { repository: RepositoryRef; symbol?: string }): Promise<ActivitySet>;
   /** One channel for all three activity kinds; the caller narrows the result by `kind`. */

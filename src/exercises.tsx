@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Icon, bridge, readableError, repositoryRef } from "./shell";
 import type { ContrastGrade, Course, LearnerState, Lesson, PredictionExercise, PredictionOutcome, Repository, ReviewGradeId, SkillGraph, TeachBackGrade } from "./types";
-import type { ActivityState, ArchitectureState, ChainState, DiagnosisState, EvaluationState, EvidenceState, ExecutableQuizState, ExplanationState, HistoryState, LocalizationState, ReviewState, ScheduleState, TraceState } from "./exercise-state";
+import type { ActivityState, AnalyticsState, ArchitectureState, ChainState, DiagnosisState, EvaluationState, EvidenceState, ExecutableQuizState, ExplanationState, HistoryState, LocalizationState, ReviewState, ScheduleState, TraceState } from "./exercise-state";
 
 /**
  * Exercise, visualization, quality, and diagnosis panels (items 26-36).
@@ -664,6 +664,90 @@ export function SchedulePanel({ repository, skillGraph, learnerState, state, onS
           <polyline points={curve.points.map((point) => `${(point.day / curve.horizonDays) * 100},${32 - point.retention * 30}`).join(" ")} />
         </svg>
         <small>Recall falls to {Math.round(plan.parameters.targetRetention * 100)}% after {curve.dueDay} day{curve.dueDay === 1 ? "" : "s"}.</small>
+      </div>}
+    </>}
+  </section>;
+}
+
+function Rate({ label, rate }: { label: string; rate: { value: number | null; samples: number; reason: string | null } }) {
+  return <div className="analytics-rate" data-rate={label} data-samples={rate.samples} data-value={rate.value ?? ""}>
+    <em>{rate.value === null ? "—" : `${Math.round(rate.value * 100)}%`}</em>
+    <small>{label}</small>
+    <i>{rate.value === null ? `needs more than ${rate.samples}` : `n=${rate.samples}`}</i>
+  </div>;
+}
+
+/**
+ * Learning analytics (item 41): four measures side by side and never averaged,
+ * each stating its sample size and refusing to show a rate it cannot support.
+ */
+export function AnalyticsPanel({ repository, skillGraph, learnerState, state, onState }: {
+  repository: Repository;
+  skillGraph: SkillGraph | null;
+  learnerState: LearnerState | null;
+  state: AnalyticsState;
+  onState: (update: Partial<AnalyticsState>) => void;
+}) {
+  const { report, status } = state;
+  const run = async () => {
+    onState({ status: "loading" });
+    try {
+      onState({
+        report: await bridge.analytics({
+          repository: repositoryRef(repository),
+          skillGraph: skillGraph ?? undefined,
+          learnerState: learnerState ?? undefined,
+        }),
+        status: "ready",
+      });
+    } catch {
+      onState({ status: "error" });
+    }
+  };
+
+  return <section className="analytics-panel" data-status={status} data-events={report?.events ?? 0}>
+    <div className="analytics-head">
+      <span>LEARNING ANALYTICS</span>
+      <button className="ghost" disabled={status === "loading"} onClick={() => void run()}>{status === "loading" ? "Measuring…" : report ? "Refresh" : "Measure my learning"}</button>
+    </div>
+    {status === "error" && <p className="analytics-note">Analytics are unavailable for this repository.</p>}
+    {report && <>
+      <div className="analytics-cards">
+        <div className="analytics-card" data-card="retention" data-verdict={report.retention.modelVerdict}>
+          <header>Retention<small>{report.retention.recalls} recall{report.retention.recalls === 1 ? "" : "s"}</small></header>
+          <Rate label="recalled" rate={report.retention.successRate} />
+          <div className="analytics-buckets">
+            {report.retention.buckets.map((bucket) => <div key={bucket.id} data-bucket={bucket.id} data-gap={bucket.gap ?? ""}>
+              <span>{bucket.label}</span>
+              <em>{bucket.observed.value === null ? "—" : `${Math.round(bucket.observed.value * 100)}%`}</em>
+              <i>{bucket.predicted === null ? "" : `model ${Math.round(bucket.predicted * 100)}%`}</i>
+            </div>)}
+          </div>
+          <small className="analytics-verdict">{report.retention.modelVerdict.replace(/-/g, " ")}</small>
+        </div>
+
+        <div className="analytics-card" data-card="transfer" data-verdict={report.transfer.verdict}>
+          <header>Transfer<small>{report.transfer.novelFiles} unfamiliar file{report.transfer.novelFiles === 1 ? "" : "s"}</small></header>
+          <Rate label="familiar files" rate={report.transfer.near} />
+          <Rate label="new files" rate={report.transfer.far} />
+          <small className="analytics-verdict" data-gap={report.transfer.gap ?? ""}>{report.transfer.verdict.replace(/-/g, " ")}</small>
+        </div>
+
+        <div className="analytics-card" data-card="time" data-sessions={report.timeOnTask.sessions}>
+          <header>Time on task<small>{report.timeOnTask.sessions} session{report.timeOnTask.sessions === 1 ? "" : "s"}</small></header>
+          <div className="analytics-rate"><em data-metric="active">{Math.round((report.timeOnTask.activeMs ?? 0) / 60000)}</em><small>active minutes</small><i>{report.timeOnTask.events} actions</i></div>
+          <small className="analytics-note">{report.timeOnTask.note}</small>
+        </div>
+
+        <div className="analytics-card" data-card="hints" data-trend={report.hints.trend.direction}>
+          <header>Hint dependence<small>{report.hints.hintsRevealed} revealed</small></header>
+          <Rate label="attempts with a hint" rate={report.hints.hintedShare} />
+          <Rate label="right without a hint" rate={report.hints.successWithoutHints} />
+          <small className="analytics-verdict">trend {report.hints.trend.direction}</small>
+        </div>
+      </div>
+      {report.warnings.length > 0 && <div className="analytics-warnings" data-count={report.warnings.length}>
+        {report.warnings.map((warning) => <span key={warning.measure} data-warning={warning.measure}>{warning.measure}: {warning.reason.replace(/-/g, " ")} ({warning.have}/{warning.need})</span>)}
       </div>}
     </>}
   </section>;

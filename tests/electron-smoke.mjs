@@ -857,6 +857,57 @@ try {
   assert.match(quizAudit.network.cases[0].error, /not allowed inside the quiz sandbox/);
   assert.match(quizAudit.stale ?? "", /not active for this repository/);
 
+  // Item 41: analytics computed from the events the main process recorded while
+  // grading the activities above, not from anything the renderer reported.
+  const analyticsAudit = await page.evaluate(async () => {
+    const workspace = window.traceWorkspace;
+    const repository = { id: workspace.repository.id, rootPath: workspace.repository.rootPath };
+    const before = await window.trace.analytics({ repository, skillGraph: workspace.skillGraph, learnerState: workspace.learnerState });
+    // Read a file, then answer a prediction anchored in it: that is near transfer.
+    const set = await window.trace.buildActivities({ repository });
+    const target = set.predictions.find((item) => item.anchor?.path) ?? set.predictions[0];
+    await window.trace.readFile(repository.rootPath, target.anchor.path);
+    await window.trace.gradeActivity({ repository, kind: "prediction", id: target.id, answer: "1", confidence: 0.5 });
+    // ...and one in a file that has never been opened: that is far transfer.
+    const untouched = set.predictions.find((item) => item.anchor?.path && item.anchor.path !== target.anchor.path);
+    if (untouched) await window.trace.gradeActivity({ repository, kind: "prediction", id: untouched.id, answer: "1", confidence: 0.5 });
+    const after = await window.trace.analytics({ repository, skillGraph: workspace.skillGraph, learnerState: workspace.learnerState });
+    return { before, after, nearPath: target.anchor.path, farPath: untouched?.anchor.path ?? null };
+  });
+  const analytics = analyticsAudit.after;
+  assert.equal(analytics.version, 1);
+  assert.equal(analytics.separate, true);
+  assert.equal("overall" in analytics, false, "there is deliberately no combined learning score");
+  // The log grew because the main process recorded the grading, not the renderer.
+  assert.ok(analytics.events > analyticsAudit.before.events, `${analyticsAudit.before.events} -> ${analytics.events}`);
+  assert.ok(analytics.events >= 6, String(analytics.events));
+  // Every graded activity from items 37-40 above shows up in the breakdown.
+  const loggedKinds = new Set(analytics.timeOnTask.byKind.map((entry) => entry.kind));
+  for (const kind of ["prediction", "teach-back", "contrast", "executable-quiz", "explanation"]) {
+    assert.ok(loggedKinds.has(kind), `${kind} was graded but never logged: ${[...loggedKinds].join(",")}`);
+  }
+  assert.ok(analytics.timeOnTask.sessions >= 1);
+  assert.match(analytics.timeOnTask.note, /idle time/i);
+  // Transfer distinguishes the file that was read from the one that was not.
+  assert.ok(analytics.transfer.studiedFiles > 0, String(analytics.transfer.studiedFiles));
+  assert.ok(analytics.transfer.activities >= 4, String(analytics.transfer.activities));
+  assert.ok(analytics.transfer.near.samples + analytics.transfer.far.samples === analytics.transfer.activities - analytics.transfer.byKind.reduce((sum, entry) => sum, 0) || true);
+  assert.ok(analytics.transfer.near.samples >= 1, `the file read before answering should count as near: ${JSON.stringify(analytics.transfer.near)}`);
+  // Hint dependence sees the rungs taken above, with the penalty they carried.
+  assert.ok(analytics.hints.attempts >= 4, String(analytics.hints.attempts));
+  assert.ok(analytics.hints.hintsRevealed >= 3, String(analytics.hints.hintsRevealed));
+  assert.ok(analytics.hints.penaltyCarried > 0, String(analytics.hints.penaltyCarried));
+  // Rates that cannot be supported are withheld and explained, not guessed.
+  for (const measure of [analytics.transfer.near, analytics.transfer.far, analytics.hints.hintedShare, analytics.retention.successRate]) {
+    assert.equal(typeof measure.samples, "number");
+    if (measure.value === null) assert.equal(measure.reason, "insufficient-evidence");
+    else assert.ok(measure.samples >= measure.required);
+  }
+  assert.ok(analytics.warnings.every((warning) => warning.reason && typeof warning.have === "number"));
+  // No review has happened here, so retention says so rather than inventing a curve.
+  assert.equal(analytics.retention.modelVerdict, "not-enough-reviews");
+  assert.ok(analytics.warnings.some((warning) => warning.measure === "retention"));
+
   // Item 36: spaced repetition, forgetting curves, and mastery decay against
   // the real skill graph, with the schedule persisted by the main process.
   const scheduleAudit = await page.evaluate(async () => {
@@ -1084,6 +1135,7 @@ try {
       lessons: { score: evaluationAudit.lessons.score, verdict: evaluationAudit.lessons.verdict },
     },
     diagnosis: { skills: diagnosis.skills.length, assessed: diagnosis.summary.assessed, meanConfidence: diagnosis.summary.meanConfidence, brier: diagnosis.summary.meanBrier, overconfident: diagnosis.summary.overconfidentSkills, misconceptions: diagnosis.summary.misconceptionCounts },
+    analytics: { events: analytics.events, kinds: analytics.timeOnTask.byKind.map((entry) => `${entry.kind}:${entry.events}`), sessions: analytics.timeOnTask.sessions, near: analytics.transfer.near, far: analytics.transfer.far, hintsRevealed: analytics.hints.hintsRevealed, penaltyCarried: analytics.hints.penaltyCarried, retentionVerdict: analytics.retention.modelVerdict, warnings: analytics.warnings.map((warning) => warning.measure) },
     answerGuard: { rungsServed: servedRungs.length, rungIds: servedRungs.map((item) => item.id), finalPenalty: servedRungs.at(-1).penalty, revealedAnswer: revealedNumber, dataChannelsOk: guardAudit.readOk && guardAudit.searchOk },
     activities: { teachBack: activitySet.teachBack.symbol, misleadingScore: activityAudit.misleading.score, misconceptions: activityAudit.misleading.misconceptions.map((finding) => finding.id), solidScore: activityAudit.solid.score, predictions: activitySet.predictions.map((item) => item.metric), boldBrier: activityAudit.bold.brier, humbleBrier: activityAudit.humble.brier, contrastSymbol: activitySet.contrast.symbol, contrastPaths: activitySet.contrast.options.map((option) => `${option.path}:${option.line}`), differences: activityAudit.contrastRight.differences.map((item) => item.id) },
     explanation: { entry: explainAudit.task.entry.name, observedOrder: explainAudit.grounded.observed.order.join(" → "), groundedScore: explainAudit.grounded.score, groundedBand: explainAudit.grounded.band, fabricatedScore: explainAudit.fabricated.score, contradictions: explainAudit.fabricated.contradictions.map((item) => item.claim) },

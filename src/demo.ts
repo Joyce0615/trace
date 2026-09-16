@@ -14,6 +14,12 @@ let savedLearning: LearnerState = structuredClone(nanoLearnerState);
 let demoSearchIndex: SearchIndex | null = null;
 let demoProbes: Record<string, Parameters<typeof import("../electron/misconception.mjs").gradeProbe>[0]> = {};
 let demoActivities: import("../electron/activities.mjs").InternalActivitySet | null = null;
+const demoActivityLog: Array<Record<string, unknown>> = [];
+const demoStudiedPaths = new Set<string>();
+const demoHints = new Map<string, { count: number; penalty: number }>();
+function logDemoActivity(event: Record<string, unknown>) {
+  demoActivityLog.push({ id: `demo-${demoActivityLog.length}`, at: new Date().toISOString(), ...event });
+}
 
 const demoGraphNodes: KnowledgeGraphNode[] = [
   { id: `repository:${nanoRepository.id}`, kind: "repository", key: nanoRepository.id, label: nanoRepository.name },
@@ -406,7 +412,7 @@ export const browserBridge: TraceBridge = {
     const edges = demoGraphEdges.filter((edge) => edge.from === request.nodeId || edge.to === request.nodeId);
     return { nodes, edges };
   },
-  async readFile(_rootPath, filePath) { return nanoSourceByPath[filePath] ?? `# Preview unavailable for ${filePath}`; },
+  async readFile(_rootPath, filePath) { demoStudiedPaths.add(filePath); return nanoSourceByPath[filePath] ?? `# Preview unavailable for ${filePath}`; },
   async classifyLink(url) { return classifyLinkInBrowser(url); },
   async openLink(url) {
     const classification = classifyLinkInBrowser(url);
@@ -682,6 +688,18 @@ export const browserBridge: TraceBridge = {
     if (!probe) throw new Error("That probe is not active for this repository.");
     return model.gradeProbe(probe, request.choiceId);
   },
+  async analytics(request) {
+    // The demo keeps its own in-memory event log so the same analytics code
+    // runs, with real events from this session rather than invented ones.
+    const analytics = await import("../electron/analytics.mjs");
+    return analytics.analyticsReport({
+      events: demoActivityLog,
+      learnerState: request.learnerState ?? savedLearning,
+      skillGraph: request.skillGraph ?? nanoSkillGraph,
+      now: request.now,
+      studiedPaths: [...demoStudiedPaths],
+    });
+  },
   async nextHint(request) {
     // The demo runs the same ladder builder, so a rung is never a giveaway here
     // either, and rungs are still served strictly one at a time.
@@ -693,6 +711,8 @@ export const browserBridge: TraceBridge = {
       : { kind: request.kind, available: false as const, reason: "No hint ladder is active for that task.", rungs: [] };
     if (!scaffold.available) throw new Error("No hint ladder is active for that task.");
     const rung = guard.nextHintRung(scaffold, request.used ?? []);
+    const revealed = [...(request.used ?? []), rung?.id].filter(Boolean) as string[];
+    demoHints.set(request.taskId, { count: revealed.length, penalty: guard.applyScaffold(1, scaffold, revealed).penalty });
     return {
       ...guard.publicScaffold(scaffold),
       rung,
@@ -711,15 +731,21 @@ export const browserBridge: TraceBridge = {
     if (!demoActivities) throw new Error("No activities are active for this repository.");
     if (request.kind === "teach-back") {
       if (demoActivities.teachBack?.id !== request.id) throw new Error("That teach-back task is not active for this repository.");
-      return activities.gradeTeachBack(demoActivities.teachBack, request.answer ?? "", nanoRepository);
+      const teachGrade = activities.gradeTeachBack(demoActivities.teachBack, request.answer ?? "", nanoRepository);
+      logDemoActivity({ kind: "teach-back", taskId: demoActivities.teachBack.id, path: demoActivities.teachBack.anchor?.path, correct: teachGrade.passed, score: teachGrade.score, hints: 0, hintPenalty: 0 });
+      return teachGrade;
     }
     if (request.kind === "prediction") {
       const prediction = demoActivities.predictions.find((item) => item.id === request.id);
       if (!prediction) throw new Error("That prediction is not active for this repository.");
-      return activities.gradePrediction(prediction, request.answer ?? "", request.confidence);
+      const outcome = activities.gradePrediction(prediction, request.answer ?? "", request.confidence);
+      logDemoActivity({ kind: "prediction", taskId: prediction.id, path: prediction.anchor.path, correct: outcome.correct, score: outcome.credit, hints: demoHints.get(prediction.id)?.count ?? 0, hintPenalty: demoHints.get(prediction.id)?.penalty ?? 0 });
+      return outcome;
     }
     if (demoActivities.contrast?.id !== request.id) throw new Error("That contrast is not active for this repository.");
-    return activities.gradeContrast(demoActivities.contrast, request.choiceId);
+    const contrastGrade = activities.gradeContrast(demoActivities.contrast, request.choiceId);
+    logDemoActivity({ kind: "contrast", taskId: demoActivities.contrast.id, path: contrastGrade.anchor.path, correct: contrastGrade.correct, score: contrastGrade.correct ? 1 : 0, hints: 0, hintPenalty: 0 });
+    return contrastGrade;
   },
   async explanationTask() {
     // Grading an explanation against traced behavior needs a real trace, which

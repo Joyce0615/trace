@@ -20,6 +20,8 @@ import { SECRET_SCANNER_VERSION, anonymizePath, redact, redactValue, scanText, s
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
 import { GIT_HISTORY_VERSION, busFactor, historyLessons, historySummary, parseHistory, readCommits } from "../electron/git-history.mjs";
 import { MISCONCEPTIONS, MISCONCEPTION_VERSION, buildProbe, calibrateSkill, detectMisconceptions, diagnoseLearner, gradeProbe } from "../electron/misconception.mjs";
+import { ANALYTICS_VERSION, MIN_SAMPLE, analyticsReport, hintAnalytics, normalizeEvents, rate, retentionAnalytics, timeOnTaskAnalytics, transferAnalytics } from "../electron/analytics.mjs";
+import { appendEvent, readEvents } from "../electron/activity-log.mjs";
 import { ALWAYS_FORBIDDEN, ANSWER_GUARD_VERSION, MAX_HINT_PENALTY, SCANNED_CHANNELS, answerSecrets, applyScaffold, auditResponse, buildScaffold, clearAnswerSecrets, findForbiddenKeys, findLeakedValues, forbiddenKeysFor, guardResponse, nextHintRung, publicScaffold, registerAnswerSecrets, scaffoldPenalty } from "../electron/answer-guard.mjs";
 import { ACTIVITY_VERSION, buildActivitySet, excerptFor, gradeContrast, gradePrediction, gradeTeachBack, headerParameters, publicActivitySet, restatementRatio, summarizePredictions } from "../electron/activities.mjs";
 import { EXPLANATION_GRADER_VERSION, buildExplanationTask, checkCitations, claimsFailure, gradeExplanation, isNamedFunction, mentionedSymbols, publicExplanationTask } from "../electron/explanation-grader.mjs";
@@ -752,7 +754,7 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
     "graph:architecture", "graph:symbol-flow", "history:summary", "evidence:import", "search:query", "eval:run",
     "learning:diagnose", "learning:probe", "learning:schedule", "learning:review",
     "quiz:build", "quiz:grade", "explain:task", "explain:grade",
-    "activity:build", "activity:grade", "hint:next", "agents:ask",
+    "activity:build", "activity:grade", "hint:next", "analytics:report", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
   assert.throws(() => schemaFor("repository:evil"), /is not a registered IPC channel/);
@@ -3349,4 +3351,204 @@ test("the egress guard blocks answer leaks and the hint ladder never gives one a
   const adopted = buildScaffold("localization", { hints: localization.hints });
   assert.equal(adopted.rungs.length, localization.hints.length);
   assert.equal(adopted.rungs[0].text, localization.hints[0].text);
+});
+
+test("learning analytics report retention, transfer, time, and hints with their sample sizes", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-analytics-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "app"), { recursive: true });
+  await writeFile(path.join(rootPath, "app", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "app", "queue.py"), "def enqueue(job):\n    return job\n");
+  await writeFile(path.join(rootPath, "app", "worker.py"), "from app.queue import enqueue\n\n\ndef work(job):\n    return enqueue(job)\n");
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const skillGraph = buildSkillGraph(repository, generateStarterCourse(repository));
+  assert.equal(ANALYTICS_VERSION, 1);
+
+  const base = Date.parse("2026-06-01T09:00:00.000Z");
+  const at = (minutes) => new Date(base + minutes * 60_000).toISOString();
+
+  // --- A rate refuses to exist below its sample floor ----------------------
+  assert.deepEqual(rate(1, 2), { value: null, samples: 2, reason: "insufficient-evidence", required: MIN_SAMPLE });
+  assert.deepEqual(rate(2, 4), { value: 0.5, samples: 4, reason: null, required: MIN_SAMPLE });
+  assert.equal(rate(0, 0).value, null);
+
+  // --- Time on task --------------------------------------------------------
+  const sessionEvents = [
+    { at: at(0), kind: "prediction", correct: true },
+    { at: at(5), kind: "prediction", correct: true },
+    { at: at(12), kind: "contrast", correct: false },
+    // A three-hour gap is a new session, not three hours of study.
+    { at: at(192), kind: "teach-back", correct: true },
+    { at: at(200), kind: "teach-back", correct: true },
+  ];
+  const time = timeOnTaskAnalytics(sessionEvents);
+  assert.equal(time.sessions, 2);
+  assert.equal(time.events, 5);
+  assert.equal(time.activeMs, (12 + 8) * 60_000, `${time.activeMs}`);
+  assert.equal(time.excludedMs, 180 * 60_000, "the idle gap is excluded, not counted");
+  assert.equal(time.eventsPerSession, 2.5);
+  assert.match(time.note, /not attention|idle time/i);
+  assert.equal(time.byKind[0].kind, "prediction");
+  assert.equal(timeOnTaskAnalytics([]).sessions, 0);
+  // A different session threshold really changes the split.
+  assert.equal(timeOnTaskAnalytics(sessionEvents, { sessionGapMs: 4 * 60 * 60 * 1000 }).sessions, 1);
+  // Unusable entries are dropped rather than crashing the report.
+  assert.equal(normalizeEvents([null, { kind: "x" }, { at: "nonsense", kind: "y" }, { at: at(0), kind: "z" }]).length, 1);
+
+  // --- Transfer ------------------------------------------------------------
+  const transferEvents = [
+    { at: at(0), kind: "prediction", path: "app/queue.py", correct: true },
+    { at: at(1), kind: "prediction", path: "app/queue.py", correct: true },
+    { at: at(2), kind: "contrast", path: "app/queue.py", correct: true },
+    { at: at(3), kind: "prediction", path: "app/queue.py", correct: true },
+    { at: at(4), kind: "prediction", path: "app/worker.py", correct: false },
+    { at: at(5), kind: "prediction", path: "app/worker.py", correct: false },
+    { at: at(6), kind: "contrast", path: "app/worker.py", correct: false },
+  ];
+  // The learner has already opened app/queue.py; app/worker.py is new ground.
+  const transfer = transferAnalytics(transferEvents, null, { studiedPaths: ["app/queue.py"] });
+  assert.equal(transfer.near.samples, 4);
+  assert.equal(transfer.near.value, 1);
+  assert.equal(transfer.far.samples, 3);
+  assert.equal(transfer.far.value, 0);
+  assert.equal(transfer.gap, 1);
+  assert.equal(transfer.verdict, "familiar-ground-only");
+  assert.equal(transfer.novelFiles, 1);
+  // Doing an exercise about a file is an attempt, not study, so an activity
+  // never reclassifies itself as near transfer.
+  const seeded = transferAnalytics(transferEvents, null, {});
+  assert.equal(seeded.near.samples, 0, "with nothing studied, nothing is near transfer");
+  assert.equal(seeded.far.samples, 7);
+  assert.equal(round4(seeded.far.value), round4(4 / 7));
+  assert.equal(seeded.gap, null, "a rate that cannot be computed makes the gap unavailable");
+  // A learner who does as well on new ground transfers freely.
+  const even = transferAnalytics([
+    ...transferEvents.slice(0, 4),
+    { at: at(4), kind: "prediction", path: "app/worker.py", correct: true },
+    { at: at(5), kind: "prediction", path: "app/worker.py", correct: true },
+    { at: at(6), kind: "contrast", path: "app/worker.py", correct: true },
+  ], null, { studiedPaths: ["app/queue.py"] });
+  assert.equal(even.verdict, "transfers-freely");
+  assert.equal(transferAnalytics([], null, {}).verdict, "insufficient-evidence");
+
+  // --- Retention: modelled versus measured --------------------------------
+  const learnerState = {
+    repositoryId: repository.id,
+    mastery: Object.fromEntries(skillGraph.nodes.map((node, index) => [node.id, {
+      skillId: node.id,
+      mastery: 0.7,
+      status: "mastered",
+      evidence: [],
+      sourceFingerprint: node.sourceFingerprint,
+      review: index === 0
+        ? { stability: 10, difficulty: 2, reviews: 2, lapses: 0, lastReviewedAt: "2026-05-30T09:00:00.000Z", lastGrade: "good" }
+        : undefined,
+    }])),
+    memory: [],
+    updatedAt: at(0),
+  };
+  // Five recalls: all succeeded at short delays, all failed at long ones, so
+  // this learner forgets faster than the curve predicts.
+  const recallEvents = [
+    { at: at(0), kind: "review", correct: true, elapsedDays: 0.5, stability: 10 },
+    { at: at(1), kind: "review", correct: true, elapsedDays: 0.6, stability: 10 },
+    { at: at(2), kind: "review", correct: true, elapsedDays: 0.4, stability: 10 },
+    { at: at(3), kind: "review", correct: false, elapsedDays: 20, stability: 10 },
+    { at: at(4), kind: "review", correct: false, elapsedDays: 25, stability: 10 },
+    { at: at(5), kind: "review", correct: false, elapsedDays: 22, stability: 10 },
+  ];
+  const retentionReport = retentionAnalytics(recallEvents, learnerState, skillGraph, { now: "2026-06-01T09:00:00.000Z" });
+  assert.equal(retentionReport.recalls, 6);
+  assert.equal(retentionReport.successRate.value, 0.5);
+  assert.equal(retentionReport.trackedSkills, 1);
+  assert.ok(retentionReport.meanPredicted > 0 && retentionReport.meanPredicted < 1);
+  const sameDay = retentionReport.buckets.find((bucket) => bucket.id === "same-day");
+  const weeks = retentionReport.buckets.find((bucket) => bucket.id === "weeks");
+  assert.equal(sameDay.observed.value, 1);
+  assert.equal(weeks.observed.value, 0);
+  assert.ok(sameDay.predicted > 0.9, String(sameDay.predicted));
+  assert.ok(weeks.predicted < 0.9, String(weeks.predicted));
+  // The measured curve disagrees with the model, and the report says so.
+  assert.ok(retentionReport.modelGap < -0.15, String(retentionReport.modelGap));
+  assert.equal(retentionReport.modelVerdict, "learner-forgets-faster-than-model");
+  // A bucket with too few observations reports nothing rather than 0% or 100%.
+  const thin = retentionAnalytics([{ at: at(0), kind: "review", correct: true, elapsedDays: 0.2, stability: 10 }], learnerState, skillGraph, { now: at(0) });
+  assert.equal(thin.buckets.find((bucket) => bucket.id === "same-day").observed.value, null);
+  assert.equal(thin.buckets.find((bucket) => bucket.id === "same-day").gap, null);
+  assert.equal(thin.modelVerdict, "not-enough-reviews");
+  // A learner who beats the model is reported the other way round.
+  const strong = retentionAnalytics([
+    { at: at(0), kind: "review", correct: true, elapsedDays: 40, stability: 4 },
+    { at: at(1), kind: "review", correct: true, elapsedDays: 45, stability: 4 },
+    { at: at(2), kind: "review", correct: true, elapsedDays: 50, stability: 4 },
+  ], learnerState, skillGraph, { now: at(0) });
+  assert.equal(strong.modelVerdict, "learner-outperforms-model");
+
+  // --- Hint dependence -----------------------------------------------------
+  const hintEvents = [
+    { at: at(0), kind: "prediction", correct: false, score: 0, hints: 2, hintPenalty: 0.15 },
+    { at: at(1), kind: "prediction", correct: true, score: 1, hints: 2, hintPenalty: 0.15 },
+    { at: at(2), kind: "contrast", correct: true, score: 1, hints: 1, hintPenalty: 0.05 },
+    { at: at(3), kind: "prediction", correct: true, score: 1, hints: 0, hintPenalty: 0 },
+    { at: at(4), kind: "prediction", correct: true, score: 1, hints: 0, hintPenalty: 0 },
+    { at: at(5), kind: "contrast", correct: true, score: 1, hints: 0, hintPenalty: 0 },
+  ];
+  const hints = hintAnalytics(hintEvents);
+  assert.equal(hints.attempts, 6);
+  assert.equal(hints.hintsRevealed, 5);
+  assert.equal(hints.hintedAttempts, 3);
+  assert.equal(hints.hintedShare.value, 0.5);
+  assert.equal(hints.penaltyCarried, round4(0.35));
+  assert.equal(hints.successWithoutHints.value, 1);
+  assert.equal(round4(hints.successWithHints.value), round4(2 / 3));
+  // The learner needed hints early and not later, which is the point of the trend.
+  assert.equal(hints.trend.direction, "decreasing", JSON.stringify(hints.trend));
+  assert.ok(hints.trend.early > hints.trend.late);
+  assert.equal(hintAnalytics(hintEvents.slice(0, 2)).trend.direction, "unknown");
+  assert.equal(hintAnalytics(hintEvents.slice(0, 2)).trend.reason, "insufficient-evidence");
+
+  // --- The report is four measures, never one ------------------------------
+  const report = analyticsReport({
+    events: [...recallEvents, ...transferEvents, ...hintEvents],
+    learnerState,
+    skillGraph,
+    studiedPaths: ["app/queue.py"],
+    now: "2026-06-01T09:00:00.000Z",
+  });
+  assert.equal(report.version, 1);
+  assert.equal(report.separate, true);
+  assert.equal("overall" in report, false, "there is deliberately no combined learning score");
+  assert.equal("score" in report, false);
+  assert.equal(report.events, 19);
+  assert.equal(report.retention.kind, "retention");
+  assert.equal(report.transfer.kind, "transfer");
+  assert.equal(report.timeOnTask.kind, "time-on-task");
+  assert.equal(report.hints.kind, "hint-dependence");
+  assert.deepEqual(report.warnings, [], JSON.stringify(report.warnings));
+  // An empty log explains itself instead of rendering a blank panel.
+  const empty = analyticsReport({ events: [], learnerState: null, skillGraph, now: at(0) });
+  assert.equal(empty.events, 0);
+  assert.deepEqual(empty.warnings.map((warning) => warning.measure).sort(), ["hint-dependence", "retention", "time-on-task", "transfer"]);
+  assert.ok(empty.warnings.every((warning) => warning.reason && warning.need > 0));
+  assert.equal(empty.retention.successRate.value, null);
+  assert.equal(empty.transfer.gap, null);
+
+  // --- The log is main-process owned, bounded, atomic, and redacted --------
+  const logDirectory = path.join(workspace, "activity-log");
+  assert.deepEqual(await readEvents(logDirectory, repository.id), [], "a missing log reads as empty, not as an error");
+  const written = await appendEvent(logDirectory, repository.id, { kind: "prediction", correct: true, detail: "token ghp_abcdefghij0123456789abcdefghij012345" });
+  assert.equal(written.kind, "prediction");
+  assert.ok(written.id && written.at);
+  const stored = await readEvents(logDirectory, repository.id);
+  assert.equal(stored.length, 1);
+  // Anything persisted goes through the item-25 redactor first.
+  assert.equal(JSON.stringify(stored).includes("ghp_abcdefghij0123456789abcdefghij012345"), false);
+  assert.match(stored[0].detail, /REDACTED/);
+  for (let index = 0; index < 5; index += 1) await appendEvent(logDirectory, repository.id, { kind: "contrast", correct: index % 2 === 0 });
+  assert.equal((await readEvents(logDirectory, repository.id)).length, 6);
+  // Different repositories keep separate logs.
+  assert.deepEqual(await readEvents(logDirectory, "another-repository"), []);
 });

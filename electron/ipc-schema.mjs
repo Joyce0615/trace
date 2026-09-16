@@ -316,6 +316,12 @@ export const IPC_SCHEMAS = {
     taskId: s.string({ maxLength: 400 }),
     explanation: s.string({ maxLength: 8_000 }),
   }),
+  "analytics:report": s.object({
+    repository: repositoryReference,
+    skillGraph: s.opaque({ optional: true }),
+    learnerState: s.opaque({ optional: true }),
+    now: s.string({ maxLength: 40, optional: true }),
+  }),
   "hint:next": s.object({
     repository: repositoryReference,
     kind: s.literal(["executable-quiz", "explanation", "contrast", "prediction", "localization"]),
