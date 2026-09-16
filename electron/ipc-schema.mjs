@@ -316,6 +316,9 @@ export const IPC_SCHEMAS = {
     taskId: s.string({ maxLength: 400 }),
     explanation: s.string({ maxLength: 8_000 }),
   }),
+  "experiment:state": s.object({ repository: repositoryReference }),
+  "experiment:consent": s.object({ repository: repositoryReference, granted: s.boolean() }),
+  "experiment:forget": s.object({ repository: repositoryReference }),
   "analytics:report": s.object({
     repository: repositoryReference,
     skillGraph: s.opaque({ optional: true }),

@@ -1,4 +1,4 @@
-import type { ActivitySet, AnalyticsReport, Architecture, ContrastGrade, DiagnosisReport, EvaluationReport, EvidenceImport, ExecutableQuiz, ExplanationGrade, ExplanationTask, HintRung, HistorySummary, PredictionOutcome, TeachBackGrade, Lesson, ProbeGrade, QuizGrade, ReviewPlan, ReviewResult, SymbolFlow, CallChain, LocalizationExercise, LocalizationHint, LocalizationScore, PredictionExercise, PredictionGrade, RaceReport, RaceTask, TraceRunResult, TraceRuntime } from "./types";
+import type { ActivitySet, AnalyticsReport, Architecture, ExperimentReport, ContrastGrade, DiagnosisReport, EvaluationReport, EvidenceImport, ExecutableQuiz, ExplanationGrade, ExplanationTask, HintRung, HistorySummary, PredictionOutcome, TeachBackGrade, Lesson, ProbeGrade, QuizGrade, ReviewPlan, ReviewResult, SymbolFlow, CallChain, LocalizationExercise, LocalizationHint, LocalizationScore, PredictionExercise, PredictionGrade, RaceReport, RaceTask, TraceRunResult, TraceRuntime } from "./types";
 
 /**
  * Exercise state shapes.
@@ -155,3 +155,11 @@ export type AnalyticsState = {
 };
 
 export const emptyAnalyticsState: AnalyticsState = { report: null, status: "idle" };
+
+export type ExperimentState = {
+  report: ExperimentReport | null;
+  status: "idle" | "loading" | "ready" | "error";
+  lastDeleted: number | null;
+};
+
+export const emptyExperimentState: ExperimentState = { report: null, status: "idle", lastDeleted: null };

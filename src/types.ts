@@ -833,6 +833,47 @@ export interface ProbeGrade {
   anchor: CodeAnchor | null;
 }
 
+export interface ExperimentAssignment {
+  experimentId: string;
+  question: string;
+  applies: string;
+  metric: string;
+  metricLabel: string;
+  minimumSample: number;
+  arm: string;
+  armLabel: string;
+  isControl: boolean;
+  settings: Record<string, unknown>;
+  enrolled: boolean;
+}
+
+export interface ExperimentResult {
+  version: number;
+  experimentId: string;
+  question: string;
+  metric: string;
+  metricLabel: string;
+  minimumSample: number;
+  observations: number;
+  arms: Array<{ arm: string; label: string; control: boolean; samples: number; mean: number | null; standardDeviation: number | null }>;
+  control: string;
+  variant: string;
+  difference: number | null;
+  interval: Array<number | null> | null;
+  powered: boolean;
+  verdict: "underpowered" | "no-difference" | "variant-better" | "control-better";
+  needed: number;
+}
+
+export interface ExperimentReport {
+  version: number;
+  consent: { granted: boolean; grantedAt: string | null; revokedAt: string | null; participantId: string | null };
+  assignments: ExperimentAssignment[];
+  observations: number;
+  storedFields: string[];
+  results: ExperimentResult[];
+}
+
 export interface AnalyticsRate {
   value: number | null;
   samples: number;
@@ -1231,6 +1272,9 @@ export interface TraceBridge {
   evaluate(request: { repository: RepositoryRef; course?: Course; skillGraph?: SkillGraph; answers?: unknown[]; sampleSize?: number }): Promise<EvaluationReport>;
   diagnose(request: { repository: RepositoryRef; skillGraph: SkillGraph; learnerState: LearnerState; text?: string }): Promise<DiagnosisReport>;
   answerProbe(request: { repository: RepositoryRef; probeId: string; choiceId: string }): Promise<ProbeGrade>;
+  experiments(request: { repository: RepositoryRef }): Promise<ExperimentReport>;
+  setExperimentConsent(request: { repository: RepositoryRef; granted: boolean }): Promise<ExperimentReport>;
+  forgetExperiments(request: { repository: RepositoryRef }): Promise<{ deletedObservations: number; hadConsent: boolean; state: ExperimentReport }>;
   analytics(request: { repository: RepositoryRef; skillGraph?: SkillGraph; learnerState?: LearnerState; now?: string }): Promise<AnalyticsReport>;
   nextHint(request: { repository: RepositoryRef; kind: HintResponse["kind"]; taskId: string; used?: string[] }): Promise<HintResponse>;
   buildActivities(request: { repository: RepositoryRef; symbol?: string }): Promise<ActivitySet>;

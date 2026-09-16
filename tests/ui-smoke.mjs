@@ -257,6 +257,36 @@ try {
   assert.match(await analytics.locator('.analytics-card[data-card="time"] .analytics-note').innerText(), /idle time/i);
   await page.screenshot({ path: path.join(artifactDirectory, "analytics.png") });
 
+  // Item 42: consent is the gate, and it is reversible.
+  const experiments = page.locator(".experiment-panel");
+  await experiments.waitFor();
+  await experiments.locator(".experiment-item").first().waitFor();
+  assert.equal(await experiments.getAttribute("data-consent"), "false", "nothing runs before consent");
+  // Every experiment shows the control arm while unconsented.
+  const unconsentedArms = await experiments.locator(".experiment-item").evaluateAll((items) => items.map((item) => ({
+    enrolled: item.getAttribute("data-enrolled"),
+    control: item.querySelector(".experiment-arm i")?.textContent,
+  })));
+  assert.ok(unconsentedArms.length >= 2, JSON.stringify(unconsentedArms));
+  assert.ok(unconsentedArms.every((item) => item.enrolled === "false" && item.control === "control"), JSON.stringify(unconsentedArms));
+  assert.match(await experiments.locator(".experiment-note").innerText(), /not taking part/);
+  // The panel names exactly what would be stored.
+  assert.match(await experiments.locator(".experiment-fields").innerText(), /no code, no paths, no answers/);
+  await experiments.getByRole("button", { name: "Take part" }).click();
+  await page.locator('.experiment-panel[data-consent="true"]').waitFor();
+  assert.equal(await experiments.getAttribute("data-consent"), "true");
+  assert.ok(await experiments.locator('.experiment-item[data-enrolled="true"]').count() >= 2);
+  // Nothing has been measured yet, so no experiment claims a result.
+  const verdicts = await experiments.locator(".experiment-result").evaluateAll((items) => items.map((item) => item.getAttribute("data-verdict")));
+  assert.ok(verdicts.every((verdict) => verdict === "underpowered"), JSON.stringify(verdicts));
+  // Withdrawing returns every arm to the control behaviour.
+  await experiments.getByRole("button", { name: "Withdraw" }).click();
+  await experiments.locator('.experiment-item[data-enrolled="false"]').first().waitFor();
+  assert.equal(await experiments.getAttribute("data-consent"), "false");
+  await experiments.getByRole("button", { name: "Delete everything" }).click();
+  await experiments.locator("[data-deleted]").waitFor();
+  await page.screenshot({ path: path.join(artifactDirectory, "experiments.png") });
+
   // Item 28: RACE-style review grades three stages against three rubrics.
   await page.locator(".content-tabs").getByRole("button", { name: "Review" }).click();
   await page.getByRole("button", { name: "Start graded review" }).click();

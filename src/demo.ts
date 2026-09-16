@@ -17,6 +17,7 @@ let demoActivities: import("../electron/activities.mjs").InternalActivitySet | n
 const demoActivityLog: Array<Record<string, unknown>> = [];
 const demoStudiedPaths = new Set<string>();
 const demoHints = new Map<string, { count: number; penalty: number }>();
+let demoExperimentState: { consent: { granted: boolean; grantedAt: string | null; revokedAt: string | null; participantId: string | null } | null; observations: Array<{ experimentId: string; arm: string; metric: string; value: number; at: string }> } = { consent: null, observations: [] };
 function logDemoActivity(event: Record<string, unknown>) {
   demoActivityLog.push({ id: `demo-${demoActivityLog.length}`, at: new Date().toISOString(), ...event });
 }
@@ -687,6 +688,26 @@ export const browserBridge: TraceBridge = {
     const probe = demoProbes[request.probeId];
     if (!probe) throw new Error("That probe is not active for this repository.");
     return model.gradeProbe(probe, request.choiceId);
+  },
+  async experiments() {
+    // The demo runs the same consent gate and analysis; nothing is collected
+    // until consent is granted here either.
+    const module = await import("../electron/experiments.mjs");
+    return module.experimentReport(demoExperimentState);
+  },
+  async setExperimentConsent(request) {
+    const module = await import("../electron/experiments.mjs");
+    demoExperimentState = request.granted
+      ? { consent: { granted: true, grantedAt: new Date().toISOString(), revokedAt: null, participantId: "demo-participant" }, observations: demoExperimentState.observations }
+      : { consent: { granted: false, grantedAt: demoExperimentState.consent?.grantedAt ?? null, revokedAt: new Date().toISOString(), participantId: null }, observations: [] };
+    return module.experimentReport(demoExperimentState);
+  },
+  async forgetExperiments() {
+    const module = await import("../electron/experiments.mjs");
+    const deletedObservations = demoExperimentState.observations.length;
+    const hadConsent = Boolean(demoExperimentState.consent?.granted);
+    demoExperimentState = { consent: null, observations: [] };
+    return { deletedObservations, hadConsent, state: module.experimentReport(demoExperimentState) };
   },
   async analytics(request) {
     // The demo keeps its own in-memory event log so the same analytics code

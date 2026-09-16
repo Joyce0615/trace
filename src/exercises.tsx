@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Icon, bridge, readableError, repositoryRef } from "./shell";
 import type { ContrastGrade, Course, LearnerState, Lesson, PredictionExercise, PredictionOutcome, Repository, ReviewGradeId, SkillGraph, TeachBackGrade } from "./types";
-import type { ActivityState, AnalyticsState, ArchitectureState, ChainState, DiagnosisState, EvaluationState, EvidenceState, ExecutableQuizState, ExplanationState, HistoryState, LocalizationState, ReviewState, ScheduleState, TraceState } from "./exercise-state";
+import type { ActivityState, AnalyticsState, ArchitectureState, ExperimentState, ChainState, DiagnosisState, EvaluationState, EvidenceState, ExecutableQuizState, ExplanationState, HistoryState, LocalizationState, ReviewState, ScheduleState, TraceState } from "./exercise-state";
 
 /**
  * Exercise, visualization, quality, and diagnosis panels (items 26-36).
@@ -665,6 +665,75 @@ export function SchedulePanel({ repository, skillGraph, learnerState, state, onS
         </svg>
         <small>Recall falls to {Math.round(plan.parameters.targetRetention * 100)}% after {curve.dueDay} day{curve.dueDay === 1 ? "" : "s"}.</small>
       </div>}
+    </>}
+  </section>;
+}
+
+/**
+ * Controlled experiments with consent and deletion (item 42).
+ *
+ * The panel states exactly which fields are stored, which arm the learner is in
+ * and what it changes, and offers revoke and delete as first-class buttons
+ * rather than buried settings. Nothing is collected until consent is granted.
+ */
+export function ExperimentPanel({ repository, state, onState }: {
+  repository: Repository;
+  state: ExperimentState;
+  onState: (update: Partial<ExperimentState>) => void;
+}) {
+  const { report, status, lastDeleted } = state;
+  useEffect(() => {
+    if (status !== "idle") return;
+    onState({ status: "loading" });
+    void bridge.experiments({ repository: repositoryRef(repository) })
+      .then((next) => onState({ report: next, status: "ready" }))
+      .catch(() => onState({ status: "error" }));
+  }, [onState, repository, status]);
+
+  const setConsent = async (granted: boolean) => {
+    onState({ report: await bridge.setExperimentConsent({ repository: repositoryRef(repository), granted }), lastDeleted: null });
+  };
+  const forget = async () => {
+    const result = await bridge.forgetExperiments({ repository: repositoryRef(repository) });
+    onState({ report: result.state, lastDeleted: result.deletedObservations });
+  };
+
+  return <section className="experiment-panel" data-status={status} data-consent={String(Boolean(report?.consent.granted))}>
+    <div className="experiment-head">
+      <span>EXPERIMENTS &amp; PRIVACY</span>
+      {report && (report.consent.granted
+        ? <button className="ghost" onClick={() => void setConsent(false)}>Withdraw</button>
+        : <button className="ghost" onClick={() => void setConsent(true)}>Take part</button>)}
+    </div>
+    {status === "error" && <p className="experiment-note">Experiment settings are unavailable for this repository.</p>}
+    {report && <>
+      <p className="experiment-note" data-observations={report.observations}>
+        {report.consent.granted
+          ? `You are taking part. ${report.observations} measurement${report.observations === 1 ? "" : "s"} are stored on this machine and nowhere else.`
+          : "You are not taking part. Every setting below is the default, and nothing is being recorded."}
+      </p>
+      <p className="experiment-fields">Stored per measurement: {report.storedFields.join(", ")}. Nothing else — no code, no paths, no answers.</p>
+      <div className="experiment-list">
+        {report.assignments.map((assignment) => {
+          const result = report.results.find((item) => item.experimentId === assignment.experimentId);
+          return <div className="experiment-item" key={assignment.experimentId} data-experiment={assignment.experimentId} data-arm={assignment.arm} data-enrolled={String(assignment.enrolled)}>
+            <strong>{assignment.question}</strong>
+            <small>{assignment.applies}</small>
+            <div className="experiment-arm">
+              <em>{assignment.armLabel}</em>
+              <i>{assignment.isControl ? "control" : "variant"}</i>
+            </div>
+            {result && <div className="experiment-result" data-verdict={result.verdict} data-observations={result.observations}>
+              <span>{result.verdict.replace(/-/g, " ")}</span>
+              <small>{result.observations} of {result.minimumSample * 2} measurements{result.needed > 0 ? ` · ${result.needed} more per arm needed` : ""}</small>
+            </div>}
+          </div>;
+        })}
+      </div>
+      <div className="experiment-actions">
+        <button className="danger" onClick={() => void forget()}>Delete everything</button>
+        {lastDeleted !== null && <small data-deleted={lastDeleted}>Deleted {lastDeleted} measurement{lastDeleted === 1 ? "" : "s"}.</small>}
+      </div>
     </>}
   </section>;
 }

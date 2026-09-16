@@ -30,6 +30,8 @@ import { buildActivitySet, gradeContrast, gradePrediction, gradeTeachBack, publi
 import { applyScaffold, buildScaffold, guardResponse, nextHintRung, publicScaffold, registerAnswerSecrets } from "./answer-guard.mjs";
 import { appendEvent, readEvents } from "./activity-log.mjs";
 import { analyticsReport } from "./analytics.mjs";
+import { EXPERIMENTS, experimentReport, settingsFor } from "./experiments.mjs";
+import { forgetEverything, loadExperimentState, recordObservation, setConsent } from "./experiment-store.mjs";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const openedRepositories = new Map();
@@ -60,6 +62,22 @@ const inspectedPaths = new Map();
 
 function activityLogDirectory() {
   return path.join(app.getPath("userData"), "activity-log");
+}
+
+function experimentDirectory() {
+  return path.join(app.getPath("userData"), "experiments");
+}
+
+/**
+ * Record one experiment observation. The store refuses without consent, so a
+ * caller that forgets to check the gate still cannot collect anything.
+ */
+async function observeExperiment(experimentId, value) {
+  const state = await loadExperimentState(experimentDirectory());
+  const assignment = settingsFor(experimentId, state);
+  if (!assignment.enrolled) return;
+  const experiment = EXPERIMENTS.find((item) => item.id === experimentId);
+  await recordObservation(experimentDirectory(), { experimentId, arm: assignment.arm, metric: experiment.metric, value });
 }
 
 /**
@@ -516,6 +534,7 @@ const ipcHandlers = {
       const prediction = set.predictions.find((item) => item.id === request.id);
       if (!prediction) throw new Error("That prediction is not active for this repository.");
       const outcome = gradePrediction(prediction, request.answer ?? "", request.confidence);
+      await observeExperiment("tutor-context-depth", outcome.credit);
       const hints = hintsTaken.get(`${repository.id}|${prediction.id}`) ?? { count: 0, penalty: 0 };
       await recordActivity(repository, { kind: "prediction", taskId: prediction.id, path: prediction.anchor.path, correct: outcome.correct, score: outcome.credit, hints: hints.count, hintPenalty: hints.penalty, confidence: outcome.confidence });
       return outcome;
@@ -558,6 +577,23 @@ const ipcHandlers = {
     const hints = hintsTaken.get(`${repository.id}|${task.id}`) ?? { count: 0, penalty: 0 };
     await recordActivity(repository, { kind: "explanation", taskId: task.id, path: task.entry.path, symbol: task.entry.name, correct: grade.score >= 0.65, score: grade.score, hints: hints.count, hintPenalty: hints.penalty });
     return grade;
+  },
+
+  "experiment:state": async (_event, request) => {
+    openedRepository(request.repository);
+    return experimentReport(await loadExperimentState(experimentDirectory()));
+  },
+
+  "experiment:consent": async (_event, request) => {
+    openedRepository(request.repository);
+    // Revoking deletes the observations, not just the permission to collect more.
+    return experimentReport(await setConsent(experimentDirectory(), request.granted));
+  },
+
+  "experiment:forget": async (_event, request) => {
+    openedRepository(request.repository);
+    const removed = await forgetEverything(experimentDirectory());
+    return { ...removed, state: experimentReport(await loadExperimentState(experimentDirectory())) };
   },
 
   "analytics:report": async (_event, request) => {
@@ -633,10 +669,16 @@ const ipcHandlers = {
     return grade;
   },
 
-  "learning:schedule": (_event, request) => {
+  "learning:schedule": async (_event, request) => {
     openedRepository(request.repository);
     if (!Array.isArray(request.skillGraph?.nodes)) throw new Error("Invalid review-schedule request.");
-    return reviewPlan(request.learnerState ?? {}, request.skillGraph, { now: request.now, dailyLimit: request.dailyLimit });
+    // Item 42: an explicit request always wins; otherwise the assigned arm sets
+    // the daily limit, and without consent that is the control arm's value.
+    const assigned = settingsFor("review-daily-limit", await loadExperimentState(experimentDirectory()));
+    return reviewPlan(request.learnerState ?? {}, request.skillGraph, {
+      now: request.now,
+      dailyLimit: request.dailyLimit ?? assigned.dailyLimit,
+    });
   },
 
   "learning:review": async (_event, request) => {
@@ -664,6 +706,7 @@ const ipcHandlers = {
       hints: 0,
       hintPenalty: 0,
     });
+    await observeExperiment("review-daily-limit", result.review.recalled ? 1 : 0);
     return { ...result, learnerState };
   },
 

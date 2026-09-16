@@ -20,6 +20,8 @@ import { SECRET_SCANNER_VERSION, anonymizePath, redact, redactValue, scanText, s
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
 import { GIT_HISTORY_VERSION, busFactor, historyLessons, historySummary, parseHistory, readCommits } from "../electron/git-history.mjs";
 import { MISCONCEPTIONS, MISCONCEPTION_VERSION, buildProbe, calibrateSkill, detectMisconceptions, diagnoseLearner, gradeProbe } from "../electron/misconception.mjs";
+import { EXPERIMENTS, EXPERIMENT_VERSION, OBSERVATION_FIELDS, activeAssignments, analyzeExperiment, assignArm, consentState, experimentReport, hash32, sanitizeObservation, settingsFor } from "../electron/experiments.mjs";
+import { forgetEverything, loadExperimentState, recordObservation, setConsent } from "../electron/experiment-store.mjs";
 import { ANALYTICS_VERSION, MIN_SAMPLE, analyticsReport, hintAnalytics, normalizeEvents, rate, retentionAnalytics, timeOnTaskAnalytics, transferAnalytics } from "../electron/analytics.mjs";
 import { appendEvent, readEvents } from "../electron/activity-log.mjs";
 import { ALWAYS_FORBIDDEN, ANSWER_GUARD_VERSION, MAX_HINT_PENALTY, SCANNED_CHANNELS, answerSecrets, applyScaffold, auditResponse, buildScaffold, clearAnswerSecrets, findForbiddenKeys, findLeakedValues, forbiddenKeysFor, guardResponse, nextHintRung, publicScaffold, registerAnswerSecrets, scaffoldPenalty } from "../electron/answer-guard.mjs";
@@ -754,7 +756,8 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
     "graph:architecture", "graph:symbol-flow", "history:summary", "evidence:import", "search:query", "eval:run",
     "learning:diagnose", "learning:probe", "learning:schedule", "learning:review",
     "quiz:build", "quiz:grade", "explain:task", "explain:grade",
-    "activity:build", "activity:grade", "hint:next", "analytics:report", "agents:ask",
+    "activity:build", "activity:grade", "hint:next", "analytics:report",
+    "experiment:state", "experiment:consent", "experiment:forget", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
   assert.throws(() => schemaFor("repository:evil"), /is not a registered IPC channel/);
@@ -3551,4 +3554,157 @@ test("learning analytics report retention, transfer, time, and hints with their 
   assert.equal((await readEvents(logDirectory, repository.id)).length, 6);
   // Different repositories keep separate logs.
   assert.deepEqual(await readEvents(logDirectory, "another-repository"), []);
+});
+
+test("experiments require consent, record only numbers, and refuse to call a winner without evidence", async (context) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "trace-experiments-"));
+  context.after(() => rm(directory, { recursive: true, force: true }));
+  assert.equal(EXPERIMENT_VERSION, 1);
+  assert.ok(EXPERIMENTS.length >= 2);
+  for (const experiment of EXPERIMENTS) {
+    assert.equal(experiment.arms.filter((arm) => arm.control).length, 1, `${experiment.id} must have exactly one control arm`);
+    assert.equal(experiment.arms[0].control, true, "the control arm is first, so it is the default");
+    assert.ok(experiment.minimumSample >= 5 && experiment.metric && experiment.question.length > 20);
+  }
+
+  // --- No consent means no experiment at all -------------------------------
+  const fresh = await loadExperimentState(directory);
+  assert.equal(consentState(fresh).granted, false);
+  assert.equal(consentState(fresh).participantId, null);
+  const unconsented = activeAssignments(fresh);
+  assert.equal(unconsented.every((item) => item.enrolled === false), true);
+  assert.equal(unconsented.every((item) => item.isControl === true), true, "an unconsented learner always gets the control arm");
+  // The applied setting is therefore exactly what the app would do anyway.
+  assert.equal(settingsFor("review-daily-limit", fresh).dailyLimit, 12);
+  // Recording is refused by the store, not merely skipped by the caller.
+  const refused = await recordObservation(directory, { experimentId: "review-daily-limit", arm: "six", metric: "review-success", value: 1 });
+  assert.deepEqual(refused, { recorded: false, reason: "no-consent" });
+  assert.deepEqual((await loadExperimentState(directory)).observations, []);
+
+  // --- Consent, assignment, and application --------------------------------
+  const consented = await setConsent(directory, true);
+  assert.equal(consented.consent.granted, true);
+  assert.ok(consented.consent.participantId.length >= 16);
+  // The participant id encodes nothing about the machine or the repository.
+  assert.equal(/[Uu]sers|flashinfer|\//.test(consented.consent.participantId), false, consented.consent.participantId);
+  const assignments = activeAssignments(consented);
+  assert.equal(assignments.every((item) => item.enrolled === true), true);
+  // Assignment is deterministic and independent per experiment.
+  for (const experiment of EXPERIMENTS) {
+    const first = assignArm(experiment, consented.consent.participantId);
+    assert.deepEqual(assignArm(experiment, consented.consent.participantId), first, "assignment must be stable across calls");
+    assert.ok(experiment.arms.some((arm) => arm.id === first.id));
+  }
+  const limit = EXPERIMENTS.find((experiment) => experiment.id === "review-daily-limit");
+  const arms = Array.from({ length: 400 }, (_unused, index) => assignArm(limit, `participant-${index}`).id);
+  assert.equal(new Set(arms).size, 2, "both arms are reachable across participants");
+  // The split is roughly even, so the hash is not quietly favouring one arm.
+  const controlShare = arms.filter((arm) => arm === "twelve").length / arms.length;
+  assert.ok(controlShare > 0.35 && controlShare < 0.65, `arm split was ${controlShare}`);
+  assert.equal(hash32("stable"), hash32("stable"));
+  assert.notEqual(hash32("stable"), hash32("stable-2"));
+  // The assigned arm really changes the applied setting.
+  const applied = settingsFor("review-daily-limit", consented);
+  assert.ok([6, 12].includes(applied.dailyLimit));
+  assert.equal(applied.enrolled, true);
+
+  // --- Privacy is an allowlist, not a filter -------------------------------
+  const hostile = sanitizeObservation({
+    experimentId: "review-daily-limit",
+    arm: "six",
+    metric: "review-success",
+    value: 1,
+    at: "2026-06-01T00:00:00.000Z",
+    path: "/Users/someone/secret/repo/app.py",
+    answer: "the answer is 42",
+    note: "learner wrote this",
+    participantEmail: "someone@example.com",
+  });
+  assert.equal(hostile.ok, true);
+  assert.deepEqual(Object.keys(hostile.observation).sort(), [...OBSERVATION_FIELDS].sort());
+  assert.equal(JSON.stringify(hostile.observation).includes("secret"), false);
+  assert.equal(JSON.stringify(hostile.observation).includes("example.com"), false);
+  // A value that is not a number is refused rather than coerced.
+  assert.deepEqual(sanitizeObservation({ experimentId: "review-daily-limit", arm: "six", metric: "review-success", value: "great" }), { ok: false, reason: "non-numeric-value" });
+  assert.deepEqual(sanitizeObservation({ experimentId: "nope", arm: "six", metric: "review-success", value: 1 }), { ok: false, reason: "unknown-experiment" });
+  assert.deepEqual(sanitizeObservation({ experimentId: "review-daily-limit", arm: "nope", metric: "review-success", value: 1 }), { ok: false, reason: "unknown-arm" });
+  assert.deepEqual(sanitizeObservation({ experimentId: "review-daily-limit", arm: "six", metric: "made-up", value: 1 }), { ok: false, reason: "unexpected-metric" });
+  // ...and the same allowlist is what reaches disk.
+  const stored = await recordObservation(directory, { experimentId: "review-daily-limit", arm: "six", metric: "review-success", value: 1, path: "/Users/someone/app.py" });
+  assert.equal(stored.recorded, true);
+  const onDisk = await loadExperimentState(directory);
+  assert.equal(onDisk.observations.length, 1);
+  assert.deepEqual(Object.keys(onDisk.observations[0]).sort(), [...OBSERVATION_FIELDS].sort());
+  assert.equal(JSON.stringify(onDisk).includes("/Users/someone"), false, "a path reached disk");
+
+  // --- The analysis refuses to overclaim -----------------------------------
+  const observations = [];
+  const push = (arm, value, count) => { for (let index = 0; index < count; index += 1) observations.push({ experimentId: "review-daily-limit", arm, metric: "review-success", value }); };
+  // Too few observations: underpowered, and it says how many more are needed.
+  push("twelve", 1, 4);
+  push("six", 0, 4);
+  const thin = analyzeExperiment(limit, observations);
+  assert.equal(thin.verdict, "underpowered");
+  assert.equal(thin.powered, false);
+  assert.equal(thin.needed, limit.minimumSample - 4);
+  assert.equal(thin.arms.find((arm) => arm.arm === "twelve").samples, 4);
+
+  // Enough observations but overlapping distributions: no difference claimed.
+  observations.length = 0;
+  for (let index = 0; index < 20; index += 1) {
+    observations.push({ experimentId: "review-daily-limit", arm: "twelve", metric: "review-success", value: index % 2 });
+    observations.push({ experimentId: "review-daily-limit", arm: "six", metric: "review-success", value: (index + 1) % 2 });
+  }
+  const noisy = analyzeExperiment(limit, observations);
+  assert.equal(noisy.powered, true);
+  assert.equal(noisy.verdict, "no-difference", JSON.stringify({ difference: noisy.difference, interval: noisy.interval }));
+  assert.ok(noisy.interval[0] <= 0 && noisy.interval[1] >= 0, JSON.stringify(noisy.interval));
+
+  // A real, separated effect is reported, in the declared direction.
+  observations.length = 0;
+  push("twelve", 0.2, 20);
+  push("six", 0.9, 20);
+  const strong = analyzeExperiment(limit, observations);
+  assert.equal(strong.verdict, "variant-better");
+  assert.ok(strong.difference > 0.5, String(strong.difference));
+  assert.ok(strong.interval[0] > 0, JSON.stringify(strong.interval));
+  // ...and the reverse effect is reported as the control winning, not ignored.
+  observations.length = 0;
+  push("twelve", 0.95, 20);
+  push("six", 0.15, 20);
+  assert.equal(analyzeExperiment(limit, observations).verdict, "control-better");
+  // An experiment with no observations at all does not pretend to a result.
+  assert.equal(analyzeExperiment(limit, []).verdict, "underpowered");
+  assert.equal(analyzeExperiment(limit, []).difference, null);
+  assert.equal(analyzeExperiment(limit, []).interval, null);
+
+  // --- The report states exactly what is kept ------------------------------
+  const report = experimentReport({ consent: onDisk.consent, observations });
+  assert.equal(report.version, 1);
+  assert.deepEqual(report.storedFields, OBSERVATION_FIELDS);
+  assert.equal(report.results.length, EXPERIMENTS.length);
+  assert.equal(report.assignments.length, EXPERIMENTS.length);
+  assert.equal(report.consent.granted, true);
+
+  // --- Withdrawal and deletion really delete -------------------------------
+  await recordObservation(directory, { experimentId: "review-daily-limit", arm: "six", metric: "review-success", value: 1 });
+  assert.ok((await loadExperimentState(directory)).observations.length >= 2);
+  const withdrawn = await setConsent(directory, false);
+  assert.equal(withdrawn.consent.granted, false);
+  assert.ok(withdrawn.consent.revokedAt);
+  assert.deepEqual(withdrawn.observations, [], "withdrawing deletes the measurements, it does not merely stop collection");
+  assert.equal(consentState(withdrawn).participantId, null);
+  assert.equal(settingsFor("review-daily-limit", withdrawn).dailyLimit, 12, "withdrawal returns the learner to the control behaviour");
+  // Re-granting mints a new participant id, so two consent periods cannot be linked.
+  const regranted = await setConsent(directory, true);
+  assert.notEqual(regranted.consent.participantId, consented.consent.participantId);
+  await recordObservation(directory, { experimentId: "review-daily-limit", arm: "six", metric: "review-success", value: 1 });
+  const forgotten = await forgetEverything(directory);
+  assert.equal(forgotten.hadConsent, true);
+  assert.ok(forgotten.deletedObservations >= 1);
+  // The file is removed, not blanked.
+  await assert.rejects(access(path.join(directory, "experiments.json")));
+  const after = await loadExperimentState(directory);
+  assert.deepEqual(after.observations, []);
+  assert.equal(consentState(after).granted, false);
 });

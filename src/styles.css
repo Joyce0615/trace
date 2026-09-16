@@ -897,3 +897,25 @@ button { color: inherit; }
 .analytics-verdict { color: #93a0b1; font-size: calc(9px + var(--font-boost)); }
 .analytics-warnings { display: flex; flex-wrap: wrap; gap: 4px; }
 .analytics-warnings span { padding: 2px 8px; border: 1px dashed #3a4456; border-radius: 6px; color: #7d8798; font-size: calc(8px + var(--font-boost)); }
+
+/* Item 42: controlled experiments with consent and deletion. */
+.experiment-panel { padding: 18px 26px 34px; display: flex; flex-direction: column; gap: 9px; border-top: 1px solid #1a2130; }
+.experiment-head { display: flex; align-items: center; gap: 10px; }
+.experiment-head span { color: #f0b866; font-size: calc(9px + var(--font-boost)); letter-spacing: .14em; }
+.experiment-head .ghost { margin-left: auto; padding: 5px 12px; border: 1px solid #262d3d; border-radius: 8px; background: none; color: #93a0b1; font-size: calc(10px + var(--font-boost)); cursor: pointer; }
+.experiment-note { color: #93a0b1; font-size: calc(10px + var(--font-boost)); }
+.experiment-fields { color: #5b6474; font-size: calc(9px + var(--font-boost)); }
+.experiment-list { display: flex; flex-direction: column; gap: 6px; }
+.experiment-item { display: flex; flex-direction: column; gap: 4px; padding: 8px 10px; border: 1px solid #1e2532; border-radius: 9px; background: #0e121a; }
+.experiment-item[data-enrolled="false"] { opacity: .72; }
+.experiment-item strong { color: #dbe1ea; font-size: calc(10px + var(--font-boost)); }
+.experiment-item > small { color: #6d7787; font-size: calc(9px + var(--font-boost)); }
+.experiment-arm { display: flex; align-items: baseline; gap: 8px; }
+.experiment-arm em { color: #c8b6ff; font-style: normal; font-size: calc(10px + var(--font-boost)); }
+.experiment-arm i { color: #5b6474; font-style: normal; font-size: calc(8px + var(--font-boost)); }
+.experiment-result { display: flex; align-items: baseline; gap: 8px; }
+.experiment-result span { color: #93a0b1; font-size: calc(9px + var(--font-boost)); }
+.experiment-result small { color: #5b6474; font-size: calc(8px + var(--font-boost)); }
+.experiment-actions { display: flex; align-items: center; gap: 9px; }
+.experiment-actions .danger { padding: 5px 12px; border: 1px solid #4a2f2f; border-radius: 8px; background: none; color: #dfa2a2; font-size: calc(10px + var(--font-boost)); cursor: pointer; }
+.experiment-actions small { color: #6d7787; font-size: calc(9px + var(--font-boost)); }

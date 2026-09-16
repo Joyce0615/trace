@@ -857,6 +857,91 @@ try {
   assert.match(quizAudit.network.cases[0].error, /not allowed inside the quiz sandbox/);
   assert.match(quizAudit.stale ?? "", /not active for this repository/);
 
+  // Item 42: consent gates every experiment, the assigned arm really changes
+  // behaviour, and withdrawing deletes what was collected.
+  const experimentAudit = await page.evaluate(async () => {
+    const workspace = window.traceWorkspace;
+    const repository = { id: workspace.repository.id, rootPath: workspace.repository.rootPath };
+    const skillGraph = workspace.skillGraph;
+    const day = 86_400_000;
+    const learnerState = {
+      ...workspace.learnerState,
+      mastery: Object.fromEntries(skillGraph.nodes.map((node) => [node.id, {
+        skillId: node.id,
+        mastery: 0.8,
+        confidence: 0.5,
+        status: "mastered",
+        evidence: [],
+        sourceFingerprint: node.sourceFingerprint,
+        // Everything overdue, so the daily limit is what decides the queue length.
+        review: { stability: 1, difficulty: 2, reviews: 2, lapses: 0, lastReviewedAt: new Date(Date.now() - 60 * day).toISOString(), lastGrade: "good" },
+      }])),
+      memory: [],
+    };
+    const before = await window.trace.experiments({ repository });
+    const controlPlan = await window.trace.reviewPlan({ repository, skillGraph, learnerState });
+    const consented = await window.trace.setExperimentConsent({ repository, granted: true });
+    const assignedPlan = await window.trace.reviewPlan({ repository, skillGraph, learnerState });
+    const explicitPlan = await window.trace.reviewPlan({ repository, skillGraph, learnerState, dailyLimit: 3 });
+    // Grade a review so an observation is recorded under the assigned arm.
+    const target = assignedPlan.queue[0].skillId;
+    await window.trace.recordReview({ repository, skillGraph, learnerState, skillId: target, grade: "good" });
+    const afterObservation = await window.trace.experiments({ repository });
+    // Each grant mints a new participant id, so re-consenting until both arms
+    // have been seen proves the *variant* is wired up too, not just the control.
+    const armsSeen = new Map();
+    for (let attempt = 0; attempt < 14 && armsSeen.size < 2; attempt += 1) {
+      const state = await window.trace.setExperimentConsent({ repository, granted: true });
+      const arm = state.assignments.find((item) => item.experimentId === "review-daily-limit");
+      const plan = await window.trace.reviewPlan({ repository, skillGraph, learnerState });
+      armsSeen.set(arm.arm, { declared: arm.settings.dailyLimit, applied: plan.parameters.dailyLimit, queued: plan.queue.length });
+      if (armsSeen.size < 2) await window.trace.setExperimentConsent({ repository, granted: false });
+    }
+    const withdrawn = await window.trace.setExperimentConsent({ repository, granted: false });
+    const afterWithdrawalPlan = await window.trace.reviewPlan({ repository, skillGraph, learnerState });
+    const forgotten = await window.trace.forgetExperiments({ repository });
+    return { before, controlPlan, consented, assignedPlan, explicitPlan, afterObservation, withdrawn, afterWithdrawalPlan, forgotten, dueCount: controlPlan.summary.due, armsSeen: [...armsSeen.entries()] };
+  });
+  // Before consent: not enrolled, control arm, control behaviour.
+  assert.equal(experimentAudit.before.consent.granted, false);
+  assert.equal(experimentAudit.before.consent.participantId, null);
+  assert.ok(experimentAudit.before.assignments.every((item) => item.enrolled === false && item.isControl === true));
+  assert.equal(experimentAudit.before.observations, 0);
+  assert.equal(experimentAudit.controlPlan.parameters.dailyLimit, 12, "an unconsented learner gets the control daily limit");
+  // After consent: enrolled, with a real participant id that leaks nothing.
+  assert.equal(experimentAudit.consented.consent.granted, true);
+  assert.ok(experimentAudit.consented.consent.participantId.length >= 16);
+  assert.equal(/Users|flashinfer/.test(experimentAudit.consented.consent.participantId), false);
+  assert.ok(experimentAudit.consented.assignments.every((item) => item.enrolled === true));
+  // The assigned arm really drives the scheduler, and an explicit request wins.
+  const assignedLimit = experimentAudit.consented.assignments.find((item) => item.experimentId === "review-daily-limit").settings.dailyLimit;
+  assert.ok([6, 12].includes(assignedLimit), String(assignedLimit));
+  assert.equal(experimentAudit.assignedPlan.parameters.dailyLimit, assignedLimit);
+  assert.equal(experimentAudit.explicitPlan.parameters.dailyLimit, 3, "an explicit request always wins over the assignment");
+  assert.equal(experimentAudit.assignedPlan.queue.length, Math.min(assignedLimit, experimentAudit.dueCount));
+  // An observation was recorded, and it contains only the allowed fields.
+  assert.ok(experimentAudit.afterObservation.observations >= 1, String(experimentAudit.afterObservation.observations));
+  assert.deepEqual(experimentAudit.afterObservation.storedFields.sort(), ["arm", "at", "experimentId", "metric", "value"]);
+  // ...and still refuses to declare a winner from it.
+  const limitResult = experimentAudit.afterObservation.results.find((item) => item.experimentId === "review-daily-limit");
+  assert.equal(limitResult.verdict, "underpowered");
+  assert.ok(limitResult.needed > 0);
+  // Both arms were reachable, and each one really drove the scheduler.
+  assert.equal(experimentAudit.armsSeen.length, 2, `only saw arms ${JSON.stringify(experimentAudit.armsSeen)}`);
+  for (const [arm, observed] of experimentAudit.armsSeen) {
+    assert.equal(observed.applied, observed.declared, `${arm} declared ${observed.declared} but the scheduler used ${observed.applied}`);
+    assert.equal(observed.queued, Math.min(observed.declared, experimentAudit.dueCount));
+  }
+  assert.notEqual(experimentAudit.armsSeen[0][1].declared, experimentAudit.armsSeen[1][1].declared, "the two arms must differ or the experiment measures nothing");
+
+  // Withdrawing deletes the measurements and restores the control behaviour.
+  assert.equal(experimentAudit.withdrawn.consent.granted, false);
+  assert.ok(experimentAudit.withdrawn.consent.revokedAt);
+  assert.equal(experimentAudit.withdrawn.observations, 0, "withdrawal deletes, it does not merely stop collecting");
+  assert.equal(experimentAudit.afterWithdrawalPlan.parameters.dailyLimit, 12);
+  assert.equal(experimentAudit.forgotten.state.observations, 0);
+  assert.equal(experimentAudit.forgotten.state.consent.granted, false);
+
   // Item 41: analytics computed from the events the main process recorded while
   // grading the activities above, not from anything the renderer reported.
   const analyticsAudit = await page.evaluate(async () => {
@@ -1135,6 +1220,7 @@ try {
       lessons: { score: evaluationAudit.lessons.score, verdict: evaluationAudit.lessons.verdict },
     },
     diagnosis: { skills: diagnosis.skills.length, assessed: diagnosis.summary.assessed, meanConfidence: diagnosis.summary.meanConfidence, brier: diagnosis.summary.meanBrier, overconfident: diagnosis.summary.overconfidentSkills, misconceptions: diagnosis.summary.misconceptionCounts },
+    experiments: { arms: experimentAudit.armsSeen.map(([arm, observed]) => `${arm}:declared=${observed.declared},applied=${observed.applied},queued=${observed.queued}`), unconsentedLimit: experimentAudit.controlPlan.parameters.dailyLimit, assignedArm: experimentAudit.consented.assignments.map((item) => `${item.experimentId}=${item.arm}`), assignedLimit, explicitLimit: experimentAudit.explicitPlan.parameters.dailyLimit, observations: experimentAudit.afterObservation.observations, verdict: limitResult.verdict, afterWithdrawal: experimentAudit.afterWithdrawalPlan.parameters.dailyLimit, deleted: experimentAudit.forgotten.deletedObservations },
     analytics: { events: analytics.events, kinds: analytics.timeOnTask.byKind.map((entry) => `${entry.kind}:${entry.events}`), sessions: analytics.timeOnTask.sessions, near: analytics.transfer.near, far: analytics.transfer.far, hintsRevealed: analytics.hints.hintsRevealed, penaltyCarried: analytics.hints.penaltyCarried, retentionVerdict: analytics.retention.modelVerdict, warnings: analytics.warnings.map((warning) => warning.measure) },
     answerGuard: { rungsServed: servedRungs.length, rungIds: servedRungs.map((item) => item.id), finalPenalty: servedRungs.at(-1).penalty, revealedAnswer: revealedNumber, dataChannelsOk: guardAudit.readOk && guardAudit.searchOk },
     activities: { teachBack: activitySet.teachBack.symbol, misleadingScore: activityAudit.misleading.score, misconceptions: activityAudit.misleading.misconceptions.map((finding) => finding.id), solidScore: activityAudit.solid.score, predictions: activitySet.predictions.map((item) => item.metric), boldBrier: activityAudit.bold.brier, humbleBrier: activityAudit.humble.brier, contrastSymbol: activitySet.contrast.symbol, contrastPaths: activitySet.contrast.options.map((option) => `${option.path}:${option.line}`), differences: activityAudit.contrastRight.differences.map((item) => item.id) },
