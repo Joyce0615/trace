@@ -31,6 +31,7 @@ import { applyScaffold, buildScaffold, guardResponse, nextHintRung, publicScaffo
 import { appendEvent, readEvents } from "./activity-log.mjs";
 import { analyticsReport } from "./analytics.mjs";
 import { EXPERIMENTS, experimentReport, settingsFor } from "./experiments.mjs";
+import { goalPlan } from "./goals.mjs";
 import { forgetEverything, loadExperimentState, recordObservation, setConsent } from "./experiment-store.mjs";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -577,6 +578,25 @@ const ipcHandlers = {
     const hints = hintsTaken.get(`${repository.id}|${task.id}`) ?? { count: 0, penalty: 0 };
     await recordActivity(repository, { kind: "explanation", taskId: task.id, path: task.entry.path, symbol: task.entry.name, correct: grade.score >= 0.65, score: grade.score, hints: hints.count, hintPenalty: hints.penalty });
     return grade;
+  },
+
+  "goals:plan": async (_event, request) => {
+    const repository = openedRepository(request.repository);
+    // Only indexed files are scanned, largest-importance first, so ranking a
+    // goal never turns into a whole-repository read.
+    const sources = {};
+    const candidates = [...repository.files]
+      .filter((file) => file.size < 200_000)
+      .sort((left, right) => (right.importance ?? 0) - (left.importance ?? 0))
+      .slice(0, 250);
+    for (const file of candidates) {
+      try {
+        sources[file.path] = await readRepositoryFile(repository.rootPath, file.path);
+      } catch {
+        // An unreadable file simply contributes no signal.
+      }
+    }
+    return goalPlan(repository, request.goal, { sources, course: request.course, limit: request.limit });
   },
 
   "experiment:state": async (_event, request) => {

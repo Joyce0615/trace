@@ -1,4 +1,5 @@
-import type { LearnerState, LearningEvidence, SkillGraph, SkillMastery, SkillNode } from "./types";
+import { goalKeywords } from "../electron/goal-keywords.mjs";
+import type { LearnerGoal, LearnerState, LearningEvidence, SkillGraph, SkillMastery, SkillNode } from "./types";
 
 export function createClientLearnerState(repositoryId: string, sourceVersion: string | undefined, graph: SkillGraph): LearnerState {
   const mastery: Record<string, SkillMastery> = {};
@@ -89,12 +90,12 @@ export function learningMemorySummary(state: LearnerState) {
   return state.memory.slice(-6).map((item) => item.text).join(" · ");
 }
 
-export function personalizeSkillGraph(graph: SkillGraph, goal: "architecture" | "critical_path" | "contribute" | "review"): SkillGraph {
-  const matchers = {
-    architecture: /system|map|engine|architecture|boundary/i,
-    critical_path: /loop|scheduler|prefill|decode|runner|flow/i,
-    contribute: /project|practice|test|scheduler/i,
-    review: /state|cache|design|system|correct/i,
-  };
-  return { ...graph, nodes: graph.nodes.map((node) => ({ ...node, importance: node.importance + (matchers[goal].test(`${node.title} ${node.branch}`) ? 28 : 0) })) };
+/**
+ * Reweight a skill graph for a goal using item 43's shared keyword patterns, so
+ * the start-screen goal, the generated curriculum, and the goal planner all
+ * agree on what a goal considers relevant.
+ */
+export function personalizeSkillGraph(graph: SkillGraph, goal: LearnerGoal): SkillGraph {
+  const pattern = goalKeywords(goal);
+  return { ...graph, nodes: graph.nodes.map((node) => ({ ...node, importance: node.importance + (pattern.test(`${node.title} ${node.branch} ${node.summary ?? ""}`) ? 28 : 0) })) };
 }

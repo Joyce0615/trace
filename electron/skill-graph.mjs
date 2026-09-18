@@ -1,16 +1,16 @@
 import { createHash } from "node:crypto";
+import { goalKeywords } from "./goal-keywords.mjs";
 
 function depthFor(difficulty) {
   return difficulty === "advanced" ? "deep" : difficulty === "intermediate" ? "working" : "foundation";
 }
 
+// One definition of "does this lesson serve this goal", shared with item 43's
+// goal planner, so the curriculum and the goal view cannot disagree.
 function goalBoost(profile, module, lesson) {
-  const text = `${module.title} ${lesson.title} ${lesson.objective}`.toLowerCase();
-  if (profile?.goal === "critical_path" && /flow|path|trace|execution|scheduler/.test(text)) return 24;
-  if (profile?.goal === "contribute" && /test|practice|project|change|contribut/.test(text)) return 30;
-  if (profile?.goal === "review" && /design|boundary|test|correct|trade/.test(text)) return 24;
-  if (profile?.goal === "architecture" && /map|purpose|structure|entry|architecture/.test(text)) return 20;
-  return 0;
+  if (!profile?.goal) return 0;
+  const text = `${module.title} ${lesson.title} ${lesson.objective}`;
+  return goalKeywords(profile.goal).test(text) ? 24 : 0;
 }
 
 export function buildSkillGraph(repository, course) {

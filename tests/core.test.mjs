@@ -20,6 +20,7 @@ import { SECRET_SCANNER_VERSION, anonymizePath, redact, redactValue, scanText, s
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
 import { GIT_HISTORY_VERSION, busFactor, historyLessons, historySummary, parseHistory, readCommits } from "../electron/git-history.mjs";
 import { MISCONCEPTIONS, MISCONCEPTION_VERSION, buildProbe, calibrateSkill, detectMisconceptions, diagnoseLearner, gradeProbe } from "../electron/misconception.mjs";
+import { GOALS, GOALS_VERSION, goalKeywords, goalPlan, orderLessonsForGoal, rankTargets, resolveGoal } from "../electron/goals.mjs";
 import { EXPERIMENTS, EXPERIMENT_VERSION, OBSERVATION_FIELDS, activeAssignments, analyzeExperiment, assignArm, consentState, experimentReport, hash32, sanitizeObservation, settingsFor } from "../electron/experiments.mjs";
 import { forgetEverything, loadExperimentState, recordObservation, setConsent } from "../electron/experiment-store.mjs";
 import { ANALYTICS_VERSION, MIN_SAMPLE, analyticsReport, hintAnalytics, normalizeEvents, rate, retentionAnalytics, timeOnTaskAnalytics, transferAnalytics } from "../electron/analytics.mjs";
@@ -757,7 +758,7 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
     "learning:diagnose", "learning:probe", "learning:schedule", "learning:review",
     "quiz:build", "quiz:grade", "explain:task", "explain:grade",
     "activity:build", "activity:grade", "hint:next", "analytics:report",
-    "experiment:state", "experiment:consent", "experiment:forget", "agents:ask",
+    "goals:plan", "experiment:state", "experiment:consent", "experiment:forget", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
   assert.throws(() => schemaFor("repository:evil"), /is not a registered IPC channel/);
@@ -774,7 +775,7 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
   assert.throws(() => validatePayload("repository:open", open, {}), /\.source: is required/);
   assert.throws(() => validatePayload("repository:open", open, { source: "" }), /at least 1 characters/);
   assert.throws(() => validatePayload("repository:open", open, { source: "x".repeat(5_000) }), /exceeds 4096 characters/);
-  assert.throws(() => validatePayload("repository:open", open, { source: "/tmp", profile: { goal: "evil", level: "adaptive" } }), /must be one of architecture/);
+  assert.throws(() => validatePayload("repository:open", open, { source: "/tmp", profile: { goal: "evil", level: "adaptive" } }), /must be one of debugging, onboarding, architecture/);
   assert.throws(() => validatePayload("repository:open", open, { source: "/tmp", limits: { maxFiles: "many" } }), /must be a finite number/);
   assert.throws(() => validatePayload("repository:open", open, { source: "/tmp", limits: { maxFiles: Infinity } }), /must be a finite number/);
 
@@ -3707,4 +3708,170 @@ test("experiments require consent, record only numbers, and refuse to call a win
   const after = await loadExperimentState(directory);
   assert.deepEqual(after.observations, []);
   assert.equal(consentState(after).granted, false);
+});
+
+test("learner goals rank the same repository five different ways from real signals", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-goals-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "app"), { recursive: true });
+  await writeFile(path.join(rootPath, "app", "__init__.py"), "");
+  // Four files, each written to be the obvious answer for exactly one goal.
+  await writeFile(path.join(rootPath, "app", "errors.py"), [
+    "def guard(value):",
+    "    assert value is not None",
+    "    try:",
+    "        return int(value)",
+    "    except ValueError:",
+    "        raise RuntimeError('bad value')",
+    "    except TypeError:",
+    "        raise RuntimeError('bad type')",
+    "",
+  ].join("\n"));
+  await writeFile(path.join(rootPath, "app", "cli.py"), [
+    "import argparse",
+    "",
+    '__all__ = ["main"]',
+    "",
+    "",
+    "def main():",
+    '    """Run the tool from the command line."""',
+    "    parser = argparse.ArgumentParser()",
+    "    return parser.parse_args()",
+    "",
+    "",
+    'if __name__ == "__main__":',
+    "    main()",
+    "",
+  ].join("\n"));
+  await writeFile(path.join(rootPath, "app", "unsafe.py"), [
+    "import subprocess",
+    "",
+    "",
+    "def run(command, token):",
+    "    secret = token or 'api_key'",
+    "    return subprocess.run(command), eval(command), secret",
+    "",
+  ].join("\n"));
+  await writeFile(path.join(rootPath, "app", "kernel.py"), [
+    "def matmul(tensor, batch_size):",
+    "    cache = {}",
+    "    for row in range(batch_size):",
+    "        for column in range(batch_size):",
+    "            cache[row] = tensor",
+    "    return cache",
+    "",
+  ].join("\n"));
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const course = generateStarterCourse(repository);
+  const sources = {};
+  for (const file of repository.files) sources[file.path] = await readRepositoryFile(rootPath, file.path);
+
+  assert.equal(GOALS_VERSION, 1);
+  assert.deepEqual(GOALS.map((goal) => goal.id), ["debugging", "onboarding", "architecture", "security", "performance"]);
+  for (const goal of GOALS) {
+    assert.ok(goal.signals.length >= 2 && goal.activities.length >= 2, goal.id);
+    assert.ok(goal.summary.length > 40, goal.id);
+  }
+
+  // --- Each goal finds its own file ---------------------------------------
+  const topFor = (goalId) => rankTargets(repository, goalId, sources)[0];
+  assert.equal(topFor("debugging").path, "app/errors.py", JSON.stringify(rankTargets(repository, "debugging", sources).map((item) => `${item.path}:${item.score}`)));
+  assert.equal(topFor("onboarding").path, "app/cli.py", JSON.stringify(rankTargets(repository, "onboarding", sources).map((item) => `${item.path}:${item.score}`)));
+  assert.equal(topFor("security").path, "app/unsafe.py", JSON.stringify(rankTargets(repository, "security", sources).map((item) => `${item.path}:${item.score}`)));
+  assert.equal(topFor("performance").path, "app/kernel.py", JSON.stringify(rankTargets(repository, "performance", sources).map((item) => `${item.path}:${item.score}`)));
+  // The same repository, ranked genuinely differently rather than cosmetically.
+  const heads = new Set(["debugging", "onboarding", "security", "performance"].map((goalId) => topFor(goalId).path));
+  assert.equal(heads.size, 4, [...heads].join(","));
+
+  // --- Every ranking explains itself with counted evidence -----------------
+  const debugging = topFor("debugging");
+  assert.ok(debugging.reasons.some((reason) => reason.signal === "error-paths" && reason.count >= 4), JSON.stringify(debugging.reasons));
+  assert.match(debugging.reasons.find((reason) => reason.signal === "error-paths").detail, /explicit error path/);
+  assert.ok(debugging.reasons.some((reason) => reason.signal === "assertions"));
+  const security = topFor("security");
+  assert.ok(security.reasons.some((reason) => reason.signal === "dynamic-execution" && reason.count >= 2), JSON.stringify(security.reasons));
+  assert.ok(security.reasons.some((reason) => reason.signal === "credentials"));
+  // Anchors point at real indexed files.
+  for (const goal of GOALS) {
+    for (const target of rankTargets(repository, goal.id, sources)) {
+      assert.ok(repository.files.some((file) => file.path === target.anchor.path), `${goal.id} anchored outside the index: ${target.anchor.path}`);
+      assert.ok(target.anchor.line >= 1);
+      assert.ok(target.reasons.length >= 1, `${goal.id} ranked ${target.path} with no evidence`);
+      assert.ok(target.score > 0);
+    }
+  }
+  // A file with nothing to say about a goal is left out, not ranked at zero.
+  assert.equal(rankTargets(repository, "security", { "app/plain.py": "x = 1\n" }).length, 0);
+
+  // Regression: a shared /g regex carries `lastIndex` between calls, which would
+  // silently skip matches in every file after the first.
+  const repeated = [1, 2, 3].map(() => rankTargets(repository, "debugging", sources)[0].reasons.find((reason) => reason.signal === "error-paths").count);
+  assert.equal(new Set(repeated).size, 1, `counts drifted across calls: ${repeated.join(",")}`);
+
+  // Density, not length: padding a file with filler must lower its score, so a
+  // long file cannot win a goal simply by being long.
+  const padded = { ...sources, "app/kernel.py": `${sources["app/kernel.py"]}${"\n# filler\n".repeat(400)}` };
+  const before = rankTargets(repository, "performance", sources).find((item) => item.path === "app/kernel.py");
+  const after = rankTargets(repository, "performance", padded).find((item) => item.path === "app/kernel.py");
+  assert.ok(after.score < before.score / 3, `${before.score} -> ${after.score}`);
+  assert.deepEqual(after.reasons.map((reason) => reason.count), before.reasons.map((reason) => reason.count), "the counted evidence is unchanged; only the density is");
+
+  // --- Legacy profile goals are aliased, not dropped -----------------------
+  assert.equal(resolveGoal("critical_path").id, "performance");
+  assert.equal(resolveGoal("contribute").id, "onboarding");
+  assert.equal(resolveGoal("review").id, "security");
+  assert.equal(resolveGoal("architecture").id, "architecture");
+  assert.equal(resolveGoal("nonsense"), null);
+  assert.equal(goalKeywords("nonsense").test("anything at all"), false);
+  assert.equal(goalKeywords("critical_path").source, goalKeywords("performance").source);
+
+  // --- Lessons are reordered, never dropped --------------------------------
+  const allLessons = course.modules.flatMap((module) => module.lessons.map((lesson) => lesson.id));
+  const ordered = orderLessonsForGoal(course, "debugging");
+  assert.equal(ordered.length, allLessons.length, "a goal reorders the course, it does not shorten it");
+  assert.deepEqual([...ordered.map((entry) => entry.lessonId)].sort(), [...allLessons].sort());
+  assert.ok(ordered.every((entry, index, list) => index === 0 || list[index - 1].relevance >= entry.relevance));
+  // An unrelated goal leaves the author's order untouched.
+  const untouched = orderLessonsForGoal(course, "nonsense");
+  assert.deepEqual(untouched.map((entry) => entry.lessonId), allLessons);
+
+  // --- The plan ------------------------------------------------------------
+  const plan = goalPlan(repository, "security", { sources, course });
+  assert.equal(plan.available, true);
+  assert.equal(plan.goal.id, "security");
+  assert.equal(plan.aliased, false);
+  assert.deepEqual(plan.recommendedActivities, resolveGoal("security").activities);
+  assert.equal(plan.coverage.filesScanned, Object.keys(sources).length);
+  assert.equal(plan.coverage.filesMatched, plan.targets.length);
+  assert.equal(plan.goals.length, GOALS.length);
+  // The goal menu never ships the detector patterns.
+  assert.ok(plan.goals.every((entry) => !("signals" in entry) && !("lessonKeywords" in entry)));
+  // A legacy id produces the aliased plan and says so.
+  const legacy = goalPlan(repository, "review", { sources, course });
+  assert.equal(legacy.goal.id, "security");
+  assert.equal(legacy.aliased, true);
+  assert.equal(legacy.requested, "review");
+  // An unknown goal degrades with the menu attached rather than throwing.
+  const unknown = goalPlan(repository, "teleportation", { sources, course });
+  assert.equal(unknown.available, false);
+  assert.match(unknown.reason, /not a known learning goal/);
+  assert.equal(unknown.goals.length, GOALS.length);
+  // A goal a repository has nothing for says so instead of inventing a top eight.
+  const barren = goalPlan(repository, "security", { sources: { "app/plain.py": "x = 1\n" }, course });
+  assert.equal(barren.targets.length, 0);
+  assert.match(barren.coverage.note, /Nothing in the scanned files/);
+
+  // --- The curriculum and the goal planner agree ---------------------------
+  // `buildSkillGraph` boosts the same lessons the planner calls relevant.
+  const securityGraph = buildSkillGraph(repository, { ...course, profile: { goal: "security", level: "adaptive" } });
+  const plainGraph = buildSkillGraph(repository, { ...course, profile: undefined });
+  const relevantLessonIds = new Set(orderLessonsForGoal(course, "security").filter((entry) => entry.relevance > 0).map((entry) => entry.lessonId));
+  for (const node of securityGraph.nodes) {
+    const plain = plainGraph.nodes.find((candidate) => candidate.id === node.id);
+    const boosted = node.importance > plain.importance;
+    assert.equal(boosted, relevantLessonIds.has(node.lessonId), `${node.lessonId}: curriculum and goal planner disagree`);
+  }
 });

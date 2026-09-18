@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Icon, bridge, readableError, repositoryRef } from "./shell";
-import type { ContrastGrade, Course, LearnerState, Lesson, PredictionExercise, PredictionOutcome, Repository, ReviewGradeId, SkillGraph, TeachBackGrade } from "./types";
-import type { ActivityState, AnalyticsState, ArchitectureState, ExperimentState, ChainState, DiagnosisState, EvaluationState, EvidenceState, ExecutableQuizState, ExplanationState, HistoryState, LocalizationState, ReviewState, ScheduleState, TraceState } from "./exercise-state";
+import type { ContrastGrade, Course, LearnerGoal, LearnerState, Lesson, PredictionExercise, PredictionOutcome, Repository, ReviewGradeId, SkillGraph, TeachBackGrade } from "./types";
+import type { ActivityState, AnalyticsState, ArchitectureState, ExperimentState, GoalState, ChainState, DiagnosisState, EvaluationState, EvidenceState, ExecutableQuizState, ExplanationState, HistoryState, LocalizationState, ReviewState, ScheduleState, TraceState } from "./exercise-state";
 
 /**
  * Exercise, visualization, quality, and diagnosis panels (items 26-36).
@@ -665,6 +665,67 @@ export function SchedulePanel({ repository, skillGraph, learnerState, state, onS
         </svg>
         <small>Recall falls to {Math.round(plan.parameters.targetRetention * 100)}% after {curve.dueDay} day{curve.dueDay === 1 ? "" : "s"}.</small>
       </div>}
+    </>}
+  </section>;
+}
+
+/**
+ * Learner goals (item 43). The same repository, ranked five different ways, with
+ * the counted signals that produced each ranking shown next to it.
+ */
+export function GoalPanel({ repository, course, state, onState, onAnchor, onLesson }: {
+  repository: Repository;
+  course: Course | null;
+  state: GoalState;
+  onState: (update: Partial<GoalState>) => void;
+  onAnchor: (path: string, line: number) => void;
+  onLesson: (lessonId: string) => void;
+}) {
+  const { goal, plan, status } = state;
+  const load = async (next: LearnerGoal) => {
+    onState({ goal: next, status: "loading" });
+    try {
+      onState({ plan: await bridge.goalPlan({ repository: repositoryRef(repository), goal: next, course: course ?? undefined }), status: "ready" });
+    } catch {
+      onState({ status: "error" });
+    }
+  };
+  useEffect(() => {
+    if (status === "idle") void load(goal);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status]);
+
+  const menu = plan?.goals ?? [];
+  return <section className="goal-panel" data-status={status} data-goal={plan?.goal?.id ?? goal}>
+    <div className="goal-head">
+      <span>WHAT ARE YOU HERE FOR</span>
+    </div>
+    <div className="goal-menu">
+      {menu.map((entry) => <button
+        key={entry.id}
+        data-goal-option={entry.id}
+        className={(plan?.goal?.id ?? goal) === entry.id ? "active" : ""}
+        onClick={() => void load(entry.id as LearnerGoal)}
+      >{entry.title}</button>)}
+    </div>
+    {status === "error" && <p className="goal-note">Goal planning is unavailable for this repository.</p>}
+    {plan?.available && <>
+      <p className="goal-summary">{plan.goal!.summary}</p>
+      {plan.coverage?.note && <p className="goal-note" data-note="coverage">{plan.coverage.note}</p>}
+      <div className="goal-targets" data-count={plan.targets?.length ?? 0}>
+        {(plan.targets ?? []).slice(0, 6).map((target) => <div className="goal-target" key={target.path} data-path={target.path} data-score={target.score}>
+          <button onClick={() => onAnchor(target.anchor.path, target.anchor.line)}>{target.path}</button>
+          <div className="goal-reasons">
+            {target.reasons.slice(0, 3).map((reason) => <span key={reason.signal} data-signal={reason.signal}>{reason.detail}</span>)}
+          </div>
+        </div>)}
+      </div>
+      <div className="goal-activities" data-activities={(plan.recommendedActivities ?? []).join(",")}>
+        {(plan.recommendedActivities ?? []).map((activity) => <span key={activity}>{activity.replace(/-/g, " ")}</span>)}
+      </div>
+      <div className="goal-lessons">
+        {(plan.lessonOrder ?? []).slice(0, 4).map((entry) => <button key={entry.lessonId} data-lesson={entry.lessonId} data-relevant={String(entry.relevance > 0)} onClick={() => onLesson(entry.lessonId)}>{entry.title}</button>)}
+      </div>
     </>}
   </section>;
 }

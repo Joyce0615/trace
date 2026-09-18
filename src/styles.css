@@ -919,3 +919,22 @@ button { color: inherit; }
 .experiment-actions { display: flex; align-items: center; gap: 9px; }
 .experiment-actions .danger { padding: 5px 12px; border: 1px solid #4a2f2f; border-radius: 8px; background: none; color: #dfa2a2; font-size: calc(10px + var(--font-boost)); cursor: pointer; }
 .experiment-actions small { color: #6d7787; font-size: calc(9px + var(--font-boost)); }
+
+/* Item 43: learner goals ranked from real source signals. */
+.goal-panel { padding: 18px 26px 22px; display: flex; flex-direction: column; gap: 9px; }
+.goal-head span { color: #9ee66f; font-size: calc(9px + var(--font-boost)); letter-spacing: .14em; }
+.goal-menu { display: flex; flex-wrap: wrap; gap: 5px; }
+.goal-menu button { padding: 4px 11px; border: 1px solid #262d3d; border-radius: 7px; background: none; color: #93a0b1; font-size: calc(10px + var(--font-boost)); cursor: pointer; }
+.goal-menu button.active { border-color: #4f46e5; color: #c8b6ff; background: #141426; }
+.goal-summary { color: #9aa5b5; font-size: calc(10px + var(--font-boost)); }
+.goal-note { color: #616b7c; font-size: calc(9px + var(--font-boost)); }
+.goal-targets { display: flex; flex-direction: column; gap: 5px; }
+.goal-target { display: flex; flex-direction: column; gap: 3px; padding: 6px 9px; border: 1px solid #1e2532; border-radius: 8px; background: #0e121a; }
+.goal-target > button { align-self: flex-start; padding: 0; border: none; background: none; color: #8fd8ff; font-size: calc(10px + var(--font-boost)); font-family: "SFMono-Regular", Menlo, monospace; cursor: pointer; }
+.goal-reasons { display: flex; flex-wrap: wrap; gap: 4px; }
+.goal-reasons span { padding: 1px 7px; border: 1px solid #232a38; border-radius: 5px; color: #7d8798; font-size: calc(8px + var(--font-boost)); }
+.goal-activities { display: flex; flex-wrap: wrap; gap: 4px; }
+.goal-activities span { padding: 2px 8px; border: 1px dashed #2f3a63; border-radius: 6px; color: #a79ee0; font-size: calc(8px + var(--font-boost)); }
+.goal-lessons { display: flex; flex-wrap: wrap; gap: 4px; }
+.goal-lessons button { padding: 3px 9px; border: 1px solid #232a38; border-radius: 6px; background: none; color: #7f8b9c; font-size: calc(9px + var(--font-boost)); cursor: pointer; }
+.goal-lessons button[data-relevant="true"] { border-color: #2f4a34; color: #9ee66f; }

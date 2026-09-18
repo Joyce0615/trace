@@ -3,8 +3,10 @@ export type LessonKind = "lesson" | "quiz" | "practice" | "project";
 export type ContextMode = "lean" | "balanced" | "deep";
 export type SkillStatus = "locked" | "available" | "recommended" | "active" | "mastered" | "stale";
 
+export type LearnerGoal = "debugging" | "onboarding" | "architecture" | "security" | "performance" | "critical_path" | "contribute" | "review";
+
 export interface LearnerProfile {
-  goal: "architecture" | "critical_path" | "contribute" | "review";
+  goal: LearnerGoal;
   level: "foundation" | "adaptive" | "advanced";
 }
 
@@ -833,6 +835,29 @@ export interface ProbeGrade {
   anchor: CodeAnchor | null;
 }
 
+export interface GoalTarget {
+  path: string;
+  anchor: CodeAnchor;
+  score: number;
+  fanIn: number;
+  lines: number;
+  reasons: Array<{ signal: string; count: number; detail: string; weight: number }>;
+}
+
+export interface GoalPlan {
+  available: boolean;
+  version: number;
+  reason?: string;
+  goal?: { id: string; title: string; summary: string; activities: string[] };
+  requested?: string;
+  aliased?: boolean;
+  targets?: GoalTarget[];
+  lessonOrder?: Array<{ lessonId: string; title: string; module: string; relevance: number; originalIndex: number; anchors: CodeAnchor[] }>;
+  recommendedActivities?: string[];
+  coverage?: { filesScanned: number; filesMatched: number; lessons: number; relevantLessons: number; note: string | null };
+  goals: Array<{ id: string; title: string; summary: string; activities: string[] }>;
+}
+
 export interface ExperimentAssignment {
   experimentId: string;
   question: string;
@@ -1272,6 +1297,7 @@ export interface TraceBridge {
   evaluate(request: { repository: RepositoryRef; course?: Course; skillGraph?: SkillGraph; answers?: unknown[]; sampleSize?: number }): Promise<EvaluationReport>;
   diagnose(request: { repository: RepositoryRef; skillGraph: SkillGraph; learnerState: LearnerState; text?: string }): Promise<DiagnosisReport>;
   answerProbe(request: { repository: RepositoryRef; probeId: string; choiceId: string }): Promise<ProbeGrade>;
+  goalPlan(request: { repository: RepositoryRef; goal: LearnerGoal; course?: Course; limit?: number }): Promise<GoalPlan>;
   experiments(request: { repository: RepositoryRef }): Promise<ExperimentReport>;
   setExperimentConsent(request: { repository: RepositoryRef; granted: boolean }): Promise<ExperimentReport>;
   forgetExperiments(request: { repository: RepositoryRef }): Promise<{ deletedObservations: number; hadConsent: boolean; state: ExperimentReport }>;

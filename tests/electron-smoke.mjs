@@ -857,6 +857,62 @@ try {
   assert.match(quizAudit.network.cases[0].error, /not allowed inside the quiz sandbox/);
   assert.match(quizAudit.stale ?? "", /not active for this repository/);
 
+  // Item 43: five goals over the same real repository, each ranked from counted
+  // source signals rather than from a label.
+  const goalAudit = await page.evaluate(async () => {
+    const workspace = window.traceWorkspace;
+    const repository = { id: workspace.repository.id, rootPath: workspace.repository.rootPath };
+    const plans = {};
+    for (const goal of ["debugging", "onboarding", "architecture", "security", "performance"]) {
+      plans[goal] = await window.trace.goalPlan({ repository, goal, course: workspace.course, limit: 6 });
+    }
+    const legacy = await window.trace.goalPlan({ repository, goal: "review", course: workspace.course });
+    let rejected = null;
+    try {
+      await window.trace.goalPlan({ repository, goal: "teleportation", course: workspace.course });
+    } catch (error) {
+      rejected = error.message;
+    }
+    return { plans, legacy, rejected };
+  });
+  const goalIds = Object.keys(goalAudit.plans);
+  assert.equal(goalIds.length, 5);
+  const indexedFilePaths = new Set(await page.evaluate(() => window.traceWorkspace.repository.files.map((file) => file.path)));
+  const rankings = {};
+  for (const goal of goalIds) {
+    const plan = goalAudit.plans[goal];
+    assert.equal(plan.available, true, `${goal}: ${plan.reason}`);
+    assert.equal(plan.goal.id, goal);
+    assert.ok(plan.targets.length >= 3, `${goal} ranked only ${plan.targets.length} files`);
+    assert.ok(plan.recommendedActivities.length >= 2, goal);
+    // Every target is a real indexed file backed by counted evidence.
+    for (const target of plan.targets) {
+      assert.ok(indexedFilePaths.has(target.path), `${goal} ranked a file outside the index: ${target.path}`);
+      assert.ok(target.reasons.length >= 1 && target.reasons.every((reason) => reason.count > 0), `${goal}: ${JSON.stringify(target.reasons)}`);
+      assert.ok(target.score > 0 && target.anchor.line >= 1);
+    }
+    // The goal menu never carries the detector patterns.
+    assert.ok(plan.goals.every((entry) => !("signals" in entry) && !("lessonKeywords" in entry)));
+    // The course is reordered, not shortened.
+    assert.equal(plan.lessonOrder.length, await page.evaluate(() => window.traceWorkspace.course.modules.flatMap((module) => module.lessons).length));
+    rankings[goal] = plan.targets.map((target) => target.path);
+  }
+  // The five goals genuinely disagree about where to start.
+  const heads = new Set(goalIds.map((goal) => rankings[goal][0]));
+  assert.ok(heads.size >= 3, `goals produced only ${heads.size} distinct starting points: ${JSON.stringify(rankings)}`);
+  assert.notDeepEqual(rankings.security, rankings.performance);
+  assert.notDeepEqual(rankings.onboarding, rankings.debugging);
+  // Signals are goal-specific, not a shared score wearing different labels.
+  const securitySignals = new Set(goalAudit.plans.security.targets.flatMap((target) => target.reasons.map((reason) => reason.signal)));
+  const performanceSignals = new Set(goalAudit.plans.performance.targets.flatMap((target) => target.reasons.map((reason) => reason.signal)));
+  assert.equal([...securitySignals].some((signal) => performanceSignals.has(signal)), false, `${[...securitySignals]} vs ${[...performanceSignals]}`);
+  // A pre-item-43 profile goal is aliased rather than dropped.
+  assert.equal(goalAudit.legacy.goal.id, "security");
+  assert.equal(goalAudit.legacy.aliased, true);
+  assert.equal(goalAudit.legacy.requested, "review");
+  // An unknown goal is rejected by the schema before a handler sees it.
+  assert.match(goalAudit.rejected ?? "", /must be one of debugging, onboarding, architecture/);
+
   // Item 42: consent gates every experiment, the assigned arm really changes
   // behaviour, and withdrawing deletes what was collected.
   const experimentAudit = await page.evaluate(async () => {
@@ -1220,6 +1276,7 @@ try {
       lessons: { score: evaluationAudit.lessons.score, verdict: evaluationAudit.lessons.verdict },
     },
     diagnosis: { skills: diagnosis.skills.length, assessed: diagnosis.summary.assessed, meanConfidence: diagnosis.summary.meanConfidence, brier: diagnosis.summary.meanBrier, overconfident: diagnosis.summary.overconfidentSkills, misconceptions: diagnosis.summary.misconceptionCounts },
+    goals: Object.fromEntries(goalIds.map((goal) => [goal, { top: rankings[goal][0], targets: rankings[goal].length, topReasons: goalAudit.plans[goal].targets[0].reasons.map((reason) => reason.detail) }])),
     experiments: { arms: experimentAudit.armsSeen.map(([arm, observed]) => `${arm}:declared=${observed.declared},applied=${observed.applied},queued=${observed.queued}`), unconsentedLimit: experimentAudit.controlPlan.parameters.dailyLimit, assignedArm: experimentAudit.consented.assignments.map((item) => `${item.experimentId}=${item.arm}`), assignedLimit, explicitLimit: experimentAudit.explicitPlan.parameters.dailyLimit, observations: experimentAudit.afterObservation.observations, verdict: limitResult.verdict, afterWithdrawal: experimentAudit.afterWithdrawalPlan.parameters.dailyLimit, deleted: experimentAudit.forgotten.deletedObservations },
     analytics: { events: analytics.events, kinds: analytics.timeOnTask.byKind.map((entry) => `${entry.kind}:${entry.events}`), sessions: analytics.timeOnTask.sessions, near: analytics.transfer.near, far: analytics.transfer.far, hintsRevealed: analytics.hints.hintsRevealed, penaltyCarried: analytics.hints.penaltyCarried, retentionVerdict: analytics.retention.modelVerdict, warnings: analytics.warnings.map((warning) => warning.measure) },
     answerGuard: { rungsServed: servedRungs.length, rungIds: servedRungs.map((item) => item.id), finalPenalty: servedRungs.at(-1).penalty, revealedAnswer: revealedNumber, dataChannelsOk: guardAudit.readOk && guardAudit.searchOk },

@@ -689,6 +689,15 @@ export const browserBridge: TraceBridge = {
     if (!probe) throw new Error("That probe is not active for this repository.");
     return model.gradeProbe(probe, request.choiceId);
   },
+  async goalPlan(request) {
+    // The demo ranks with the same signal detectors as the desktop app.
+    const goals = await import("../electron/goals.mjs");
+    return goals.goalPlan(nanoRepository, request.goal, {
+      sources: nanoSourceByPath,
+      course: request.course ?? nanoCourse,
+      limit: request.limit,
+    });
+  },
   async experiments() {
     // The demo runs the same consent gate and analysis; nothing is collected
     // until consent is granted here either.

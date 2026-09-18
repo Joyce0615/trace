@@ -431,6 +431,40 @@ try {
   await page.getByText("nanovllm/engine/scheduler.py", { exact: false }).first().waitFor();
   await page.locator(".explorer-search input").fill("");
 
+  // Item 43: the same repository ranked differently for different goals.
+  await page.locator(".content-tabs").getByRole("button", { name: "Diagram" }).click();
+  const goals = page.locator(".goal-panel");
+  await goals.waitFor();
+  await goals.locator(".goal-target").first().waitFor();
+  assert.equal(await goals.locator("[data-goal-option]").count(), 5, "five named goals");
+  const rankingFor = async (goalId) => {
+    await goals.locator(`[data-goal-option="${goalId}"]`).click();
+    await page.locator(`.goal-panel[data-goal="${goalId}"]`).waitFor();
+    await goals.locator(".goal-target").first().waitFor();
+    return goals.locator(".goal-target").evaluateAll((items) => items.map((item) => item.getAttribute("data-path")));
+  };
+  const performanceRanking = await rankingFor("performance");
+  const securityRanking = await rankingFor("security");
+  const onboardingRanking = await rankingFor("onboarding");
+  assert.ok(performanceRanking.length >= 2, JSON.stringify(performanceRanking));
+  // Genuinely different orderings, not a relabelled list.
+  assert.notDeepEqual(performanceRanking, securityRanking, JSON.stringify({ performanceRanking, securityRanking }));
+  assert.notDeepEqual(onboardingRanking, performanceRanking);
+  // Every ranking explains itself with counted evidence.
+  const reasons = await goals.locator(".goal-target").first().locator(".goal-reasons span").allInnerTexts();
+  assert.ok(reasons.length >= 1, JSON.stringify(reasons));
+  assert.ok(reasons.every((reason) => /\d/.test(reason)), JSON.stringify(reasons));
+  // The goal recommends the activities that suit it, and the reordered lessons
+  // put the relevant ones first.
+  assert.ok((await goals.locator(".goal-activities span").count()) >= 2);
+  const relevance = await goals.locator(".goal-lessons button").evaluateAll((items) => items.map((item) => item.getAttribute("data-relevant")));
+  assert.ok(relevance.length >= 1, JSON.stringify(relevance));
+  // A target opens the real file.
+  await goals.locator(".goal-target > button").first().click();
+  await page.locator(".monaco-editor").waitFor({ timeout: 20_000 });
+  await page.locator(".content-tabs").getByRole("button", { name: "Diagram" }).click();
+  await page.screenshot({ path: path.join(artifactDirectory, "goals.png") });
+
   // Item 34: three quality scorecards, never averaged into one number.
   await page.locator(".content-tabs").getByRole("button", { name: "Diagram" }).click();
   const evaluation = page.locator(".evaluation-panel");

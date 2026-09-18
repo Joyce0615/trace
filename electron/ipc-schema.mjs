@@ -169,8 +169,12 @@ const repositoryReference = s.object({
   rootPath: s.string({ maxLength: 4_096 }),
 });
 
+const GOAL_IDS = ["debugging", "onboarding", "architecture", "security", "performance", "critical_path", "contribute", "review"];
+
 const learnerProfile = s.object({
-  goal: s.literal(["architecture", "critical_path", "contribute", "review"]),
+  // The five named goals of item 43 plus the three pre-item-43 profile values,
+  // which are aliased rather than dropped so a saved profile keeps working.
+  goal: s.literal(GOAL_IDS),
   level: s.literal(["foundation", "adaptive", "advanced"]),
 }, { optional: true });
 
@@ -315,6 +319,12 @@ export const IPC_SCHEMAS = {
     repository: repositoryReference,
     taskId: s.string({ maxLength: 400 }),
     explanation: s.string({ maxLength: 8_000 }),
+  }),
+  "goals:plan": s.object({
+    repository: repositoryReference,
+    goal: s.literal(GOAL_IDS),
+    course: s.opaque({ optional: true }),
+    limit: s.number({ integer: true, min: 1, max: 20, optional: true }),
   }),
   "experiment:state": s.object({ repository: repositoryReference }),
   "experiment:consent": s.object({ repository: repositoryReference, granted: s.boolean() }),
