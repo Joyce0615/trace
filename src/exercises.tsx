@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Icon, bridge, readableError, repositoryRef } from "./shell";
 import type { ContrastGrade, Course, LearnerGoal, LearnerState, Lesson, PredictionExercise, PredictionOutcome, Repository, ReviewGradeId, SkillGraph, TeachBackGrade } from "./types";
-import type { ActivityState, AnalyticsState, ArchitectureState, ExperimentState, GoalState, ChainState, DiagnosisState, EvaluationState, EvidenceState, ExecutableQuizState, ExplanationState, HistoryState, LocalizationState, ReviewState, ScheduleState, TraceState } from "./exercise-state";
+import type { ActivityState, AnalyticsState, ArchitectureState, ExperimentState, GoalState, SharingState, ChainState, DiagnosisState, EvaluationState, EvidenceState, ExecutableQuizState, ExplanationState, HistoryState, LocalizationState, ReviewState, ScheduleState, TraceState } from "./exercise-state";
 
 /**
  * Exercise, visualization, quality, and diagnosis panels (items 26-36).
@@ -664,6 +664,68 @@ export function SchedulePanel({ repository, skillGraph, learnerState, state, onS
           <polyline points={curve.points.map((point) => `${(point.day / curve.horizonDays) * 100},${32 - point.retention * 30}`).join(" ")} />
         </svg>
         <small>Recall falls to {Math.round(plan.parameters.targetRetention * 100)}% after {curve.dueDay} day{curve.dueDay === 1 ? "" : "s"}.</small>
+      </div>}
+    </>}
+  </section>;
+}
+
+/**
+ * Course packages with provenance (item 44) and their signature (item 45).
+ *
+ * The panel shows what a package would carry before it is created, because
+ * "share this course" quietly means "share where it came from, and possibly
+ * some of the source", and that should be visible rather than discovered.
+ */
+export function SharingPanel({ repository, course, skillGraph, state, onState }: {
+  repository: Repository;
+  course: Course | null;
+  skillGraph: SkillGraph | null;
+  state: SharingState;
+  onState: (update: Partial<SharingState>) => void;
+}) {
+  const { packaged, result, embedSource, status } = state;
+  const build = async () => {
+    if (!course) return;
+    onState({ status: "packaging" });
+    try {
+      onState({ packaged: await bridge.packageCourse({ repository: repositoryRef(repository), course, skillGraph: skillGraph ?? undefined, embedSource }), status: "ready", result: null });
+    } catch {
+      onState({ status: "error" });
+    }
+  };
+  const reimport = async () => {
+    if (!packaged) return;
+    onState({ result: await bridge.importCourse({ repository: repositoryRef(repository), package: packaged }) });
+  };
+
+  return <section className="sharing-panel" data-status={status} data-verdict={result?.verification.verdict ?? ""}>
+    <div className="sharing-head">
+      <span>SHARE THIS COURSE</span>
+      <button className="ghost" disabled={status === "packaging" || !course} onClick={() => void build()}>{status === "packaging" ? "Packaging…" : packaged ? "Repackage" : "Build a package"}</button>
+    </div>
+    <label className="sharing-toggle"><input type="checkbox" checked={embedSource} onChange={(event) => onState({ embedSource: event.target.checked })} />Include source excerpts</label>
+    {status === "error" && <p className="sharing-note">Packaging is unavailable for this repository.</p>}
+    {packaged && <>
+      <div className="sharing-provenance" data-anchors={packaged.integrity.anchorCount} data-license={packaged.license.id} data-embeds={String(packaged.license.embedsSource)}>
+        <div><em>{packaged.provenance.repositoryName ?? packaged.provenance.repositoryId}</em><small>repository</small></div>
+        <div><em>{(packaged.provenance.commit ?? "").slice(0, 8) || "—"}</em><small>commit</small></div>
+        <div><em>{packaged.integrity.anchorCount}</em><small>verified anchors</small></div>
+        <div><em>{packaged.license.id}</em><small>license</small></div>
+      </div>
+      <p className="sharing-note" data-policy={packaged.license.policy}>
+        {packaged.license.embedsSource
+          ? `Source excerpts from ${packaged.integrity.excerptCount} file(s) are included under ${packaged.license.id}.`
+          : packaged.license.policy === "source-withheld-unrecognized-license"
+            ? `Source excerpts were withheld: this repository's license (${packaged.license.id}) is not one Trace recognises as permissive.`
+            : "Anchors only — no source is redistributed."}
+      </p>
+      {packaged.signature && <p className="sharing-signature" data-key={packaged.signature.keyId}>Signed {packaged.signature.algorithm} · key {packaged.signature.keyId.slice(0, 12)}…</p>}
+      <button className="ghost" onClick={() => void reimport()}>Verify against this repository</button>
+      {result && <div className="sharing-result" data-verdict={result.verification.verdict} data-imported={String(result.imported)}>
+        <strong>{result.verification.verdict}</strong>
+        <small>{result.verification.anchors?.usable ?? 0}/{result.verification.anchors?.total ?? 0} anchors usable{result.repointed ? ` · ${result.repointed} re-pointed` : ""}{result.dropped ? ` · ${result.dropped} dropped` : ""}</small>
+        {result.verification.signature && <em data-trust={result.verification.signature.trust}>signature {result.verification.signature.trust}</em>}
+        {result.verification.problems.map((problem) => <i key={problem}>{problem}</i>)}
       </div>}
     </>}
   </section>;

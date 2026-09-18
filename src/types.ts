@@ -835,6 +835,82 @@ export interface ProbeGrade {
   anchor: CodeAnchor | null;
 }
 
+export interface CoursePackage {
+  format: string;
+  version: number;
+  packagedAt: string;
+  provenance: {
+    repositoryId: string | null;
+    repositoryName: string | null;
+    remote: string | null;
+    branch: string | null;
+    commit: string | null;
+    sourceVersion: string | null;
+    indexer: string | null;
+    fileCount: number;
+    generatedBy: string;
+    packagedBy: string;
+  };
+  license: { id: string; file: string | null; permissive: boolean; detected: boolean; policy: string; embedsSource: boolean };
+  content: { course: Course; skillGraph: SkillGraph | null };
+  integrity: {
+    anchors: Array<{ lessonId: string; path: string; line: number; symbol: string | null; blobId: string | null; indexed: boolean }>;
+    anchorCount: number;
+    lessonCount: number;
+    excerpts: Record<string, string>;
+    excerptCount: number;
+  };
+  signature: CourseSignature | null;
+}
+
+export interface PackageVerification {
+  valid: boolean;
+  verdict: "exact" | "compatible" | "drifted" | "foreign" | "empty" | "unreadable";
+  reason?: string | null;
+  sameRepository?: boolean;
+  sameCommit?: boolean;
+  sameVersion?: boolean;
+  packagedFrom?: CoursePackage["provenance"] | null;
+  license?: CoursePackage["license"] | null;
+  anchors: {
+    total: number;
+    counts: Record<string, number>;
+    results: Array<{ lessonId: string; path: string; line: number; symbol: string | null; blobId: string | null; status: string; currentLine: number | null }>;
+    usable: number;
+    usableRatio: number;
+  } | null;
+  problems: string[];
+  signature?: SignatureVerification | null;
+}
+
+export interface CourseImportResult {
+  imported: boolean;
+  verification: PackageVerification;
+  course: Course | null;
+  skillGraph: SkillGraph | null;
+  reason?: string;
+  repointed?: number;
+  dropped?: number;
+  licenseNotice?: string;
+}
+
+export interface CourseSignature {
+  algorithm: string;
+  keyId: string;
+  signature: string;
+  signedAt: string;
+  digest: string;
+  subject: string;
+}
+
+export interface SignatureVerification {
+  verified: boolean;
+  reason: string | null;
+  trust: "trusted" | "untrusted" | "unsigned" | "invalid";
+  keyId: string | null;
+  subject?: string | null;
+}
+
 export interface GoalTarget {
   path: string;
   anchor: CodeAnchor;
@@ -1297,6 +1373,8 @@ export interface TraceBridge {
   evaluate(request: { repository: RepositoryRef; course?: Course; skillGraph?: SkillGraph; answers?: unknown[]; sampleSize?: number }): Promise<EvaluationReport>;
   diagnose(request: { repository: RepositoryRef; skillGraph: SkillGraph; learnerState: LearnerState; text?: string }): Promise<DiagnosisReport>;
   answerProbe(request: { repository: RepositoryRef; probeId: string; choiceId: string }): Promise<ProbeGrade>;
+  packageCourse(request: { repository: RepositoryRef; course: Course; skillGraph?: SkillGraph; embedSource?: boolean }): Promise<CoursePackage>;
+  importCourse(request: { repository: RepositoryRef; package: CoursePackage; force?: boolean }): Promise<CourseImportResult>;
   goalPlan(request: { repository: RepositoryRef; goal: LearnerGoal; course?: Course; limit?: number }): Promise<GoalPlan>;
   experiments(request: { repository: RepositoryRef }): Promise<ExperimentReport>;
   setExperimentConsent(request: { repository: RepositoryRef; granted: boolean }): Promise<ExperimentReport>;

@@ -938,3 +938,24 @@ button { color: inherit; }
 .goal-lessons { display: flex; flex-wrap: wrap; gap: 4px; }
 .goal-lessons button { padding: 3px 9px; border: 1px solid #232a38; border-radius: 6px; background: none; color: #7f8b9c; font-size: calc(9px + var(--font-boost)); cursor: pointer; }
 .goal-lessons button[data-relevant="true"] { border-color: #2f4a34; color: #9ee66f; }
+
+/* Items 44-45: shareable course packages, provenance, and signatures. */
+.sharing-panel { padding: 18px 26px 34px; display: flex; flex-direction: column; gap: 9px; border-top: 1px solid #1a2130; }
+.sharing-head { display: flex; align-items: center; gap: 10px; }
+.sharing-head span { color: #8fd8ff; font-size: calc(9px + var(--font-boost)); letter-spacing: .14em; }
+.sharing-head .ghost, .sharing-panel > .ghost { padding: 5px 12px; border: 1px solid #262d3d; border-radius: 8px; background: none; color: #93a0b1; font-size: calc(10px + var(--font-boost)); cursor: pointer; }
+.sharing-head .ghost { margin-left: auto; }
+.sharing-panel > .ghost { align-self: flex-start; }
+.sharing-toggle { display: flex; align-items: center; gap: 6px; color: #7d8798; font-size: calc(9px + var(--font-boost)); }
+.sharing-note { color: #7d8798; font-size: calc(9px + var(--font-boost)); }
+.sharing-signature { color: #9ee66f; font-size: calc(9px + var(--font-boost)); }
+.sharing-provenance { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
+.sharing-provenance div { padding: 6px 4px; border: 1px solid #1c2230; border-radius: 7px; background: #0c1017; text-align: center; }
+.sharing-provenance em { display: block; font-style: normal; font-size: calc(11px + var(--font-boost)); color: #cfd6e2; overflow: hidden; text-overflow: ellipsis; }
+.sharing-provenance small { color: #5b6474; font-size: calc(8px + var(--font-boost)); }
+.sharing-result { display: flex; flex-direction: column; gap: 3px; padding: 7px 9px; border: 1px solid #1e2532; border-radius: 8px; background: #0e121a; }
+.sharing-result strong { color: #dbe1ea; font-size: calc(11px + var(--font-boost)); }
+.sharing-result small { color: #7d8798; font-size: calc(9px + var(--font-boost)); }
+.sharing-result em { color: #9ee66f; font-style: normal; font-size: calc(9px + var(--font-boost)); }
+.sharing-result em[data-trust="untrusted"], .sharing-result em[data-trust="invalid"] { color: #dfa2a2; }
+.sharing-result i { color: #6d7787; font-style: normal; font-size: calc(8px + var(--font-boost)); }

@@ -857,6 +857,62 @@ try {
   assert.match(quizAudit.network.cases[0].error, /not allowed inside the quiz sandbox/);
   assert.match(quizAudit.stale ?? "", /not active for this repository/);
 
+  // Item 44: a shareable package of the real FlashInfer course, with provenance
+  // and a license policy that is enforced rather than advertised.
+  const indexedFilePathsForPackage = new Set(await page.evaluate(() => window.traceWorkspace.repository.files.map((file) => file.path)));
+  const packageAudit = await page.evaluate(async () => {
+    const workspace = window.traceWorkspace;
+    const repository = { id: workspace.repository.id, rootPath: workspace.repository.rootPath };
+    const anchorsOnly = await window.trace.packageCourse({ repository, course: workspace.course, skillGraph: workspace.skillGraph });
+    const requested = await window.trace.packageCourse({ repository, course: workspace.course, skillGraph: workspace.skillGraph, embedSource: true });
+    const roundTrip = await window.trace.importCourse({ repository, package: anchorsOnly });
+    // A package whose anchors point somewhere else must not import here.
+    const foreign = await window.trace.importCourse({
+      repository,
+      package: {
+        ...anchorsOnly,
+        provenance: { ...anchorsOnly.provenance, repositoryId: "some-other-repository" },
+        integrity: { ...anchorsOnly.integrity, anchors: anchorsOnly.integrity.anchors.map((anchor) => ({ ...anchor, path: `elsewhere/${anchor.path}` })) },
+      },
+    });
+    const unreadable = await window.trace.importCourse({ repository, package: { format: "not-a-trace-package" } });
+    return { anchorsOnly, requested, roundTrip, foreign, unreadable, serialized: JSON.stringify(anchorsOnly) };
+  });
+  const coursePackage = packageAudit.anchorsOnly;
+  assert.equal(coursePackage.format, "trace-course-v1");
+  // Provenance is real: the repository, its commit, and its index version.
+  const identity = await page.evaluate(() => ({ id: window.traceWorkspace.repository.id, head: window.traceWorkspace.repository.head, versionId: window.traceWorkspace.repository.versionId }));
+  assert.equal(coursePackage.provenance.repositoryId, identity.id);
+  assert.equal(coursePackage.provenance.commit, identity.head);
+  assert.equal(coursePackage.provenance.sourceVersion, identity.versionId);
+  assert.ok(coursePackage.integrity.anchorCount >= 4, String(coursePackage.integrity.anchorCount));
+  // Every anchored file is one the index really has, with a real blob id.
+  assert.ok(coursePackage.integrity.anchors.every((anchor) => indexedFilePathsForPackage.has(anchor.path)), "an anchor left the index");
+  assert.ok(coursePackage.integrity.anchors.every((anchor) => typeof anchor.blobId === "string" && anchor.blobId.length >= 7), JSON.stringify(coursePackage.integrity.anchors[0]));
+  // FlashInfer is Apache-2.0, which is permissive, so asking for excerpts works
+  // and not asking still yields none.
+  assert.equal(coursePackage.license.id, "Apache-2.0", JSON.stringify(coursePackage.license));
+  assert.equal(coursePackage.license.permissive, true);
+  assert.equal(coursePackage.license.embedsSource, false);
+  assert.equal(coursePackage.integrity.excerptCount, 0);
+  assert.equal(packageAudit.requested.license.embedsSource, true);
+  assert.ok(packageAudit.requested.integrity.excerptCount >= 1, String(packageAudit.requested.integrity.excerptCount));
+  // No absolute home path travels in a shareable file.
+  assert.equal(/\/Users\/[A-Za-z0-9._-]+\//.test(packageAudit.serialized), false, "an absolute home path leaked into the package");
+  // A round trip into the repository it came from is exact and loses nothing.
+  assert.equal(packageAudit.roundTrip.imported, true);
+  assert.equal(packageAudit.roundTrip.verification.verdict, "exact", JSON.stringify(packageAudit.roundTrip.verification.anchors?.counts));
+  assert.equal(packageAudit.roundTrip.verification.sameRepository, true);
+  assert.equal(packageAudit.roundTrip.dropped, 0);
+  assert.equal(packageAudit.roundTrip.verification.anchors.usableRatio, 1);
+  assert.match(packageAudit.roundTrip.course.generatedBy, /^imported:/);
+  // A foreign package is refused, with the reason stated.
+  assert.equal(packageAudit.foreign.imported, false);
+  assert.equal(packageAudit.foreign.verification.verdict, "foreign");
+  assert.match(packageAudit.foreign.reason, /does not match this repository/);
+  assert.equal(packageAudit.unreadable.imported, false);
+  assert.equal(packageAudit.unreadable.verification.verdict, "unreadable");
+
   // Item 43: five goals over the same real repository, each ranked from counted
   // source signals rather than from a label.
   const goalAudit = await page.evaluate(async () => {
@@ -1276,6 +1332,7 @@ try {
       lessons: { score: evaluationAudit.lessons.score, verdict: evaluationAudit.lessons.verdict },
     },
     diagnosis: { skills: diagnosis.skills.length, assessed: diagnosis.summary.assessed, meanConfidence: diagnosis.summary.meanConfidence, brier: diagnosis.summary.meanBrier, overconfident: diagnosis.summary.overconfidentSkills, misconceptions: diagnosis.summary.misconceptionCounts },
+    coursePackage: { format: coursePackage.format, commit: (coursePackage.provenance.commit ?? "").slice(0, 8), anchors: coursePackage.integrity.anchorCount, license: coursePackage.license.id, policy: coursePackage.license.policy, embeddedFiles: packageAudit.requested.integrity.excerptCount, roundTrip: packageAudit.roundTrip.verification.verdict, foreign: packageAudit.foreign.verification.verdict },
     goals: Object.fromEntries(goalIds.map((goal) => [goal, { top: rankings[goal][0], targets: rankings[goal].length, topReasons: goalAudit.plans[goal].targets[0].reasons.map((reason) => reason.detail) }])),
     experiments: { arms: experimentAudit.armsSeen.map(([arm, observed]) => `${arm}:declared=${observed.declared},applied=${observed.applied},queued=${observed.queued}`), unconsentedLimit: experimentAudit.controlPlan.parameters.dailyLimit, assignedArm: experimentAudit.consented.assignments.map((item) => `${item.experimentId}=${item.arm}`), assignedLimit, explicitLimit: experimentAudit.explicitPlan.parameters.dailyLimit, observations: experimentAudit.afterObservation.observations, verdict: limitResult.verdict, afterWithdrawal: experimentAudit.afterWithdrawalPlan.parameters.dailyLimit, deleted: experimentAudit.forgotten.deletedObservations },
     analytics: { events: analytics.events, kinds: analytics.timeOnTask.byKind.map((entry) => `${entry.kind}:${entry.events}`), sessions: analytics.timeOnTask.sessions, near: analytics.transfer.near, far: analytics.transfer.far, hintsRevealed: analytics.hints.hintsRevealed, penaltyCarried: analytics.hints.penaltyCarried, retentionVerdict: analytics.retention.modelVerdict, warnings: analytics.warnings.map((warning) => warning.measure) },

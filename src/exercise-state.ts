@@ -1,4 +1,4 @@
-import type { ActivitySet, AnalyticsReport, Architecture, ExperimentReport, GoalPlan, LearnerGoal, ContrastGrade, DiagnosisReport, EvaluationReport, EvidenceImport, ExecutableQuiz, ExplanationGrade, ExplanationTask, HintRung, HistorySummary, PredictionOutcome, TeachBackGrade, Lesson, ProbeGrade, QuizGrade, ReviewPlan, ReviewResult, SymbolFlow, CallChain, LocalizationExercise, LocalizationHint, LocalizationScore, PredictionExercise, PredictionGrade, RaceReport, RaceTask, TraceRunResult, TraceRuntime } from "./types";
+import type { ActivitySet, AnalyticsReport, Architecture, CourseImportResult, CoursePackage, ExperimentReport, GoalPlan, LearnerGoal, ContrastGrade, DiagnosisReport, EvaluationReport, EvidenceImport, ExecutableQuiz, ExplanationGrade, ExplanationTask, HintRung, HistorySummary, PredictionOutcome, TeachBackGrade, Lesson, ProbeGrade, QuizGrade, ReviewPlan, ReviewResult, SymbolFlow, CallChain, LocalizationExercise, LocalizationHint, LocalizationScore, PredictionExercise, PredictionGrade, RaceReport, RaceTask, TraceRunResult, TraceRuntime } from "./types";
 
 /**
  * Exercise state shapes.
@@ -171,3 +171,12 @@ export type GoalState = {
 };
 
 export const emptyGoalState: GoalState = { goal: "onboarding", plan: null, status: "idle" };
+
+export type SharingState = {
+  packaged: CoursePackage | null;
+  result: CourseImportResult | null;
+  embedSource: boolean;
+  status: "idle" | "packaging" | "ready" | "error";
+};
+
+export const emptySharingState: SharingState = { packaged: null, result: null, embedSource: false, status: "idle" };

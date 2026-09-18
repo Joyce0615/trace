@@ -320,6 +320,17 @@ export const IPC_SCHEMAS = {
     taskId: s.string({ maxLength: 400 }),
     explanation: s.string({ maxLength: 8_000 }),
   }),
+  "course:package": s.object({
+    repository: repositoryReference,
+    course: s.opaque(),
+    skillGraph: s.opaque({ optional: true }),
+    embedSource: s.boolean({ optional: true }),
+  }),
+  "course:import": s.object({
+    repository: repositoryReference,
+    package: s.opaque(),
+    force: s.boolean({ optional: true }),
+  }),
   "goals:plan": s.object({
     repository: repositoryReference,
     goal: s.literal(GOAL_IDS),

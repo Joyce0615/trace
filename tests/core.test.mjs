@@ -20,6 +20,7 @@ import { SECRET_SCANNER_VERSION, anonymizePath, redact, redactValue, scanText, s
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
 import { GIT_HISTORY_VERSION, busFactor, historyLessons, historySummary, parseHistory, readCommits } from "../electron/git-history.mjs";
 import { MISCONCEPTIONS, MISCONCEPTION_VERSION, buildProbe, calibrateSkill, detectMisconceptions, diagnoseLearner, gradeProbe } from "../electron/misconception.mjs";
+import { COURSE_PACKAGE_FORMAT, COURSE_PACKAGE_VERSION, anchorManifest, detectLicense, importCourse, packageCourse, verifyPackage } from "../electron/course-package.mjs";
 import { GOALS, GOALS_VERSION, goalKeywords, goalPlan, orderLessonsForGoal, rankTargets, resolveGoal } from "../electron/goals.mjs";
 import { EXPERIMENTS, EXPERIMENT_VERSION, OBSERVATION_FIELDS, activeAssignments, analyzeExperiment, assignArm, consentState, experimentReport, hash32, sanitizeObservation, settingsFor } from "../electron/experiments.mjs";
 import { forgetEverything, loadExperimentState, recordObservation, setConsent } from "../electron/experiment-store.mjs";
@@ -758,7 +759,7 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
     "learning:diagnose", "learning:probe", "learning:schedule", "learning:review",
     "quiz:build", "quiz:grade", "explain:task", "explain:grade",
     "activity:build", "activity:grade", "hint:next", "analytics:report",
-    "goals:plan", "experiment:state", "experiment:consent", "experiment:forget", "agents:ask",
+    "course:package", "course:import", "goals:plan", "experiment:state", "experiment:consent", "experiment:forget", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
   assert.throws(() => schemaFor("repository:evil"), /is not a registered IPC channel/);
@@ -3874,4 +3875,143 @@ test("learner goals rank the same repository five different ways from real signa
     const boosted = node.importance > plain.importance;
     assert.equal(boosted, relevantLessonIds.has(node.lessonId), `${node.lessonId}: curriculum and goal planner disagree`);
   }
+});
+
+test("course packages carry provenance, respect the license, and report anchor drift", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-package-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "app"), { recursive: true });
+  await writeFile(path.join(rootPath, "app", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "app", "queue.py"), "def enqueue(job):\n    return job\n");
+  await writeFile(path.join(rootPath, "app", "worker.py"), "from app.queue import enqueue\n\n\ndef work(job):\n    return enqueue(job)\n");
+  await writeFile(path.join(rootPath, "LICENSE"), "MIT License\n\nPermission is hereby granted, free of charge, to any person obtaining a copy...\n");
+  await execFileAsync("git", ["init", "-q"], { cwd: rootPath });
+  await execFileAsync("git", ["config", "user.email", "a@b.c"], { cwd: rootPath });
+  await execFileAsync("git", ["config", "user.name", "Tester"], { cwd: rootPath });
+  await execFileAsync("git", ["add", "-A"], { cwd: rootPath });
+  await execFileAsync("git", ["commit", "-qm", "first"], { cwd: rootPath });
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const course = generateStarterCourse(repository);
+  const skillGraph = buildSkillGraph(repository, course);
+  const sources = {};
+  for (const file of repository.files) sources[file.path] = await readRepositoryFile(rootPath, file.path);
+
+  assert.equal(COURSE_PACKAGE_FORMAT, "trace-course-v1");
+
+  // --- License detection ---------------------------------------------------
+  const license = detectLicense(sources);
+  assert.equal(license.id, "MIT");
+  assert.equal(license.permissive, true);
+  assert.equal(license.file, "LICENSE");
+  assert.equal(detectLicense({}).id, "unknown");
+  assert.equal(detectLicense({ LICENSE: "All rights reserved. Do not copy." }).id, "unrecognized");
+  assert.equal(detectLicense({ LICENSE: "GNU AFFERO GENERAL PUBLIC LICENSE Version 3" }).permissive, false, "copyleft is detected but not treated as permissive");
+  assert.equal(detectLicense({ LICENSE: "Apache License, Version 2.0" }).id, "Apache-2.0");
+
+  // --- Provenance ----------------------------------------------------------
+  const packaged = packageCourse(repository, course, { skillGraph, sources, license, now: "2026-06-01T00:00:00.000Z" });
+  assert.equal(packaged.format, COURSE_PACKAGE_FORMAT);
+  assert.equal(packaged.provenance.repositoryId, repository.id);
+  assert.equal(packaged.provenance.commit, repository.head);
+  assert.equal(packaged.provenance.sourceVersion, repository.versionId);
+  assert.ok(packaged.provenance.commit && packaged.provenance.commit.length >= 7, packaged.provenance.commit);
+  assert.equal(packaged.integrity.lessonCount, course.modules.flatMap((module) => module.lessons).length);
+  assert.ok(packaged.integrity.anchorCount >= 1);
+  // Every anchor records the blob id of the file it points into, which is what
+  // makes drift detectable rather than guessable.
+  assert.ok(packaged.integrity.anchors.every((anchor) => anchor.indexed && anchor.blobId), JSON.stringify(packaged.integrity.anchors.slice(0, 3)));
+
+  // --- The license gate ----------------------------------------------------
+  assert.equal(packaged.license.embedsSource, false);
+  assert.equal(packaged.license.policy, "anchors-only");
+  assert.equal(packaged.integrity.excerptCount, 0);
+  const embedded = packageCourse(repository, course, { skillGraph, sources, license, embedSource: true });
+  assert.equal(embedded.license.embedsSource, true);
+  assert.equal(embedded.license.policy, "source-embedded");
+  assert.ok(embedded.integrity.excerptCount >= 1);
+  // An unrecognised license refuses to embed, and says that is what happened.
+  const restrictive = packageCourse(repository, course, { skillGraph, sources, license: detectLicense({ LICENSE: "All rights reserved." }), embedSource: true });
+  assert.equal(restrictive.license.embedsSource, false);
+  assert.equal(restrictive.license.policy, "source-withheld-unrecognized-license");
+  assert.equal(restrictive.integrity.excerptCount, 0);
+  assert.equal(JSON.stringify(restrictive.integrity.excerpts), "{}");
+  // Copyleft is recognised but still refused for embedding.
+  assert.equal(packageCourse(repository, course, { sources, license: detectLicense({ LICENSE: "GNU AFFERO GENERAL PUBLIC LICENSE" }), embedSource: true }).license.embedsSource, false);
+  // Anything persisted is redacted first.
+  const leaky = packageCourse({ ...repository, remoteUrl: "https://ghp_abcdefghij0123456789abcdefghij012345@example.com/x.git" }, course, { sources, license });
+  assert.equal(JSON.stringify(leaky).includes("ghp_abcdefghij0123456789abcdefghij012345"), false);
+
+  // --- Verification against the same repository ---------------------------
+  const exact = verifyPackage(packaged, repository);
+  assert.equal(exact.verdict, "exact");
+  assert.equal(exact.valid, true);
+  assert.equal(exact.sameRepository, true);
+  assert.equal(exact.sameCommit, true);
+  assert.equal(exact.anchors.counts.exact, exact.anchors.total);
+  assert.deepEqual(exact.problems, []);
+  // An index without per-file blob ids falls back to the repository version id,
+  // so a package verified against the repository it came from is still exact.
+  const blobless = { ...repository, files: repository.files.map((file) => ({ ...file, blobId: undefined })) };
+  const withoutBlobs = verifyPackage(packageCourse(blobless, course, { sources, license }), blobless);
+  assert.equal(withoutBlobs.verdict, "exact", JSON.stringify(withoutBlobs.anchors.counts));
+  assert.equal(withoutBlobs.sameVersion, true);
+  // ...but a different version id is not covered by that fallback.
+  assert.notEqual(verifyPackage(packageCourse(blobless, course, { sources, license }), { ...blobless, versionId: "some-other-version" }).verdict, "exact");
+
+  // --- Drift: a file whose contents changed --------------------------------
+  await writeFile(path.join(rootPath, "app", "queue.py"), "# a new comment line\n# and another\ndef enqueue(job):\n    return job\n");
+  await execFileAsync("git", ["add", "-A"], { cwd: rootPath });
+  await execFileAsync("git", ["commit", "-qm", "second"], { cwd: rootPath });
+  resetAnalysisCache();
+  const moved = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const drifted = verifyPackage(packaged, moved);
+  assert.equal(drifted.sameCommit, false, "a new commit is not the packaged commit");
+  assert.notEqual(drifted.verdict, "exact");
+  assert.ok((drifted.anchors.counts.moved ?? 0) + (drifted.anchors.counts["changed-file"] ?? 0) >= 1, JSON.stringify(drifted.anchors.counts));
+  assert.ok(drifted.problems.length >= 1, JSON.stringify(drifted.problems));
+  // An anchor that moved is re-found by its symbol rather than silently kept.
+  const repointed = drifted.anchors.results.filter((entry) => entry.status === "moved");
+  for (const entry of repointed) {
+    assert.notEqual(entry.currentLine, entry.line);
+    assert.ok(moved.symbols.some((symbol) => symbol.path === entry.path && symbol.name === entry.symbol && symbol.line === entry.currentLine));
+  }
+
+  // --- A package from somewhere else --------------------------------------
+  const foreign = verifyPackage(
+    { ...packaged, provenance: { ...packaged.provenance, repositoryId: "another-repo" }, integrity: { ...packaged.integrity, anchors: packaged.integrity.anchors.map((anchor) => ({ ...anchor, path: `elsewhere/${anchor.path}` })) } },
+    repository,
+  );
+  assert.equal(foreign.verdict, "foreign");
+  assert.equal(foreign.valid, false);
+  assert.equal(foreign.sameRepository, false);
+  assert.equal(foreign.anchors.counts["missing-file"], foreign.anchors.total);
+  // Unreadable packages are refused by format and by version.
+  assert.equal(verifyPackage({ format: "something-else" }, repository).verdict, "unreadable");
+  assert.match(verifyPackage({ format: COURSE_PACKAGE_FORMAT, version: 99 }, repository).reason, /newer than this build/);
+
+  // --- Import --------------------------------------------------------------
+  const imported = importCourse(packaged, repository);
+  assert.equal(imported.imported, true);
+  assert.equal(imported.verification.verdict, "exact");
+  assert.equal(imported.dropped, 0);
+  assert.equal(imported.repointed, 0);
+  assert.match(imported.course.generatedBy, /^imported:/);
+  assert.equal(imported.licenseNotice, "This package carries anchors only; no source was redistributed.");
+  // Importing into the drifted repository re-points what it can.
+  const reimported = importCourse(packaged, moved, { force: true });
+  assert.equal(reimported.imported, true);
+  const importedAnchors = reimported.course.modules.flatMap((module) => module.lessons).flatMap((lesson) => lesson.anchors);
+  // Nothing is left pointing at a file the importer does not have.
+  assert.ok(importedAnchors.every((anchor) => moved.files.some((file) => file.path === anchor.path)), JSON.stringify(importedAnchors));
+  assert.equal(reimported.repointed + reimported.dropped >= 0, true);
+  // A foreign package is refused unless the importer insists.
+  const refused = importCourse({ ...packaged, integrity: { ...packaged.integrity, anchors: packaged.integrity.anchors.map((anchor) => ({ ...anchor, path: `nowhere/${anchor.path}` })) } }, repository);
+  assert.equal(refused.imported, false);
+  assert.match(refused.reason, /does not match this repository/);
+  assert.equal(importCourse({ format: "nope" }, repository).imported, false);
+  // A course that embeds source tells the importer what they may do with it.
+  assert.match(importCourse(embedded, repository).licenseNotice, /under MIT/);
 });

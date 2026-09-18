@@ -36,6 +36,8 @@ contextBridge.exposeInMainWorld("trace", {
   evaluate: (request) => ipcRenderer.invoke("eval:run", request),
   diagnose: (request) => ipcRenderer.invoke("learning:diagnose", request),
   answerProbe: (request) => ipcRenderer.invoke("learning:probe", request),
+  packageCourse: (request) => ipcRenderer.invoke("course:package", request),
+  importCourse: (request) => ipcRenderer.invoke("course:import", request),
   goalPlan: (request) => ipcRenderer.invoke("goals:plan", request),
   experiments: (request) => ipcRenderer.invoke("experiment:state", request),
   setExperimentConsent: (request) => ipcRenderer.invoke("experiment:consent", request),

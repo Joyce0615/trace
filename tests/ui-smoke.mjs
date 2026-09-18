@@ -257,6 +257,24 @@ try {
   assert.match(await analytics.locator('.analytics-card[data-card="time"] .analytics-note').innerText(), /idle time/i);
   await page.screenshot({ path: path.join(artifactDirectory, "analytics.png") });
 
+  // Item 44: a shareable package that states its provenance and license policy.
+  const sharing = page.locator(".sharing-panel");
+  await sharing.waitFor();
+  await sharing.getByRole("button", { name: "Build a package" }).click();
+  await sharing.locator(".sharing-provenance").waitFor();
+  const anchorCount = Number(await sharing.locator(".sharing-provenance").getAttribute("data-anchors"));
+  assert.ok(anchorCount >= 1, String(anchorCount));
+  // Anchors only by default: nothing is redistributed without being asked for.
+  assert.equal(await sharing.locator(".sharing-provenance").getAttribute("data-embeds"), "false");
+  assert.match(await sharing.locator('[data-policy="anchors-only"]').innerText(), /no source is redistributed/);
+  // Verifying against the repository it came from is an exact match.
+  await sharing.getByRole("button", { name: "Verify against this repository" }).click();
+  await sharing.locator(".sharing-result").waitFor();
+  assert.equal(await sharing.locator(".sharing-result").getAttribute("data-verdict"), "exact");
+  assert.equal(await sharing.locator(".sharing-result").getAttribute("data-imported"), "true");
+  assert.match(await sharing.locator(".sharing-result small").innerText(), new RegExp(`${anchorCount}/${anchorCount} anchors usable`));
+  await page.screenshot({ path: path.join(artifactDirectory, "course-package.png") });
+
   // Item 42: consent is the gate, and it is reversible.
   const experiments = page.locator(".experiment-panel");
   await experiments.waitFor();

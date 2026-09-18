@@ -689,6 +689,20 @@ export const browserBridge: TraceBridge = {
     if (!probe) throw new Error("That probe is not active for this repository.");
     return model.gradeProbe(probe, request.choiceId);
   },
+  async packageCourse(request) {
+    // The demo packages and imports with the same code, so provenance and the
+    // license gate behave identically without a main process.
+    const packaging = await import("../electron/course-package.mjs");
+    return packaging.packageCourse(nanoRepository, request.course, {
+      skillGraph: request.skillGraph,
+      sources: nanoSourceByPath,
+      embedSource: Boolean(request.embedSource),
+    });
+  },
+  async importCourse(request) {
+    const packaging = await import("../electron/course-package.mjs");
+    return packaging.importCourse(request.package, nanoRepository, { force: Boolean(request.force) });
+  },
   async goalPlan(request) {
     // The demo ranks with the same signal detectors as the desktop app.
     const goals = await import("../electron/goals.mjs");

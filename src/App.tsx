@@ -1,7 +1,7 @@
 import type { OnMount } from "@monaco-editor/react";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { demoCourse, demoLearnerState, demoRepository, demoSkillGraph } from "./demo";
-import { emptyActivityState, emptyAnalyticsState, emptyExperimentState, emptyGoalState, emptyArchitectureState, emptyChainState, emptyDiagnosisState, emptyEvaluationState, emptyEvidenceState, emptyHistoryState, emptyLocalizationState, emptyExecutableQuizState, emptyExplanationState, emptyReviewState, emptyScheduleState, emptyTraceState, type ActivityState, type AnalyticsState, type ArchitectureState, type ExperimentState, type GoalState, type ChainState, type DiagnosisState, type EvaluationState, type EvidenceState, type ExecutableQuizState, type ExplanationState, type HistoryState, type LocalizationState, type ReviewState, type ScheduleState, type TraceState } from "./exercise-state";
+import { emptyActivityState, emptyAnalyticsState, emptyExperimentState, emptyGoalState, emptySharingState, emptyArchitectureState, emptyChainState, emptyDiagnosisState, emptyEvaluationState, emptyEvidenceState, emptyHistoryState, emptyLocalizationState, emptyExecutableQuizState, emptyExplanationState, emptyReviewState, emptyScheduleState, emptyTraceState, type ActivityState, type AnalyticsState, type ArchitectureState, type ExperimentState, type GoalState, type SharingState, type ChainState, type DiagnosisState, type EvaluationState, type EvidenceState, type ExecutableQuizState, type ExplanationState, type HistoryState, type LocalizationState, type ReviewState, type ScheduleState, type TraceState } from "./exercise-state";
 import { Icon, bridge, readableError, repositoryRef } from "./shell";
 import { addEvidence, completeDiagnostic, personalizeSkillGraph, skillForLesson } from "./learning";
 import type { AgentState, ContextMode, ContextPack, SearchResponse, ContextScope, Course, IndexProgress, KnowledgeGraphSummary, LearnerProfile, LinkClassification, LearnerState, LearningMemory, Lesson, LessonContentBlock, PracticeReport, PracticeSession, Repository, RepoFile, SkillGraph, SkillNode, SymbolResolution } from "./types";
@@ -31,6 +31,7 @@ const LazyActivityPanel = lazy(async () => ({ default: (await import("./exercise
 const LazyAnalyticsPanel = lazy(async () => ({ default: (await import("./exercises")).AnalyticsPanel }));
 const LazyExperimentPanel = lazy(async () => ({ default: (await import("./exercises")).ExperimentPanel }));
 const LazyGoalPanel = lazy(async () => ({ default: (await import("./exercises")).GoalPanel }));
+const LazySharingPanel = lazy(async () => ({ default: (await import("./exercises")).SharingPanel }));
 
 function Logo() {
   return <div className="logo-mark" aria-label="Trace"><span /><span /><span /></div>;
@@ -418,7 +419,7 @@ function LessonCanvas({ lesson, diagramOnly, onAnchor }: { lesson: Lesson; diagr
   </div>;
 }
 
-function CodeWorkspace({ repository, lesson, currentFile, content, line, workspaceMode, fontBoost, trail, chainState, onChainState, localizationState, onLocalizationState, reviewState, onReviewState, traceState, onTraceState, architectureState, onArchitectureState, historyState, onHistoryState, onHistoryLesson, evidenceState, onEvidenceState, skillGraph, course, evaluationState, onEvaluationState, learnerState, onLearnerState, diagnosisState, onDiagnosisState, scheduleState, onScheduleState, executableQuizState, onExecutableQuizState, explanationState, onExplanationState, activityState, onActivityState, analyticsState, onAnalyticsState, experimentState, onExperimentState, goalState, onGoalState, onOpen, onSelection, onWorkspaceMode, resolution, resolutionBusy, onResolve }: {
+function CodeWorkspace({ repository, lesson, currentFile, content, line, workspaceMode, fontBoost, trail, chainState, onChainState, localizationState, onLocalizationState, reviewState, onReviewState, traceState, onTraceState, architectureState, onArchitectureState, historyState, onHistoryState, onHistoryLesson, evidenceState, onEvidenceState, skillGraph, course, evaluationState, onEvaluationState, learnerState, onLearnerState, diagnosisState, onDiagnosisState, scheduleState, onScheduleState, executableQuizState, onExecutableQuizState, explanationState, onExplanationState, activityState, onActivityState, analyticsState, onAnalyticsState, experimentState, onExperimentState, goalState, onGoalState, sharingState, onSharingState, onOpen, onSelection, onWorkspaceMode, resolution, resolutionBusy, onResolve }: {
   repository: Repository;
   lesson: Lesson;
   currentFile: RepoFile | null;
@@ -464,6 +465,8 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
   onExperimentState: (update: Partial<ExperimentState>) => void;
   goalState: GoalState;
   onGoalState: (update: Partial<GoalState>) => void;
+  sharingState: SharingState;
+  onSharingState: (update: Partial<SharingState>) => void;
   onOpen: (file: RepoFile, line?: number) => void;
   onSelection: (selection: CodeSelection | null) => void;
   onWorkspaceMode: (mode: WorkspaceMode) => void;
@@ -624,6 +627,13 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
             state={diagnosisState}
             onState={onDiagnosisState}
             onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }}
+          /></Suspense>
+          <Suspense fallback={<div className="panel-loading">Loading sharing…</div>}><LazySharingPanel
+            repository={repository}
+            course={course}
+            skillGraph={skillGraph}
+            state={sharingState}
+            onState={onSharingState}
           /></Suspense>
           <Suspense fallback={<div className="panel-loading">Loading experiments…</div>}><LazyExperimentPanel
             repository={repository}
@@ -923,6 +933,7 @@ export default function App() {
   const [analyticsState, setAnalyticsState] = useState<AnalyticsState>(emptyAnalyticsState);
   const [experimentState, setExperimentState] = useState<ExperimentState>(emptyExperimentState);
   const [goalState, setGoalState] = useState<GoalState>(emptyGoalState);
+  const [sharingState, setSharingState] = useState<SharingState>(emptySharingState);
   const [resolution, setResolution] = useState<SymbolResolution | null>(null);
   const [resolutionBusy, setResolutionBusy] = useState(false);
 
@@ -967,6 +978,7 @@ export default function App() {
   const updateAnalyticsState = useCallback((update: Partial<AnalyticsState>) => setAnalyticsState((previous) => ({ ...previous, ...update })), []);
   const updateExperimentState = useCallback((update: Partial<ExperimentState>) => setExperimentState((previous) => ({ ...previous, ...update })), []);
   const updateGoalState = useCallback((update: Partial<GoalState>) => setGoalState((previous) => ({ ...previous, ...update })), []);
+  const updateSharingState = useCallback((update: Partial<SharingState>) => setSharingState((previous) => ({ ...previous, ...update })), []);
 
   const loadSource = useCallback(async (repo: Repository, file: RepoFile, targetLine = 1) => {
     // The navigation trail is what the localization drill scores for efficiency.
@@ -1003,6 +1015,7 @@ export default function App() {
     setAnalyticsState(emptyAnalyticsState);
     setExperimentState(emptyExperimentState);
     setGoalState(emptyGoalState);
+    setSharingState(emptySharingState);
     setInspectionTrail([]);
     setCourse(nextCourse);
     setSkillGraph(nextGraph);
@@ -1235,7 +1248,7 @@ export default function App() {
       </header>
       <div className="workspace-grid">
         <CourseSidebar course={course} skillGraph={skillGraph} knowledgeGraph={knowledgeGraph} learnerState={learnerState} activeSkill={activeSkill} selectedLesson={selectedLesson} completed={completed} onSelect={selectLesson} onSelectSkill={selectSkill} onFamiliar={(node) => setLearnerState(addEvidence(learnerState, skillGraph, node.id, { kind: "self-report", strength: 0.62, detail: `Marked familiar: ${node.title}` }))} onChallenge={(node) => { const lesson = flattenLessons(course).find((item) => item.id === node.lessonId); if (lesson) void selectLesson(lesson).then(() => setMode("quiz")); }} onToggleComplete={toggleComplete} onEnhance={enhanceCourse} enhancing={courseBusy} enhanceElapsed={courseElapsed} provider={provider} canEnhance={agents[provider].available} />
-        <CodeWorkspace repository={repository} lesson={selectedLesson} currentFile={currentFile} content={content} line={line} workspaceMode={workspaceMode} fontBoost={fontBoosts[fontScale]} trail={inspectionTrail} chainState={chainState} onChainState={updateChainState} localizationState={localizationState} onLocalizationState={updateLocalizationState} reviewState={reviewState} onReviewState={updateReviewState} traceState={traceState} onTraceState={updateTraceState} architectureState={architectureState} onArchitectureState={updateArchitectureState} historyState={historyState} onHistoryState={updateHistoryState} onHistoryLesson={selectLesson} evidenceState={evidenceState} onEvidenceState={updateEvidenceState} skillGraph={skillGraph} course={course} evaluationState={evaluationState} onEvaluationState={updateEvaluationState} learnerState={learnerState} onLearnerState={setLearnerState} diagnosisState={diagnosisState} onDiagnosisState={updateDiagnosisState} scheduleState={scheduleState} onScheduleState={updateScheduleState} executableQuizState={executableQuizState} onExecutableQuizState={updateExecutableQuizState} explanationState={explanationState} onExplanationState={updateExplanationState} activityState={activityState} onActivityState={updateActivityState} analyticsState={analyticsState} onAnalyticsState={updateAnalyticsState} experimentState={experimentState} onExperimentState={updateExperimentState} goalState={goalState} onGoalState={updateGoalState} onOpen={openFile} onSelection={setSelection} onWorkspaceMode={changeWorkspaceMode} resolution={resolution} resolutionBusy={resolutionBusy} onResolve={resolveAtCursor} />
+        <CodeWorkspace repository={repository} lesson={selectedLesson} currentFile={currentFile} content={content} line={line} workspaceMode={workspaceMode} fontBoost={fontBoosts[fontScale]} trail={inspectionTrail} chainState={chainState} onChainState={updateChainState} localizationState={localizationState} onLocalizationState={updateLocalizationState} reviewState={reviewState} onReviewState={updateReviewState} traceState={traceState} onTraceState={updateTraceState} architectureState={architectureState} onArchitectureState={updateArchitectureState} historyState={historyState} onHistoryState={updateHistoryState} onHistoryLesson={selectLesson} evidenceState={evidenceState} onEvidenceState={updateEvidenceState} skillGraph={skillGraph} course={course} evaluationState={evaluationState} onEvaluationState={updateEvaluationState} learnerState={learnerState} onLearnerState={setLearnerState} diagnosisState={diagnosisState} onDiagnosisState={updateDiagnosisState} scheduleState={scheduleState} onScheduleState={updateScheduleState} executableQuizState={executableQuizState} onExecutableQuizState={updateExecutableQuizState} explanationState={explanationState} onExplanationState={updateExplanationState} activityState={activityState} onActivityState={updateActivityState} analyticsState={analyticsState} onAnalyticsState={updateAnalyticsState} experimentState={experimentState} onExperimentState={updateExperimentState} goalState={goalState} onGoalState={updateGoalState} sharingState={sharingState} onSharingState={updateSharingState} onOpen={openFile} onSelection={setSelection} onWorkspaceMode={changeWorkspaceMode} resolution={resolution} resolutionBusy={resolutionBusy} onResolve={resolveAtCursor} />
         <TutorPanel repository={repository} lesson={selectedLesson} skill={activeSkill} nextSkill={nextSkill} learnerState={learnerState} provider={provider} agents={agents} mode={mode} messages={messages} askMessages={askMessages} busy={agentBusy} currentFile={currentFile} selection={selection} guideStage={guideStage} onGuideStage={updateGuideStage} onWorkspaceMode={changeWorkspaceMode} onNextSkill={selectSkill} onProvider={setProvider} onMode={setMode} onAsk={ask} onSaveMemory={saveMemory} onQuizEvidence={() => updateEvidence("quiz", 0.55, `Submitted quiz answer for ${selectedLesson.title}`)} onDone={() => toggleComplete(selectedLesson)} complete={completed.has(selectedLesson.id)} practiceSession={practiceSession} practiceReport={practiceReport} practiceBusy={practiceBusy} onCreatePractice={createPractice} onInspectPractice={inspectPractice} onOpenPractice={() => { if (practiceSession) void bridge.openPractice(practiceSession.id); }} onRemovePractice={removePractice} />
       </div>
       {diagnosticOpen && <DiagnosticOverlay graph={skillGraph} onComplete={finishDiagnostic} onSkip={() => finishDiagnostic()} />}

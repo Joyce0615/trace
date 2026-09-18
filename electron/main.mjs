@@ -32,6 +32,7 @@ import { appendEvent, readEvents } from "./activity-log.mjs";
 import { analyticsReport } from "./analytics.mjs";
 import { EXPERIMENTS, experimentReport, settingsFor } from "./experiments.mjs";
 import { goalPlan } from "./goals.mjs";
+import { detectLicense, importCourse, packageCourse, verifyPackage } from "./course-package.mjs";
 import { forgetEverything, loadExperimentState, recordObservation, setConsent } from "./experiment-store.mjs";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -578,6 +579,45 @@ const ipcHandlers = {
     const hints = hintsTaken.get(`${repository.id}|${task.id}`) ?? { count: 0, penalty: 0 };
     await recordActivity(repository, { kind: "explanation", taskId: task.id, path: task.entry.path, symbol: task.entry.name, correct: grade.score >= 0.65, score: grade.score, hints: hints.count, hintPenalty: hints.penalty });
     return grade;
+  },
+
+  "course:package": async (_event, request) => {
+    const repository = openedRepository(request.repository);
+    if (!Array.isArray(request.course?.modules)) throw new Error("Invalid course package request.");
+    // The license is read from the repository's own LICENSE file, and only the
+    // files the course actually anchors into are read for possible excerpts.
+    const licenseSources = {};
+    for (const file of repository.files.filter((candidate) => /^(?:LICEN[CS]E|COPYING)(?:\.\w+)?$/i.test(candidate.name)).slice(0, 4)) {
+      try {
+        licenseSources[file.path] = await readRepositoryFile(repository.rootPath, file.path);
+      } catch {
+        // An unreadable LICENSE simply leaves the license unknown.
+      }
+    }
+    const license = detectLicense(licenseSources);
+    const sources = { ...licenseSources };
+    if (request.embedSource && license.permissive) {
+      const anchored = new Set(request.course.modules.flatMap((module) => (module.lessons ?? []).flatMap((lesson) => (lesson.anchors ?? []).map((anchor) => anchor.path))));
+      for (const filePath of [...anchored].slice(0, 200)) {
+        try {
+          sources[filePath] = await readRepositoryFile(repository.rootPath, filePath);
+        } catch {
+          // A file that cannot be read is simply not embedded.
+        }
+      }
+    }
+    return packageCourse(repository, request.course, {
+      skillGraph: request.skillGraph,
+      sources,
+      license,
+      embedSource: Boolean(request.embedSource),
+    });
+  },
+
+  "course:import": (_event, request) => {
+    const repository = openedRepository(request.repository);
+    const result = importCourse(request.package, repository, { force: Boolean(request.force) });
+    return { ...result, verification: result.verification ?? verifyPackage(request.package, repository) };
   },
 
   "goals:plan": async (_event, request) => {
