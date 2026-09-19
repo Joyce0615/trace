@@ -689,6 +689,21 @@ export const browserBridge: TraceBridge = {
     if (!probe) throw new Error("That probe is not active for this repository.");
     return model.gradeProbe(probe, request.choiceId);
   },
+  async signingIdentity() {
+    // The browser has no private key store, so it says so rather than
+    // pretending a package is signed.
+    return { algorithm: "ed25519", keyId: "unavailable", publicKey: "", createdAt: null, trustedKeyIds: [] };
+  },
+  async trustKey() {
+    return { trustedKeyIds: [] };
+  },
+  async verifyPackageSignature() {
+    return {
+      signature: { verified: false, reason: "not-signed", trust: "unsigned" as const, keyId: null },
+      anchorSignature: { verified: false, reason: "not-signed", trust: "unsigned" as const, keyId: null },
+      trustedKeyIds: [],
+    };
+  },
   async packageCourse(request) {
     // The demo packages and imports with the same code, so provenance and the
     // license gate behave identically without a main process.

@@ -320,6 +320,12 @@ export const IPC_SCHEMAS = {
     taskId: s.string({ maxLength: 400 }),
     explanation: s.string({ maxLength: 8_000 }),
   }),
+  "signing:identity": s.object({ repository: repositoryReference }),
+  "signing:trust": s.object({
+    repository: repositoryReference,
+    keyId: s.string({ maxLength: 64, minLength: 8 }),
+    trusted: s.boolean(),
+  }),
   "course:package": s.object({
     repository: repositoryReference,
     course: s.opaque(),
@@ -330,6 +336,10 @@ export const IPC_SCHEMAS = {
     repository: repositoryReference,
     package: s.opaque(),
     force: s.boolean({ optional: true }),
+  }),
+  "course:verify-signature": s.object({
+    repository: repositoryReference,
+    package: s.opaque(),
   }),
   "goals:plan": s.object({
     repository: repositoryReference,

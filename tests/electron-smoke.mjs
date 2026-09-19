@@ -867,10 +867,14 @@ try {
     const requested = await window.trace.packageCourse({ repository, course: workspace.course, skillGraph: workspace.skillGraph, embedSource: true });
     const roundTrip = await window.trace.importCourse({ repository, package: anchorsOnly });
     // A package whose anchors point somewhere else must not import here.
+    // Unsigned, so provenance rather than the seal is what refuses it. (A
+    // *doctored signed* package is refused by item 45's seal check instead.)
     const foreign = await window.trace.importCourse({
       repository,
       package: {
         ...anchorsOnly,
+        signature: null,
+        anchorSignature: null,
         provenance: { ...anchorsOnly.provenance, repositoryId: "some-other-repository" },
         integrity: { ...anchorsOnly.integrity, anchors: anchorsOnly.integrity.anchors.map((anchor) => ({ ...anchor, path: `elsewhere/${anchor.path}` })) },
       },
@@ -909,9 +913,73 @@ try {
   // A foreign package is refused, with the reason stated.
   assert.equal(packageAudit.foreign.imported, false);
   assert.equal(packageAudit.foreign.verification.verdict, "foreign");
+  assert.equal(packageAudit.foreign.verification.signature.trust, "unsigned", "unsigned is not the same as tampered");
   assert.match(packageAudit.foreign.reason, /does not match this repository/);
   assert.equal(packageAudit.unreadable.imported, false);
   assert.equal(packageAudit.unreadable.verification.verdict, "unreadable");
+
+  // Item 45: the package is sealed, tampering is detected, and a broken seal is
+  // refused rather than imported with a warning.
+  const signingAudit = await page.evaluate(async () => {
+    const workspace = window.traceWorkspace;
+    const repository = { id: workspace.repository.id, rootPath: workspace.repository.rootPath };
+    const identity = await window.trace.signingIdentity({ repository });
+    const packaged = await window.trace.packageCourse({ repository, course: workspace.course, skillGraph: workspace.skillGraph });
+    const asIs = await window.trace.verifyPackageSignature({ repository, package: packaged });
+    // Move one anchor by five lines: the course still looks plausible, and the
+    // seal must still break.
+    const doctored = {
+      ...packaged,
+      integrity: {
+        ...packaged.integrity,
+        anchors: packaged.integrity.anchors.map((anchor, index) => (index === 0 ? { ...anchor, line: anchor.line + 5 } : anchor)),
+      },
+    };
+    const doctoredCheck = await window.trace.verifyPackageSignature({ repository, package: doctored });
+    const doctoredImport = await window.trace.importCourse({ repository, package: doctored });
+    // Rewriting the course text alone must also break it.
+    const rewritten = { ...packaged, content: { ...packaged.content, course: { ...packaged.content.course, title: "Rewritten by someone else" } } };
+    const rewrittenCheck = await window.trace.verifyPackageSignature({ repository, package: rewritten });
+    // Trust is a separate, reversible decision from validity.
+    const beforeTrust = await window.trace.verifyPackageSignature({ repository, package: packaged });
+    await window.trace.trustKey({ repository, keyId: identity.keyId, trusted: true });
+    const afterTrust = await window.trace.verifyPackageSignature({ repository, package: packaged });
+    await window.trace.trustKey({ repository, keyId: identity.keyId, trusted: false });
+    const afterUntrust = await window.trace.verifyPackageSignature({ repository, package: packaged });
+    const goodImport = await window.trace.importCourse({ repository, package: packaged });
+    return { identity, packaged, asIs, doctoredCheck, doctoredImport, rewrittenCheck, beforeTrust, afterTrust, afterUntrust, goodImport, identitySerialized: JSON.stringify(identity) };
+  });
+  assert.equal(signingAudit.identity.algorithm, "ed25519");
+  assert.equal(signingAudit.identity.keyId.length, 32);
+  // The private key never crosses the IPC boundary.
+  assert.equal(signingAudit.identitySerialized.includes("PRIVATE"), false, "a private key crossed IPC");
+  assert.match(signingAudit.identity.publicKey, /BEGIN PUBLIC KEY/);
+  // Both seals verify on the package as produced.
+  assert.equal(signingAudit.packaged.signature.algorithm, "ed25519");
+  assert.equal(signingAudit.packaged.signature.subject, "course-package");
+  assert.equal(signingAudit.packaged.anchorSignature.subject, "source-anchors");
+  assert.equal(signingAudit.asIs.signature.verified, true, signingAudit.asIs.signature.reason);
+  assert.equal(signingAudit.asIs.anchorSignature.verified, true, signingAudit.asIs.anchorSignature.reason);
+  // Moving one anchor line breaks both the package seal and the anchor seal.
+  assert.equal(signingAudit.doctoredCheck.signature.verified, false);
+  assert.equal(signingAudit.doctoredCheck.signature.reason, "content-changed");
+  assert.equal(signingAudit.doctoredCheck.anchorSignature.reason, "content-changed");
+  // ...and such a package is refused, not imported with a warning.
+  assert.equal(signingAudit.doctoredImport.imported, false);
+  assert.match(signingAudit.doctoredImport.reason, /signature did not verify/);
+  assert.equal(signingAudit.doctoredImport.course, null);
+  // Rewriting the course content breaks the package seal too.
+  assert.equal(signingAudit.rewrittenCheck.signature.verified, false);
+  assert.equal(signingAudit.rewrittenCheck.signature.reason, "content-changed");
+  // Trust is reported separately from validity, and is reversible.
+  assert.equal(signingAudit.beforeTrust.signature.trust, "untrusted");
+  assert.equal(signingAudit.beforeTrust.signature.verified, true, "an untrusted signature is still a verified one");
+  assert.equal(signingAudit.afterTrust.signature.trust, "trusted");
+  assert.equal(signingAudit.afterUntrust.signature.trust, "untrusted");
+  // An intact package still imports, with its signature verdict attached.
+  assert.equal(signingAudit.goodImport.imported, true);
+  assert.equal(signingAudit.goodImport.verification.signature.verified, true);
+  assert.equal(signingAudit.goodImport.verification.anchorSignature.verified, true);
 
   // Item 43: five goals over the same real repository, each ranked from counted
   // source signals rather than from a label.
@@ -1332,6 +1400,7 @@ try {
       lessons: { score: evaluationAudit.lessons.score, verdict: evaluationAudit.lessons.verdict },
     },
     diagnosis: { skills: diagnosis.skills.length, assessed: diagnosis.summary.assessed, meanConfidence: diagnosis.summary.meanConfidence, brier: diagnosis.summary.meanBrier, overconfident: diagnosis.summary.overconfidentSkills, misconceptions: diagnosis.summary.misconceptionCounts },
+    signing: { algorithm: signingAudit.identity.algorithm, keyId: `${signingAudit.identity.keyId.slice(0, 12)}…`, packageSealed: signingAudit.asIs.signature.verified, anchorsSealed: signingAudit.asIs.anchorSignature.verified, tamperReason: signingAudit.doctoredCheck.signature.reason, tamperedImport: signingAudit.doctoredImport.imported, trustBefore: signingAudit.beforeTrust.signature.trust, trustAfter: signingAudit.afterTrust.signature.trust },
     coursePackage: { format: coursePackage.format, commit: (coursePackage.provenance.commit ?? "").slice(0, 8), anchors: coursePackage.integrity.anchorCount, license: coursePackage.license.id, policy: coursePackage.license.policy, embeddedFiles: packageAudit.requested.integrity.excerptCount, roundTrip: packageAudit.roundTrip.verification.verdict, foreign: packageAudit.foreign.verification.verdict },
     goals: Object.fromEntries(goalIds.map((goal) => [goal, { top: rankings[goal][0], targets: rankings[goal].length, topReasons: goalAudit.plans[goal].targets[0].reasons.map((reason) => reason.detail) }])),
     experiments: { arms: experimentAudit.armsSeen.map(([arm, observed]) => `${arm}:declared=${observed.declared},applied=${observed.applied},queued=${observed.queued}`), unconsentedLimit: experimentAudit.controlPlan.parameters.dailyLimit, assignedArm: experimentAudit.consented.assignments.map((item) => `${item.experimentId}=${item.arm}`), assignedLimit, explicitLimit: experimentAudit.explicitPlan.parameters.dailyLimit, observations: experimentAudit.afterObservation.observations, verdict: limitResult.verdict, afterWithdrawal: experimentAudit.afterWithdrawalPlan.parameters.dailyLimit, deleted: experimentAudit.forgotten.deletedObservations },

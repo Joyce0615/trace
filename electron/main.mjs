@@ -33,6 +33,7 @@ import { analyticsReport } from "./analytics.mjs";
 import { EXPERIMENTS, experimentReport, settingsFor } from "./experiments.mjs";
 import { goalPlan } from "./goals.mjs";
 import { detectLicense, importCourse, packageCourse, verifyPackage } from "./course-package.mjs";
+import { anchorPayload, loadOrCreateKeyPair, loadTrustedKeys, publicIdentity, responsePayload, setKeyTrust, signPackage, signPayload, verifyPackageSignature, verifyPayload } from "./signing.mjs";
 import { forgetEverything, loadExperimentState, recordObservation, setConsent } from "./experiment-store.mjs";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -68,6 +69,17 @@ function activityLogDirectory() {
 
 function experimentDirectory() {
   return path.join(app.getPath("userData"), "experiments");
+}
+
+function signingDirectory() {
+  return path.join(app.getPath("userData"), "signing");
+}
+
+/** The machine's signing key, created on first use and cached for the session. */
+let signingKeyPromise = null;
+function signingKey() {
+  signingKeyPromise ??= loadOrCreateKeyPair(signingDirectory());
+  return signingKeyPromise;
 }
 
 /**
@@ -606,18 +618,59 @@ const ipcHandlers = {
         }
       }
     }
-    return packageCourse(repository, request.course, {
+    const packaged = packageCourse(repository, request.course, {
       skillGraph: request.skillGraph,
       sources,
       license,
       embedSource: Boolean(request.embedSource),
     });
+    // Item 45: the package is sealed over its provenance, license policy,
+    // anchors, and content, and the anchors are sealed again on their own so a
+    // lesson's ground truth can be checked without trusting the rest of the file.
+    const keyPair = await signingKey();
+    const signed = signPackage(packaged, keyPair);
+    return { ...signed, anchorSignature: signPayload("source-anchors", anchorPayload(packaged.integrity.anchors), keyPair) };
   },
 
-  "course:import": (_event, request) => {
+  "course:import": async (_event, request) => {
     const repository = openedRepository(request.repository);
+    const trustedKeyIds = await loadTrustedKeys(signingDirectory());
+    const signature = verifyPackageSignature(request.package, { trustedKeyIds });
+    const anchorSignature = verifyPayload("source-anchors", anchorPayload(request.package?.integrity?.anchors), request.package?.anchorSignature, { trustedKeyIds });
+    // A package whose seal is broken is refused outright: unlike drift, this is
+    // not a difference of version, it is evidence the file was altered.
+    if (signature.trust === "invalid" || anchorSignature.trust === "invalid") {
+      return {
+        imported: false,
+        course: null,
+        skillGraph: null,
+        reason: `The package signature did not verify (${signature.trust === "invalid" ? signature.reason : anchorSignature.reason}).`,
+        verification: { ...verifyPackage(request.package, repository), signature, anchorSignature },
+      };
+    }
     const result = importCourse(request.package, repository, { force: Boolean(request.force) });
-    return { ...result, verification: result.verification ?? verifyPackage(request.package, repository) };
+    return { ...result, verification: { ...(result.verification ?? verifyPackage(request.package, repository)), signature, anchorSignature } };
+  },
+
+  "course:verify-signature": async (_event, request) => {
+    openedRepository(request.repository);
+    const trustedKeyIds = await loadTrustedKeys(signingDirectory());
+    return {
+      signature: verifyPackageSignature(request.package, { trustedKeyIds }),
+      anchorSignature: verifyPayload("source-anchors", anchorPayload(request.package?.integrity?.anchors), request.package?.anchorSignature, { trustedKeyIds }),
+      trustedKeyIds,
+    };
+  },
+
+  "signing:identity": async (_event, request) => {
+    openedRepository(request.repository);
+    // Only the public half ever crosses the IPC boundary.
+    return { ...publicIdentity(await signingKey()), trustedKeyIds: await loadTrustedKeys(signingDirectory()) };
+  },
+
+  "signing:trust": async (_event, request) => {
+    openedRepository(request.repository);
+    return { trustedKeyIds: await setKeyTrust(signingDirectory(), request.keyId, request.trusted) };
   },
 
   "goals:plan": async (_event, request) => {
@@ -778,13 +831,19 @@ const ipcHandlers = {
     if (local) return { text: local, pack, answeredBy: "local-index", responseCacheHit: false };
     const cacheDirectory = path.join(app.getPath("userData"), "agent-responses");
     const cacheKey = responseCacheKey(repository, request.provider, trustedContext, pack);
-    const cached = await loadCachedResponse(cacheDirectory, cacheKey);
+    const keyPair = await signingKey();
+    const cached = await loadCachedResponse(cacheDirectory, cacheKey, {
+      // A tampered cache entry is discarded, not served.
+      verify: (entry) => verifyPayload("agent-response", responsePayload(entry), entry?.signature),
+    });
     if (cached?.text) return { ...cached, pack, responseCacheHit: true };
     if (request.rootPath !== repository.rootPath) throw new Error("Agent root does not match the open repository.");
     const text = await askAgent(request.provider, repository.rootPath, { ...trustedContext, contextPack: pack });
     const response = { text, pack, answeredBy: request.provider, responseCacheHit: false };
-    await saveCachedResponse(cacheDirectory, cacheKey, response);
-    return response;
+    const stored = await saveCachedResponse(cacheDirectory, cacheKey, response, {
+      sign: (entry) => signPayload("agent-response", responsePayload(entry), keyPair),
+    });
+    return { ...response, signature: stored.signature };
   },
 
   "course:enhance": async (_event, request) => {

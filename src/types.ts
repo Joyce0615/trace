@@ -861,6 +861,7 @@ export interface CoursePackage {
     excerptCount: number;
   };
   signature: CourseSignature | null;
+  anchorSignature?: CourseSignature | null;
 }
 
 export interface PackageVerification {
@@ -881,6 +882,7 @@ export interface PackageVerification {
   } | null;
   problems: string[];
   signature?: SignatureVerification | null;
+  anchorSignature?: SignatureVerification | null;
 }
 
 export interface CourseImportResult {
@@ -892,6 +894,14 @@ export interface CourseImportResult {
   repointed?: number;
   dropped?: number;
   licenseNotice?: string;
+}
+
+export interface SigningIdentity {
+  algorithm: string;
+  keyId: string;
+  publicKey: string;
+  createdAt: string | null;
+  trustedKeyIds: string[];
 }
 
 export interface CourseSignature {
@@ -1373,6 +1383,9 @@ export interface TraceBridge {
   evaluate(request: { repository: RepositoryRef; course?: Course; skillGraph?: SkillGraph; answers?: unknown[]; sampleSize?: number }): Promise<EvaluationReport>;
   diagnose(request: { repository: RepositoryRef; skillGraph: SkillGraph; learnerState: LearnerState; text?: string }): Promise<DiagnosisReport>;
   answerProbe(request: { repository: RepositoryRef; probeId: string; choiceId: string }): Promise<ProbeGrade>;
+  signingIdentity(request: { repository: RepositoryRef }): Promise<SigningIdentity>;
+  trustKey(request: { repository: RepositoryRef; keyId: string; trusted: boolean }): Promise<{ trustedKeyIds: string[] }>;
+  verifyPackageSignature(request: { repository: RepositoryRef; package: CoursePackage }): Promise<{ signature: SignatureVerification; anchorSignature: SignatureVerification; trustedKeyIds: string[] }>;
   packageCourse(request: { repository: RepositoryRef; course: Course; skillGraph?: SkillGraph; embedSource?: boolean }): Promise<CoursePackage>;
   importCourse(request: { repository: RepositoryRef; package: CoursePackage; force?: boolean }): Promise<CourseImportResult>;
   goalPlan(request: { repository: RepositoryRef; goal: LearnerGoal; course?: Course; limit?: number }): Promise<GoalPlan>;

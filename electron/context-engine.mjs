@@ -154,15 +154,33 @@ export function responseCacheKey(repository, provider, context, pack) {
   return createHash("sha256").update(`${repository.versionId}:${provider}:${context.lesson.id}:${pack.mode}:${context.question.trim().toLowerCase()}:${pack.sections.map((item) => item.id).join(":")}`).digest("hex").slice(0, 32);
 }
 
-export async function loadCachedResponse(directory, key) {
-  try { return JSON.parse(await readFile(responsePath(directory, key), "utf8")); } catch { return null; }
+/**
+ * Read a cached agent answer and, if the cache was signed, say whether the file
+ * on disk is still the answer that was written. Any process on this machine can
+ * rewrite the cache, so a cache hit is only trustworthy if it is checked.
+ */
+export async function loadCachedResponse(directory, key, options = {}) {
+  let cached;
+  try {
+    cached = JSON.parse(await readFile(responsePath(directory, key), "utf8"));
+  } catch {
+    return null;
+  }
+  if (!options.verify) return cached;
+  const verification = options.verify(cached);
+  // A tampered cache entry is discarded rather than served with a warning.
+  if (verification && verification.trust === "invalid") return null;
+  return { ...cached, signatureVerification: verification };
 }
 
-export async function saveCachedResponse(directory, key, value) {
+export async function saveCachedResponse(directory, key, value, options = {}) {
   await mkdir(directory, { recursive: true });
   const destination = responsePath(directory, key);
   const temporary = `${destination}.${process.pid}.tmp`;
   // Cached agent output is scanned again: a model can echo a secret it was shown.
-  await writeFile(temporary, JSON.stringify(redactValue(value), null, 2));
+  const redacted = redactValue({ ...value, cacheKey: key });
+  const signed = options.sign ? { ...redacted, signature: options.sign(redacted) } : redacted;
+  await writeFile(temporary, JSON.stringify(signed, null, 2));
   await rename(temporary, destination);
+  return signed;
 }

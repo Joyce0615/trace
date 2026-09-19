@@ -273,6 +273,14 @@ try {
   assert.equal(await sharing.locator(".sharing-result").getAttribute("data-verdict"), "exact");
   assert.equal(await sharing.locator(".sharing-result").getAttribute("data-imported"), "true");
   assert.match(await sharing.locator(".sharing-result small").innerText(), new RegExp(`${anchorCount}/${anchorCount} anchors usable`));
+  // Item 45: the browser has no private key store, so it reports the package as
+  // unsigned rather than presenting an unverifiable seal as trustworthy.
+  assert.equal(await sharing.locator(".sharing-signature").count(), 0);
+  const browserSignature = await page.evaluate(async () => window.trace
+    ? null
+    : (await import("/src/demo.ts")).browserBridge.verifyPackageSignature());
+  assert.equal(browserSignature.signature.trust, "unsigned");
+  assert.equal(browserSignature.anchorSignature.trust, "unsigned");
   await page.screenshot({ path: path.join(artifactDirectory, "course-package.png") });
 
   // Item 42: consent is the gate, and it is reversible.
