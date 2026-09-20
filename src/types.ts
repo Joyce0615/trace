@@ -172,6 +172,10 @@ export interface Lesson {
     hint: string;
   };
   content?: LessonContentBlock[];
+  /** Item 46. Present only after a migration touched this lesson. */
+  reviewNotes?: string[];
+  retiredAnchors?: Array<CodeAnchor & { reason: string; evidence: string[] }>;
+  migrationStatus?: "intact" | "migrated" | "needs-review" | "orphaned";
 }
 
 export interface CourseModule {
@@ -194,6 +198,8 @@ export interface Course {
   generatedAt: string;
   profile?: LearnerProfile;
   modules: CourseModule[];
+  /** Item 46: applied migrations, newest last, each carrying what it replaced. */
+  migrations?: Array<{ id: string; version: number; at: string; from: { commit: string | null; sourceVersion: string | null }; to: { commit: string | null; sourceVersion: string | null }; repointed: number; retired: number; added: number; skipped: number }>;
 }
 
 export interface DiagnosticQuestion {
@@ -896,6 +902,63 @@ export interface CourseImportResult {
   licenseNotice?: string;
 }
 
+/** Item 46: what happened to one anchored definition between two versions. */
+export type MigrationStatus =
+  | "unchanged" | "edited" | "moved" | "moved-file" | "renamed" | "split" | "ambiguous" | "unverified" | "disappeared" | "file-removed";
+
+export interface MigrationOperation {
+  id: string;
+  moduleId: string;
+  lessonId: string;
+  lessonTitle: string;
+  site: "lesson" | "diagram" | "timeline" | "callchain";
+  blockId: string | null;
+  index: number;
+  status: MigrationStatus;
+  from: CodeAnchor;
+  to: CodeAnchor | null;
+  secondary: CodeAnchor[];
+  similarity: number;
+  coverage: number;
+  confidence: number;
+  autoApply: boolean;
+  requiresReview: boolean;
+  changesAnchor: boolean;
+  evidence: string[];
+}
+
+export interface MigrationPlan {
+  version: number;
+  courseId: string | null;
+  from: { commit: string | null; sourceVersion: string | null; symbolCount: number; bodied: boolean };
+  to: { commit: string | null; sourceVersion: string | null; symbolCount: number; bodied: boolean };
+  thresholds: Record<string, number>;
+  operations: MigrationOperation[];
+  counts: Record<string, number>;
+  lessons: Array<{ lessonId: string; moduleId: string; title: string; anchors: number; dead: number; review: number; changed: number; status: "intact" | "migrated" | "needs-review" | "orphaned" }>;
+  totals: { anchors: number; unchanged: number; applicable: number; review: number; dead: number; orphanedLessons: number };
+  limitation: string | null;
+}
+
+export interface MigrationResult {
+  available: boolean;
+  reason?: string;
+  plan: MigrationPlan | null;
+  course?: Course | null;
+  migration?: { id: string; at: string; repointed: number; retired: number; added: number; skipped: number };
+  applied?: number;
+  retired?: number;
+  added?: number;
+  skipped?: number;
+  orphaned?: number;
+  reviewRequired?: number;
+  gitRenames?: Array<{ from: string; to: string; similarity: number | null }>;
+  filesCompared?: number;
+  /** True when the migrated course is a shipped example rather than the open one. */
+  preview?: boolean;
+  note?: string;
+}
+
 export interface SigningIdentity {
   algorithm: string;
   keyId: string;
@@ -1388,6 +1451,8 @@ export interface TraceBridge {
   verifyPackageSignature(request: { repository: RepositoryRef; package: CoursePackage }): Promise<{ signature: SignatureVerification; anchorSignature: SignatureVerification; trustedKeyIds: string[] }>;
   packageCourse(request: { repository: RepositoryRef; course: Course; skillGraph?: SkillGraph; embedSource?: boolean }): Promise<CoursePackage>;
   importCourse(request: { repository: RepositoryRef; package: CoursePackage; force?: boolean }): Promise<CourseImportResult>;
+  migrateCourse(request: { repository: RepositoryRef; course: Course; fromCommit?: string | null; apply?: boolean; accept?: "auto" | "all" | "none"; acceptIds?: string[]; retireMissing?: boolean }): Promise<MigrationResult>;
+  revertCourseMigration(request: { repository: RepositoryRef; course: Course; migrationId?: string | null }): Promise<{ course: Course; reverted: boolean; reason?: string; migrationId?: string; restored?: number }>;
   goalPlan(request: { repository: RepositoryRef; goal: LearnerGoal; course?: Course; limit?: number }): Promise<GoalPlan>;
   experiments(request: { repository: RepositoryRef }): Promise<ExperimentReport>;
   setExperimentConsent(request: { repository: RepositoryRef; granted: boolean }): Promise<ExperimentReport>;

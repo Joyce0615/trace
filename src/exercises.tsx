@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Icon, bridge, readableError, repositoryRef } from "./shell";
 import type { ContrastGrade, Course, LearnerGoal, LearnerState, Lesson, PredictionExercise, PredictionOutcome, Repository, ReviewGradeId, SkillGraph, TeachBackGrade } from "./types";
-import type { ActivityState, AnalyticsState, ArchitectureState, ExperimentState, GoalState, SharingState, ChainState, DiagnosisState, EvaluationState, EvidenceState, ExecutableQuizState, ExplanationState, HistoryState, LocalizationState, ReviewState, ScheduleState, TraceState } from "./exercise-state";
+import type { ActivityState, AnalyticsState, ArchitectureState, ExperimentState, GoalState, MigrationState, SharingState, ChainState, DiagnosisState, EvaluationState, EvidenceState, ExecutableQuizState, ExplanationState, HistoryState, LocalizationState, ReviewState, ScheduleState, TraceState } from "./exercise-state";
 
 /**
  * Exercise, visualization, quality, and diagnosis panels (items 26-36).
@@ -726,6 +726,128 @@ export function SharingPanel({ repository, course, skillGraph, state, onState }:
         <small>{result.verification.anchors?.usable ?? 0}/{result.verification.anchors?.total ?? 0} anchors usable{result.repointed ? ` · ${result.repointed} re-pointed` : ""}{result.dropped ? ` · ${result.dropped} dropped` : ""}</small>
         {result.verification.signature && <em data-trust={result.verification.signature.trust}>signature {result.verification.signature.trust}</em>}
         {result.verification.problems.map((problem) => <i key={problem}>{problem}</i>)}
+      </div>}
+    </>}
+  </section>;
+}
+
+const MIGRATION_LABELS: Record<string, string> = {
+  unchanged: "unchanged",
+  edited: "body changed",
+  moved: "moved",
+  "moved-file": "moved file",
+  renamed: "renamed",
+  split: "split",
+  ambiguous: "ambiguous",
+  unverified: "unverifiable",
+  disappeared: "gone",
+  "file-removed": "file deleted",
+};
+
+/**
+ * Course migration (item 46).
+ *
+ * The panel's job is to make the migration arguable. Every operation shows what
+ * it would do, how sure it is, and the evidence that produced it; the ones the
+ * matcher will not take on its own are listed first, because those are the ones
+ * a person actually has to look at.
+ */
+export function MigrationPanel({ repository, course, state, onState, onCourse, onAnchor }: {
+  repository: Repository;
+  course: Course | null;
+  state: MigrationState;
+  onState: (update: Partial<MigrationState>) => void;
+  onCourse: (course: Course) => void;
+  onAnchor: (path: string, line: number) => void;
+}) {
+  const { result, applied, expanded, accept, status } = state;
+  const plan = applied?.plan ?? result?.plan ?? null;
+
+  const check = async () => {
+    if (!course) return;
+    onState({ status: "planning", applied: null });
+    try {
+      const next = await bridge.migrateCourse({ repository: repositoryRef(repository), course });
+      onState({ result: next, status: next.available ? "ready" : "unavailable" });
+    } catch {
+      onState({ status: "error" });
+    }
+  };
+
+  const apply = async () => {
+    if (!course) return;
+    onState({ status: "planning" });
+    try {
+      const next = await bridge.migrateCourse({ repository: repositoryRef(repository), course, apply: true, accept });
+      onState({ applied: next, status: next.available ? "ready" : "unavailable" });
+      // A preview migrates a shipped example, so adopting it would replace the
+      // learner's course with someone else's.
+      if (next.available && next.course && !next.preview) onCourse(next.course);
+    } catch {
+      onState({ status: "error" });
+    }
+  };
+
+  const revert = async () => {
+    if (!course) return;
+    const reverted = await bridge.revertCourseMigration({ repository: repositoryRef(repository), course });
+    if (reverted.reverted) onCourse(reverted.course);
+    onState({ applied: null, result: null, status: "idle" });
+  };
+
+  const ordered = plan
+    ? [...plan.operations].sort((left, right) => Number(right.requiresReview) - Number(left.requiresReview) || left.confidence - right.confidence)
+    : [];
+  const migrated = Boolean((course?.migrations ?? []).length);
+
+  return <section className="migration-panel" data-status={status} data-preview={String(Boolean(result?.preview ?? applied?.preview))}>
+    <div className="migration-head">
+      <span>HAS THE SOURCE MOVED?</span>
+      <button className="ghost" disabled={status === "planning" || !course} onClick={() => void check()}>{status === "planning" ? "Checking…" : plan ? "Re-check" : "Check anchors"}</button>
+    </div>
+    {status === "error" && <p className="migration-note">Migration is unavailable for this repository.</p>}
+    {status === "unavailable" && <p className="migration-note" data-reason="unavailable">{result?.reason ?? applied?.reason}</p>}
+    {(result?.note ?? applied?.note) && <p className="migration-note" data-note="preview">{result?.note ?? applied?.note}</p>}
+    {plan && <>
+      <div className="migration-totals" data-anchors={plan.totals.anchors} data-review={plan.totals.review} data-dead={plan.totals.dead} data-applicable={plan.totals.applicable}>
+        <div><em>{plan.totals.anchors}</em><small>anchors checked</small></div>
+        <div><em>{plan.totals.unchanged}</em><small>unchanged</small></div>
+        <div><em>{plan.totals.applicable}</em><small>repairable</small></div>
+        <div><em>{plan.totals.review}</em><small>need review</small></div>
+      </div>
+      <p className="migration-range" data-from={plan.from.commit ?? ""} data-to={plan.to.commit ?? ""}>
+        {(plan.from.commit ?? "unknown").slice(0, 8)} → {(plan.to.commit ?? "current").slice(0, 8)} · {result?.filesCompared ?? applied?.filesCompared ?? 0} file(s) compared
+      </p>
+      {plan.limitation && <p className="migration-note" data-note="limitation">{plan.limitation}</p>}
+      <div className="migration-ops">
+        {ordered.slice(0, 12).map((operation) => <div
+          className="migration-op"
+          key={operation.id}
+          data-op={operation.id}
+          data-migration-status={operation.status}
+          data-review={String(operation.requiresReview)}
+          data-confidence={operation.confidence}
+        >
+          <button className="migration-op-head" onClick={() => onState({ expanded: expanded === operation.id ? null : operation.id })}>
+            <strong>{MIGRATION_LABELS[operation.status] ?? operation.status}</strong>
+            <span>{operation.from.symbol ?? operation.from.path.split("/").at(-1)}</span>
+            <small>{operation.to ? `→ ${operation.to.path.split("/").at(-1)}:${operation.to.line}` : "no successor"}</small>
+          </button>
+          {expanded === operation.id && <div className="migration-evidence">
+            {operation.evidence.map((line) => <p key={line}>{line}</p>)}
+            {operation.to && <button className="ghost" onClick={() => onAnchor(operation.to!.path, operation.to!.line)}>Open {operation.to.path}:{operation.to.line}</button>}
+          </div>}
+        </div>)}
+      </div>
+      <div className="migration-actions">
+        <label className="migration-toggle"><input type="checkbox" checked={accept === "all"} onChange={(event) => onState({ accept: event.target.checked ? "all" : "auto" })} />Also take the ones that need review</label>
+        <button className="ghost" disabled={status === "planning"} onClick={() => void apply()}>Migrate this course</button>
+        {migrated && <button className="ghost" onClick={() => void revert()}>Undo migration</button>}
+      </div>
+      {applied && <div className="migration-result" data-applied={applied.applied} data-retired={applied.retired} data-orphaned={applied.orphaned} data-preview={String(Boolean(applied.preview))}>
+        <strong>{applied.applied} re-pointed</strong>
+        <small>{applied.retired} retired · {applied.added} added · {applied.reviewRequired} still need review</small>
+        {(applied.plan?.lessons ?? []).filter((lesson) => lesson.status !== "intact").slice(0, 5).map((lesson) => <i key={lesson.lessonId} data-lesson={lesson.lessonId} data-lesson-status={lesson.status}>{lesson.title}: {lesson.status}</i>)}
       </div>}
     </>}
   </section>;

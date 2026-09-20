@@ -41,6 +41,8 @@ contextBridge.exposeInMainWorld("trace", {
   verifyPackageSignature: (request) => ipcRenderer.invoke("course:verify-signature", request),
   packageCourse: (request) => ipcRenderer.invoke("course:package", request),
   importCourse: (request) => ipcRenderer.invoke("course:import", request),
+  migrateCourse: (request) => ipcRenderer.invoke("course:migrate", request),
+  revertCourseMigration: (request) => ipcRenderer.invoke("course:revert-migration", request),
   goalPlan: (request) => ipcRenderer.invoke("goals:plan", request),
   experiments: (request) => ipcRenderer.invoke("experiment:state", request),
   setExperimentConsent: (request) => ipcRenderer.invoke("experiment:consent", request),

@@ -283,6 +283,35 @@ try {
   assert.equal(browserSignature.anchorSignature.trust, "unsigned");
   await page.screenshot({ path: path.join(artifactDirectory, "course-package.png") });
 
+  // Item 46: the same matcher the desktop app runs, over a shipped earlier
+  // snapshot of the fixture, with the four repairs it can tell apart.
+  const migration = page.locator(".migration-panel");
+  await migration.waitFor();
+  await migration.getByRole("button", { name: "Check anchors" }).click();
+  await migration.locator(".migration-totals").waitFor();
+  assert.equal(await migration.getAttribute("data-preview"), "true", "the demo says the migrated course is the shipped example");
+  assert.match(await migration.locator('[data-note="preview"]').innerText(), /no git history/i);
+  const totals = migration.locator(".migration-totals");
+  assert.equal(await totals.getAttribute("data-anchors"), "5");
+  assert.equal(await totals.getAttribute("data-dead"), "1");
+  const migrationStatuses = await migration.locator(".migration-op").evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-migration-status")));
+  for (const expected of ["moved", "renamed", "split", "file-removed", "unchanged"]) {
+    assert.ok(migrationStatuses.includes(expected), `${expected} missing from ${migrationStatuses.join(", ")}`);
+  }
+  // The ones needing a person are listed first.
+  assert.equal(await migration.locator(".migration-op").first().getAttribute("data-review"), "true");
+  // Evidence is shown, not just a verdict.
+  await migration.locator('.migration-op[data-migration-status="split"] .migration-op-head').click();
+  assert.match(await migration.locator('.migration-op[data-migration-status="split"] .migration-evidence').innerText(), /shares its body with 'step'/);
+  await migration.getByRole("button", { name: "Migrate this course" }).click();
+  await migration.locator(".migration-result").waitFor();
+  const migrationResult = migration.locator(".migration-result");
+  assert.equal(await migrationResult.getAttribute("data-applied"), "2", "the move and the rename are safe; the split is not");
+  assert.equal(await migrationResult.getAttribute("data-retired"), "1");
+  assert.equal(await migrationResult.getAttribute("data-orphaned"), "1");
+  assert.match(await migrationResult.innerText(), /Prefix Cache Lookups: orphaned/);
+  await page.screenshot({ path: path.join(artifactDirectory, "course-migration.png") });
+
   // Item 42: consent is the gate, and it is reversible.
   const experiments = page.locator(".experiment-panel");
   await experiments.waitFor();

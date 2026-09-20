@@ -341,6 +341,22 @@ export const IPC_SCHEMAS = {
     repository: repositoryReference,
     package: s.opaque(),
   }),
+  "course:migrate": s.object({
+    repository: repositoryReference,
+    course: s.opaque(),
+    // A revision, not a path: constrained here so the handler never interpolates
+    // renderer text into a git argument.
+    fromCommit: s.string({ maxLength: 120, pattern: /^[0-9a-zA-Z_./^~-]+$/, optional: true, nullable: true }),
+    apply: s.boolean({ optional: true }),
+    accept: s.literal(["auto", "all", "none"], { optional: true }),
+    acceptIds: s.array(s.string({ maxLength: 32 }), { maxItems: 500, optional: true }),
+    retireMissing: s.boolean({ optional: true }),
+  }),
+  "course:revert-migration": s.object({
+    repository: repositoryReference,
+    course: s.opaque(),
+    migrationId: s.string({ maxLength: 160, optional: true, nullable: true }),
+  }),
   "goals:plan": s.object({
     repository: repositoryReference,
     goal: s.literal(GOAL_IDS),

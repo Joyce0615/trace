@@ -1,4 +1,4 @@
-import type { ActivitySet, AnalyticsReport, Architecture, CourseImportResult, CoursePackage, ExperimentReport, GoalPlan, LearnerGoal, ContrastGrade, DiagnosisReport, EvaluationReport, EvidenceImport, ExecutableQuiz, ExplanationGrade, ExplanationTask, HintRung, HistorySummary, PredictionOutcome, TeachBackGrade, Lesson, ProbeGrade, QuizGrade, ReviewPlan, ReviewResult, SymbolFlow, CallChain, LocalizationExercise, LocalizationHint, LocalizationScore, PredictionExercise, PredictionGrade, RaceReport, RaceTask, TraceRunResult, TraceRuntime } from "./types";
+import type { ActivitySet, AnalyticsReport, Architecture, CourseImportResult, CoursePackage, ExperimentReport, MigrationResult, GoalPlan, LearnerGoal, ContrastGrade, DiagnosisReport, EvaluationReport, EvidenceImport, ExecutableQuiz, ExplanationGrade, ExplanationTask, HintRung, HistorySummary, PredictionOutcome, TeachBackGrade, Lesson, ProbeGrade, QuizGrade, ReviewPlan, ReviewResult, SymbolFlow, CallChain, LocalizationExercise, LocalizationHint, LocalizationScore, PredictionExercise, PredictionGrade, RaceReport, RaceTask, TraceRunResult, TraceRuntime } from "./types";
 
 /**
  * Exercise state shapes.
@@ -180,3 +180,14 @@ export type SharingState = {
 };
 
 export const emptySharingState: SharingState = { packaged: null, result: null, embedSource: false, status: "idle" };
+
+/** Item 46. The plan is kept separate from the applied result so a reviewer can compare them. */
+export type MigrationState = {
+  result: MigrationResult | null;
+  applied: MigrationResult | null;
+  expanded: string | null;
+  accept: "auto" | "all";
+  status: "idle" | "planning" | "ready" | "unavailable" | "error";
+};
+
+export const emptyMigrationState: MigrationState = { result: null, applied: null, expanded: null, accept: "auto", status: "idle" };

@@ -981,6 +981,184 @@ try {
   assert.equal(signingAudit.goodImport.verification.signature.verified, true);
   assert.equal(signingAudit.goodImport.verification.anchorSignature.verified, true);
 
+  // Item 46: migrate real courses across 400 commits of real FlashInfer
+  // history, with the previous version reconstructed from the object database
+  // rather than by checking anything out.
+  const historicCommit = "6f651b63fce45753f47c0ed7d7651a6daa2f1cf8";
+  const workingTreeBefore = await page.evaluate(() => window.trace.readFile(window.traceWorkspace.repository.rootPath, "flashinfer/__main__.py"));
+  // A course really written against that commit: every anchor below is a
+  // definition at the line it occupied there.
+  const historicCourse = {
+    id: "flashinfer-historic",
+    sourceCommit: historicCommit,
+    modules: [{
+      id: "m", number: "01", title: "Historic", summary: "", lessons: [
+        {
+          id: "cli", title: "The command line", objective: "", summary: "", duration: 10, difficulty: "foundation", kind: "lesson", status: "ready",
+          anchors: [
+            { path: "flashinfer/__main__.py", line: 38, symbol: "_download_cubin" },
+            { path: "flashinfer/__main__.py", line: 68, symbol: "cli" },
+          ],
+          quiz: { question: "", hint: "" },
+          content: [{ id: "b", type: "timeline", title: "One invocation", steps: [
+            { label: "Register", detail: "", anchor: { path: "flashinfer/__main__.py", line: 47, symbol: "_ensure_modules_registered" } },
+          ] }],
+        },
+        {
+          id: "mnnvl", title: "Multi-node NVLink", objective: "", summary: "", duration: 10, difficulty: "foundation", kind: "lesson", status: "ready",
+          anchors: [
+            { path: "flashinfer/comm/mnnvl.py", line: 63, symbol: "round_up" },
+            { path: "flashinfer/comm/mnnvl.py", line: 154, symbol: "CommBackend" },
+          ],
+          quiz: { question: "", hint: "" },
+        },
+        {
+          id: "utils", title: "Utilities", objective: "", summary: "", duration: 10, difficulty: "foundation", kind: "lesson", status: "ready",
+          anchors: [{ path: "flashinfer/utils.py", line: 32, symbol: "PosEncodingMode" }],
+          quiz: { question: "", hint: "" },
+        },
+      ],
+    }],
+  };
+  const migrationAudit = await page.evaluate(async ({ commit, historic }) => {
+    const workspace = window.traceWorkspace;
+    const repository = { id: workspace.repository.id, rootPath: workspace.repository.rootPath };
+    const planned = await window.trace.migrateCourse({ repository, course: historic, fromCommit: commit });
+    const auto = await window.trace.migrateCourse({ repository, course: historic, fromCommit: commit, apply: true });
+    const all = await window.trace.migrateCourse({ repository, course: historic, fromCommit: commit, apply: true, accept: "all" });
+    const none = await window.trace.migrateCourse({ repository, course: historic, fromCommit: commit, apply: true, accept: "none" });
+    const reverted = auto.course ? await window.trace.revertCourseMigration({ repository, course: auto.course }) : null;
+    // The generated course for this repository, which anchors whole files as
+    // well as definitions, must survive the same 400 commits without loss.
+    const starter = await window.trace.migrateCourse({ repository, course: workspace.course, fromCommit: commit, apply: true });
+    // A commit this repository has never seen is refused, not guessed at.
+    const unknown = await window.trace.migrateCourse({ repository, course: historic, fromCommit: "0".repeat(40) });
+    // Migrating onto the commit a course was written for changes nothing.
+    const selfMigration = await window.trace.migrateCourse({ repository, course: workspace.course, fromCommit: workspace.repository.head });
+    let rejected = null;
+    try {
+      await window.trace.migrateCourse({ repository, course: historic, fromCommit: "; rm -rf /" });
+    } catch (error) {
+      rejected = error.message;
+    }
+    return { planned, auto, all, none, reverted, starter, unknown, selfMigration, rejected, starterCourse: workspace.course };
+  }, { commit: historicCommit, historic: historicCourse });
+
+  const migrationPlan = migrationAudit.planned.plan;
+  assert.equal(migrationAudit.planned.available, true, migrationAudit.planned.reason);
+  assert.equal(migrationPlan.from.commit, historicCommit);
+  assert.equal(migrationPlan.to.commit, await page.evaluate(() => window.traceWorkspace.repository.head));
+  assert.equal(migrationPlan.totals.anchors, 6);
+  assert.equal(migrationPlan.limitation, null, "both versions had real bodies to compare");
+  assert.equal(migrationAudit.planned.filesCompared, 3);
+  // Every operation carries evidence and a status this build understands.
+  const knownStatuses = new Set(["unchanged", "edited", "moved", "moved-file", "renamed", "split", "ambiguous", "unverified", "disappeared", "file-removed"]);
+  for (const operation of migrationPlan.operations) {
+    assert.ok(knownStatuses.has(operation.status), operation.status);
+    assert.ok(operation.evidence.length >= 1, JSON.stringify(operation));
+    assert.ok(operation.confidence >= 0 && operation.confidence <= 1, String(operation.confidence));
+    if (operation.autoApply) assert.ok(operation.to, `an auto-applied operation must have a successor: ${JSON.stringify(operation)}`);
+  }
+  // Five definitions really moved inside their own files, and each was found.
+  const migrationBySymbol = Object.fromEntries(migrationPlan.operations.map((operation) => [operation.from.symbol, operation]));
+  assert.equal(migrationPlan.counts.moved, 5, JSON.stringify(migrationPlan.counts));
+  assert.equal(migrationBySymbol._download_cubin.to.line, 49);
+  assert.equal(migrationBySymbol.cli.to.line, 302, "a definition that moved 234 lines is still the same definition");
+  assert.equal(migrationBySymbol._ensure_modules_registered.to.line, 58, "a timeline step migrates like any other anchor");
+  assert.equal(migrationBySymbol.round_up.to.line, 68);
+  assert.equal(migrationBySymbol.PosEncodingMode.to.line, 37);
+  assert.ok(migrationBySymbol.cli.evidence.some((line) => /moved from line 68 to line 302/.test(line)), JSON.stringify(migrationBySymbol.cli.evidence));
+  // `CommBackend` left mnnvl.py for a sibling module and was rewritten as a
+  // Protocol on the way, so it is found but held for review rather than taken.
+  const relocated = migrationBySymbol.CommBackend;
+  assert.equal(relocated.status, "moved-file");
+  assert.equal(relocated.to.path, "flashinfer/comm/abstractions.py");
+  assert.equal(relocated.to.line, 21);
+  assert.equal(relocated.autoApply, false, `a 0.23-similar body is a lead, not a certainty (${relocated.similarity})`);
+  assert.ok(relocated.similarity < 0.5, String(relocated.similarity));
+  // Everything re-pointed lands on a line that really declares that symbol in
+  // the current working tree — checked against the file, not against the index.
+  const repairs = migrationPlan.operations.filter((operation) => operation.changesAnchor);
+  assert.equal(repairs.length, 6);
+  const repairTargets = await page.evaluate(async (targets) => {
+    const rootPath = window.traceWorkspace.repository.rootPath;
+    const seen = {};
+    for (const target of targets) {
+      const file = await window.trace.readFile(rootPath, target.path);
+      seen[`${target.path}:${target.line}`] = String(file).split("\n")[target.line - 1] ?? "";
+    }
+    return seen;
+  }, repairs.map((repair) => repair.to));
+  for (const repair of repairs) {
+    const line = repairTargets[`${repair.to.path}:${repair.to.line}`];
+    assert.ok(new RegExp(`\\b${repair.to.symbol}\\b`).test(line), `${repair.to.path}:${repair.to.line} does not declare ${repair.to.symbol}: ${line}`);
+  }
+
+  const autoMigration = migrationAudit.auto;
+  const migrationIndexedPaths = new Set(await page.evaluate(() => window.traceWorkspace.repository.files.map((file) => file.path)));
+  assert.equal(autoMigration.applied, 5, "the five in-file moves are safe; the cross-file relocation is not");
+  assert.equal(autoMigration.reviewRequired, 1);
+  assert.equal(autoMigration.retired, 0);
+  assert.equal(autoMigration.course.sourceCommit, migrationPlan.to.commit);
+  assert.equal(autoMigration.course.migrations.length, 1);
+  const migratedAnchors = autoMigration.course.modules.flatMap((module) => module.lessons).flatMap((lesson) => lesson.anchors);
+  assert.ok(migratedAnchors.every((anchor) => migrationIndexedPaths.has(anchor.path)), "a migrated anchor left the index");
+  assert.deepEqual(autoMigration.course.modules[0].lessons[1].anchors, [
+    { path: "flashinfer/comm/mnnvl.py", line: 68, symbol: "round_up" },
+    { path: "flashinfer/comm/mnnvl.py", line: 154, symbol: "CommBackend" },
+  ], "an unreviewed relocation leaves the anchor exactly as the author wrote it");
+  assert.ok(autoMigration.course.modules[0].lessons[1].reviewNotes.some((note) => /abstractions\.py/.test(note)), JSON.stringify(autoMigration.course.modules[0].lessons[1].reviewNotes));
+  // Accepting everything takes the relocation too.
+  assert.equal(migrationAudit.all.applied, 6);
+  assert.deepEqual(migrationAudit.all.course.modules[0].lessons[1].anchors[1], { path: "flashinfer/comm/abstractions.py", line: 21, symbol: "CommBackend" });
+  // Nothing accepted, nothing re-pointed.
+  assert.equal(migrationAudit.none.applied, 0);
+  // The undo is exact.
+  assert.equal(migrationAudit.reverted.reverted, true);
+  assert.equal(JSON.stringify(migrationAudit.reverted.course.modules), JSON.stringify(historicCourse.modules), "reverting did not restore the course exactly");
+
+  // The generated FlashInfer course loses nothing across the same 400 commits:
+  // whole-file anchors are reported on rather than retired, and no live
+  // definition is called deleted. Both of those were defects found here.
+  const starterMigration = migrationAudit.starter;
+  const starterPlan = starterMigration.plan;
+  assert.ok(starterPlan.totals.anchors >= 20, String(starterPlan.totals.anchors));
+  assert.equal(starterMigration.retired, 0, `the generated course lost ${starterMigration.retired} anchors: ${JSON.stringify(starterPlan.counts)}`);
+  assert.equal(starterPlan.totals.orphanedLessons, 0);
+  assert.equal(starterPlan.counts.disappeared ?? 0, 0, "no definition that is still indexed may be reported as gone");
+  const currentNames = new Set(await page.evaluate(() => window.traceWorkspace.repository.symbols.map((symbol) => symbol.name)));
+  for (const operation of starterPlan.operations.filter((entry) => !entry.from.symbol)) {
+    assert.notEqual(operation.status, "disappeared", `a file-level anchor cannot be a vanished symbol: ${JSON.stringify(operation)}`);
+    if (migrationIndexedPaths.has(operation.from.path)) assert.notEqual(operation.status, "file-removed");
+  }
+  for (const operation of starterPlan.operations.filter((entry) => entry.status === "disappeared")) {
+    assert.equal(currentNames.has(operation.from.symbol), false, `${operation.from.symbol} is still in the index but was reported as gone`);
+  }
+
+  // Unknown and hostile revisions are refused.
+  assert.equal(migrationAudit.unknown.available, false);
+  assert.match(migrationAudit.unknown.reason, /not in this repository's history/);
+  assert.ok(migrationAudit.rejected, "a shell-injecting revision must be rejected by the IPC schema");
+  assert.match(migrationAudit.rejected, /unexpected format/);
+  // Migrating a course onto the commit it was written for changes nothing.
+  assert.equal(migrationAudit.selfMigration.plan.totals.applicable, 0, JSON.stringify(migrationAudit.selfMigration.plan.counts));
+  assert.equal(migrationAudit.selfMigration.plan.totals.dead, 0);
+  // Reading history never touched the working tree.
+  const workingTreeAfter = await page.evaluate(() => window.trace.readFile(window.traceWorkspace.repository.rootPath, "flashinfer/__main__.py"));
+  assert.equal(typeof workingTreeBefore, "string");
+  assert.equal(workingTreeAfter, workingTreeBefore, "reconstructing an old version modified the working tree");
+  const migrationReport = {
+    fromCommit: historicCommit.slice(0, 8),
+    filesCompared: migrationAudit.planned.filesCompared,
+    counts: migrationPlan.counts,
+    applied: autoMigration.applied,
+    heldForReview: autoMigration.reviewRequired,
+    relocation: `${relocated.from.path}:${relocated.from.line} -> ${relocated.to.path}:${relocated.to.line} (similarity ${relocated.similarity})`,
+    biggestMove: `cli ${migrationBySymbol.cli.from.line} -> ${migrationBySymbol.cli.to.line}`,
+    revertExact: JSON.stringify(migrationAudit.reverted.course.modules) === JSON.stringify(historicCourse.modules),
+    starterCourse: { anchors: starterPlan.totals.anchors, counts: starterPlan.counts, retired: starterMigration.retired, orphaned: starterPlan.totals.orphanedLessons },
+  };
+
   // Item 43: five goals over the same real repository, each ranked from counted
   // source signals rather than from a label.
   const goalAudit = await page.evaluate(async () => {
@@ -1401,6 +1579,7 @@ try {
     },
     diagnosis: { skills: diagnosis.skills.length, assessed: diagnosis.summary.assessed, meanConfidence: diagnosis.summary.meanConfidence, brier: diagnosis.summary.meanBrier, overconfident: diagnosis.summary.overconfidentSkills, misconceptions: diagnosis.summary.misconceptionCounts },
     signing: { algorithm: signingAudit.identity.algorithm, keyId: `${signingAudit.identity.keyId.slice(0, 12)}…`, packageSealed: signingAudit.asIs.signature.verified, anchorsSealed: signingAudit.asIs.anchorSignature.verified, tamperReason: signingAudit.doctoredCheck.signature.reason, tamperedImport: signingAudit.doctoredImport.imported, trustBefore: signingAudit.beforeTrust.signature.trust, trustAfter: signingAudit.afterTrust.signature.trust },
+    migration: migrationReport,
     coursePackage: { format: coursePackage.format, commit: (coursePackage.provenance.commit ?? "").slice(0, 8), anchors: coursePackage.integrity.anchorCount, license: coursePackage.license.id, policy: coursePackage.license.policy, embeddedFiles: packageAudit.requested.integrity.excerptCount, roundTrip: packageAudit.roundTrip.verification.verdict, foreign: packageAudit.foreign.verification.verdict },
     goals: Object.fromEntries(goalIds.map((goal) => [goal, { top: rankings[goal][0], targets: rankings[goal].length, topReasons: goalAudit.plans[goal].targets[0].reasons.map((reason) => reason.detail) }])),
     experiments: { arms: experimentAudit.armsSeen.map(([arm, observed]) => `${arm}:declared=${observed.declared},applied=${observed.applied},queued=${observed.queued}`), unconsentedLimit: experimentAudit.controlPlan.parameters.dailyLimit, assignedArm: experimentAudit.consented.assignments.map((item) => `${item.experimentId}=${item.arm}`), assignedLimit, explicitLimit: experimentAudit.explicitPlan.parameters.dailyLimit, observations: experimentAudit.afterObservation.observations, verdict: limitResult.verdict, afterWithdrawal: experimentAudit.afterWithdrawalPlan.parameters.dailyLimit, deleted: experimentAudit.forgotten.deletedObservations },

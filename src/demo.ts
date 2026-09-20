@@ -718,6 +718,37 @@ export const browserBridge: TraceBridge = {
     const packaging = await import("../electron/course-package.mjs");
     return packaging.importCourse(request.package, nanoRepository, { force: Boolean(request.force) });
   },
+  async migrateCourse(request) {
+    // The desktop app reconstructs the previous version with `git show`. The
+    // browser has no object database, so the demo ships a real earlier version
+    // of three fixture files and the course written against it, and runs the
+    // same matcher over them. The result is marked `preview` because the course
+    // it migrates is that shipped example, not the one on screen.
+    const migration = await import("../electron/course-migration.mjs");
+    const fixture = await import("./nano-previous");
+    const before = migration.buildSymbolSnapshot(fixture.nanoPreviousSymbols, fixture.nanoPreviousSources, {
+      label: "previous", commit: fixture.NANO_PREVIOUS_COMMIT, files: Object.keys(fixture.nanoPreviousSources),
+    });
+    const after = migration.buildSymbolSnapshot(fixture.nanoCurrentSymbols, nanoSourceByPath, {
+      label: "current", commit: nanoRepository.head, sourceVersion: nanoRepository.versionId, files: nanoRepository.files.map((file) => file.path),
+    });
+    const plan = migration.planMigration(fixture.nanoLegacyCourse, before, after);
+    const shared = {
+      available: true,
+      preview: true,
+      note: "The browser demo has no git history, so this compares a shipped earlier snapshot of nano-vllm against the current one.",
+      plan,
+      filesCompared: Object.keys(fixture.nanoPreviousSources).length,
+      gitRenames: [],
+    };
+    if (!request.apply) return { ...shared, course: null };
+    const accept = request.acceptIds ?? (request.accept === "none" ? [] : request.accept ?? "auto");
+    return { ...shared, ...migration.applyMigration(fixture.nanoLegacyCourse, plan, { accept, retireMissing: request.retireMissing ?? true }) };
+  },
+  async revertCourseMigration(request) {
+    const migration = await import("../electron/course-migration.mjs");
+    return migration.revertMigration(request.course, request.migrationId ?? null);
+  },
   async goalPlan(request) {
     // The demo ranks with the same signal detectors as the desktop app.
     const goals = await import("../electron/goals.mjs");

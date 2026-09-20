@@ -180,6 +180,53 @@ export async function readCommits(rootPath, options = {}) {
   return { ok: true, commits: parseHistory(meta.stdout, stats.ok ? stats.stdout : ""), limits };
 }
 
+/**
+ * Read one file as it was at a revision, without touching the working tree.
+ *
+ * Course migration needs the *previous* version of a file to compare bodies
+ * against. Checking the old commit out would be a consequential edit to the
+ * learner's repository — and would fail outright on a dirty tree — so the blob
+ * is read straight out of the object database instead.
+ */
+export async function readFileAtCommit(rootPath, commit, filePath, options = {}) {
+  const limits = { ...DEFAULT_HISTORY_LIMITS, ...(options.limits ?? {}) };
+  if (!/^[0-9a-zA-Z_./^~-]{1,120}$/.test(String(commit ?? "")) || !filePath) return { ok: false, content: null, reason: "unreadable-revision" };
+  const read = await runGit(rootPath, ["show", `${commit}:${filePath}`], { ...limits, maxOutputBytes: options.maxBytes ?? 600_000 });
+  if (!read.ok) return { ok: false, content: null, reason: read.stderr.trim() || "not-in-revision" };
+  return { ok: true, content: read.stdout, reason: null };
+}
+
+/** Paths tracked at a revision, so "the file is gone" stays distinguishable from "the file has no definitions". */
+export async function listFilesAtCommit(rootPath, commit, options = {}) {
+  const limits = { ...DEFAULT_HISTORY_LIMITS, ...(options.limits ?? {}) };
+  if (!/^[0-9a-zA-Z_./^~-]{1,120}$/.test(String(commit ?? ""))) return { ok: false, files: [] };
+  const read = await runGit(rootPath, ["ls-tree", "-r", "--name-only", commit], limits);
+  if (!read.ok) return { ok: false, files: [] };
+  return { ok: true, files: read.stdout.split("\n").map((line) => line.trim()).filter(Boolean) };
+}
+
+/**
+ * Git's own rename detection between two revisions.
+ *
+ * Body similarity finds a definition that moved between files even when git
+ * reports no rename, but where git *does* report one it is stronger evidence
+ * than a heuristic — and it is also what tells a migration which new files are
+ * worth reading at all.
+ */
+export async function detectRenames(rootPath, fromCommit, toCommit = "HEAD", options = {}) {
+  const limits = { ...DEFAULT_HISTORY_LIMITS, ...(options.limits ?? {}) };
+  if (!/^[0-9a-zA-Z_./^~-]{1,120}$/.test(String(fromCommit ?? ""))) return { ok: false, renames: [] };
+  const read = await runGit(rootPath, ["diff", "--find-renames", "--name-status", "-M", `${fromCommit}..${toCommit}`], limits);
+  if (!read.ok) return { ok: false, renames: [] };
+  const renames = [];
+  for (const line of read.stdout.split("\n")) {
+    const parts = line.split("\t");
+    if (!/^R\d*$/.test(parts[0] ?? "") || parts.length < 3) continue;
+    renames.push({ from: parts[1], to: parts[2], similarity: Number(parts[0].slice(1)) / 100 || null });
+  }
+  return { ok: true, renames };
+}
+
 /** Read and summarize repository history. Returns `available:false` outside git. */
 export async function historySummary(rootPath, options = {}) {
   const limits = { ...DEFAULT_HISTORY_LIMITS, ...(options.limits ?? {}) };

@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 import { generateStarterCourse, normalizeAgentCourse } from "../electron/course.mjs";
 import { loadCourse, saveCourse } from "../electron/course-store.mjs";
 import { createPracticeSession, inspectPracticeSession, removePracticeSession } from "../electron/practice.mjs";
-import { DEFAULT_INDEX_LIMITS, IndexCancelledError, analysisCacheStats, analyzeFile, fileImportance, inspectRepository, languageFamily, languageFor, readRepositoryFile, resetAnalysisCache } from "../electron/repository.mjs";
+import { DEFAULT_INDEX_LIMITS, IndexCancelledError, analysisCacheStats, analyzeContent, analyzeFile, fileImportance, inspectRepository, languageFamily, languageFor, readRepositoryFile, resetAnalysisCache } from "../electron/repository.mjs";
 import { buildKnowledgeGraph, loadKnowledgeGraph, neighborhood, saveKnowledgeGraph } from "../electron/knowledge-graph.mjs";
 import { RemoteSourceError, cloneArguments, cloneDestination, cloneEnvironment, looksRemote, parseRemoteSource, summarizeSubmodules, verifyExistingClone } from "../electron/clone-guard.mjs";
 import { IPC_PROTOCOL_VERSION, IPC_SCHEMAS, MAX_PAYLOAD_BYTES, MAX_PAYLOAD_DEPTH, registerValidatedHandlers, schemaFor, validatePayload } from "../electron/ipc-schema.mjs";
@@ -18,10 +18,11 @@ import { PROMPT_ISOLATION_VERSION, buildIsolatedPrompt, createNonce, detectInjec
 import { tutorPrompt } from "../electron/agents.mjs";
 import { SECRET_SCANNER_VERSION, anonymizePath, redact, redactValue, scanText, shannonEntropy, summarizeFindings } from "../electron/secret-scanner.mjs";
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
-import { GIT_HISTORY_VERSION, busFactor, historyLessons, historySummary, parseHistory, readCommits } from "../electron/git-history.mjs";
+import { GIT_HISTORY_VERSION, busFactor, detectRenames, historyLessons, historySummary, listFilesAtCommit, parseHistory, readCommits, readFileAtCommit } from "../electron/git-history.mjs";
 import { MISCONCEPTIONS, MISCONCEPTION_VERSION, buildProbe, calibrateSkill, detectMisconceptions, diagnoseLearner, gradeProbe } from "../electron/misconception.mjs";
 import { SIGNING_ALGORITHM, SIGNING_VERSION, anchorPayload, assessmentPayload, canonicalize, createKeyPair, digestOf, keyIdFor, loadOrCreateKeyPair, loadTrustedKeys, packagePayload, publicIdentity, responsePayload, setKeyTrust, signPackage, signPayload, verifyPackageSignature, verifyPayload } from "../electron/signing.mjs";
 import { COURSE_PACKAGE_FORMAT, COURSE_PACKAGE_VERSION, anchorManifest, detectLicense, importCourse, packageCourse, verifyPackage } from "../electron/course-package.mjs";
+import { DEFAULT_MIGRATION_THRESHOLDS, MIGRATION_VERSION, applyMigration, bodyTokens, buildSymbolSnapshot, courseAnchorSites, coverage, jaccard, planMigration, revertMigration, shingles } from "../electron/course-migration.mjs";
 import { GOALS, GOALS_VERSION, goalKeywords, goalPlan, orderLessonsForGoal, rankTargets, resolveGoal } from "../electron/goals.mjs";
 import { EXPERIMENTS, EXPERIMENT_VERSION, OBSERVATION_FIELDS, activeAssignments, analyzeExperiment, assignArm, consentState, experimentReport, hash32, sanitizeObservation, settingsFor } from "../electron/experiments.mjs";
 import { forgetEverything, loadExperimentState, recordObservation, setConsent } from "../electron/experiment-store.mjs";
@@ -760,7 +761,7 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
     "learning:diagnose", "learning:probe", "learning:schedule", "learning:review",
     "quiz:build", "quiz:grade", "explain:task", "explain:grade",
     "activity:build", "activity:grade", "hint:next", "analytics:report",
-    "course:package", "course:import", "course:verify-signature",
+    "course:package", "course:import", "course:verify-signature", "course:migrate", "course:revert-migration",
     "signing:identity", "signing:trust", "goals:plan", "experiment:state", "experiment:consent", "experiment:forget", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
@@ -4166,4 +4167,431 @@ test("signatures seal courses, anchors, assessments, and cached agent output", a
   assert.deepEqual(await loadTrustedKeys(keyDirectory), ["abc123"]);
   assert.deepEqual(await setKeyTrust(keyDirectory, "abc123", true), ["abc123"], "trusting twice is idempotent");
   assert.deepEqual(await setKeyTrust(keyDirectory, "abc123", false), []);
+});
+
+test("course migrations follow symbols that move, split, are renamed, or disappear", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-migration-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  const git = (...args) => execFileAsync("git", args, { cwd: rootPath });
+
+  // --- Version one ---------------------------------------------------------
+  await mkdir(path.join(rootPath, "app"), { recursive: true });
+  const engineV1 = [
+    "# entry point for the engine",
+    "class Engine:",
+    "    def add_request(self, prompt):",
+    "        seq = Sequence(prompt)",
+    "        self.scheduler.add(seq)",
+    "        return seq",
+    "",
+    "    def generate(self, prompts):",
+    "        outputs = {}",
+    "        for prompt in prompts:",
+    "            self.add_request(prompt)",
+    "        while not self.done():",
+    "            seqs = self.scheduler.schedule()",
+    "            tokens = self.runner.run(seqs)",
+    "            self.scheduler.finish_batch(seqs, tokens)",
+    "            for seq in seqs:",
+    "                if seq.finished:",
+    "                    outputs[seq.id] = seq.tokens",
+    "        return outputs",
+    "",
+  ].join("\n");
+  const schedulerV1 = [
+    "class Scheduler:",
+    "    def schedule(self):",
+    "        picked = []",
+    "        while self.waiting and len(picked) < self.max_seqs:",
+    "            seq = self.waiting.popleft()",
+    "            self.blocks.allocate(seq)",
+    "            picked.append(seq)",
+    "        return picked",
+    "",
+    "    def finish_batch(self, seqs, tokens):",
+    "        for seq, token in zip(seqs, tokens):",
+    "            seq.append(token)",
+    "            if token == self.eos:",
+    "                seq.finished = True",
+    "                self.blocks.release(seq)",
+    "        return seqs",
+    "",
+  ].join("\n");
+  const cacheV1 = [
+    "class PrefixCache:",
+    "    def lookup(self, token_ids):",
+    "        digest = self.hash(token_ids)",
+    "        entry = self.entries.get(digest)",
+    "        if entry is None:",
+    "            return None",
+    "        entry.hits += 1",
+    "        return entry.blocks",
+    "",
+  ].join("\n");
+  const helpersV1 = [
+    "def clamp(value, low, high):",
+    "    if value < low:",
+    "        return low",
+    "    if value > high:",
+    "        return high",
+    "    return value",
+    "",
+  ].join("\n");
+  await writeFile(path.join(rootPath, "app", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "app", "engine.py"), engineV1);
+  await writeFile(path.join(rootPath, "app", "scheduler.py"), schedulerV1);
+  await writeFile(path.join(rootPath, "app", "prefix_cache.py"), cacheV1);
+  await writeFile(path.join(rootPath, "app", "helpers.py"), helpersV1);
+  await git("init", "-q");
+  await git("config", "user.email", "a@b.c");
+  await git("config", "user.name", "Tester");
+  await git("add", "-A");
+  await git("commit", "-qm", "v1");
+  const firstCommit = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: rootPath })).stdout.trim();
+
+  // --- Version two: one of each kind of change ----------------------------
+  const engineV2 = [
+    "class Engine:",
+    "    def add_request(self, prompt):",
+    "        seq = Sequence(prompt)",
+    "        self.scheduler.add(seq)",
+    "        return seq",
+    "",
+    "    def step(self):",
+    "        seqs = self.scheduler.schedule()",
+    "        tokens = self.runner.run(seqs)",
+    "        self.scheduler.postprocess(seqs, tokens)",
+    "        return [(seq.id, seq.tokens) for seq in seqs if seq.finished]",
+    "",
+    "    def generate(self, prompts):",
+    "        outputs = {}",
+    "        for prompt in prompts:",
+    "            self.add_request(prompt)",
+    "        while not self.done():",
+    "            for seq_id, tokens in self.step():",
+    "                outputs[seq_id] = tokens",
+    "        return outputs",
+    "",
+  ].join("\n");
+  const schedulerV2 = schedulerV1.replace("def finish_batch(", "def postprocess(");
+  await writeFile(path.join(rootPath, "app", "engine.py"), engineV2);
+  await writeFile(path.join(rootPath, "app", "scheduler.py"), schedulerV2);
+  await rm(path.join(rootPath, "app", "prefix_cache.py"));
+  await mkdir(path.join(rootPath, "app", "util"), { recursive: true });
+  await writeFile(path.join(rootPath, "app", "util", "limits.py"), helpersV1);
+  await rm(path.join(rootPath, "app", "helpers.py"));
+  await git("add", "-A");
+  await git("commit", "-qm", "v2");
+  const secondCommit = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: rootPath })).stdout.trim();
+
+  // --- Git access is read-only: the previous version is reconstructed from
+  //     the object database rather than by checking anything out. -----------
+  const oldTree = await listFilesAtCommit(rootPath, firstCommit);
+  assert.equal(oldTree.ok, true);
+  assert.ok(oldTree.files.includes("app/prefix_cache.py"));
+  assert.equal(oldTree.files.includes("app/util/limits.py"), false);
+  const oldEngine = await readFileAtCommit(rootPath, firstCommit, "app/engine.py");
+  assert.equal(oldEngine.ok, true);
+  assert.equal(oldEngine.content, engineV1);
+  assert.equal((await readFileAtCommit(rootPath, firstCommit, "app/util/limits.py")).ok, false, "a file that did not exist yet is not invented");
+  assert.equal((await readFileAtCommit(rootPath, "not a revision", "app/engine.py")).reason, "unreadable-revision");
+  // The working tree is untouched by any of that.
+  assert.equal(await readFile(path.join(rootPath, "app", "engine.py"), "utf8"), engineV2);
+  const renames = await detectRenames(rootPath, firstCommit, secondCommit);
+  assert.ok(renames.renames.some((entry) => entry.from === "app/helpers.py" && entry.to === "app/util/limits.py"), JSON.stringify(renames.renames));
+
+  const snapshotOf = async (sources, options) => {
+    const symbols = [];
+    for (const [filePath, text] of Object.entries(sources)) {
+      const analysis = await analyzeSource(filePath, "python", text);
+      if (analysis?.definitions?.length) symbols.push(...analysis.definitions);
+    }
+    return buildSymbolSnapshot(symbols, sources, options);
+  };
+  const beforeSources = {
+    "app/engine.py": engineV1,
+    "app/scheduler.py": schedulerV1,
+    "app/prefix_cache.py": cacheV1,
+    "app/helpers.py": helpersV1,
+  };
+  const afterSources = {
+    "app/engine.py": engineV2,
+    "app/scheduler.py": schedulerV2,
+    "app/util/limits.py": helpersV1,
+  };
+  const before = await snapshotOf(beforeSources, { label: "v1", commit: firstCommit, files: oldTree.files });
+  const after = await snapshotOf(afterSources, { label: "v2", commit: secondCommit, files: (await listFilesAtCommit(rootPath, secondCommit)).files });
+  assert.equal(before.bodied, true);
+  assert.ok(before.symbols.find((symbol) => symbol.name === "generate").shingles.length >= 10);
+
+  // --- The course as it was written against version one -------------------
+  const course = {
+    id: "course-1",
+    sourceCommit: firstCommit,
+    modules: [
+      {
+        id: "m1", lessons: [
+          {
+            id: "loop", title: "The generation loop",
+            anchors: [
+              { path: "app/engine.py", line: 3, symbol: "add_request" },
+              { path: "app/engine.py", line: 8, symbol: "generate" },
+              { path: "app/helpers.py", line: 1, symbol: "clamp" },
+            ],
+            content: [
+              { id: "b1", type: "timeline", title: "One step", steps: [
+                { label: "Schedule", detail: "", anchor: { path: "app/scheduler.py", line: 2, symbol: "schedule" } },
+                { label: "Finish", detail: "", anchor: { path: "app/scheduler.py", line: 10, symbol: "finish_batch" } },
+              ] },
+            ],
+          },
+          {
+            id: "cache", title: "Prefix cache",
+            anchors: [{ path: "app/prefix_cache.py", line: 2, symbol: "lookup" }],
+          },
+        ],
+      },
+    ],
+  };
+
+  // Every clickable anchor is migrated, not just the lesson header list.
+  const sites = courseAnchorSites(course);
+  assert.equal(sites.length, 6);
+  assert.deepEqual([...new Set(sites.map((site) => site.site))].sort(), ["lesson", "timeline"]);
+
+  const plan = planMigration(course, before, after);
+  const statusOf = (symbol) => plan.operations.find((operation) => operation.from.symbol === symbol)?.status;
+  assert.equal(plan.limitation, null, "both versions had bodies, so renames and splits were detectable");
+  assert.equal(plan.totals.anchors, 6);
+
+  // --- Moved: the same definition, one line up ----------------------------
+  const moved = plan.operations.find((operation) => operation.from.symbol === "add_request");
+  assert.equal(moved.status, "moved");
+  assert.equal(moved.to.line, 2);
+  assert.equal(moved.to.path, "app/engine.py");
+  assert.equal(moved.confidence, 1);
+  assert.equal(moved.autoApply, true);
+  assert.match(moved.evidence.join(" "), /moved from line 3 to line 2/);
+
+  // --- Unchanged: identical body, identical line --------------------------
+  const unchanged = plan.operations.find((operation) => operation.from.symbol === "schedule");
+  assert.equal(unchanged.status, "unchanged");
+  assert.equal(unchanged.changesAnchor, false);
+
+  // --- Renamed: the body survived under a new name ------------------------
+  const renamed = plan.operations.find((operation) => operation.from.symbol === "finish_batch");
+  assert.equal(renamed.status, "renamed");
+  assert.equal(renamed.to.symbol, "postprocess");
+  assert.equal(renamed.to.path, "app/scheduler.py");
+  assert.ok(renamed.similarity > 0.9, String(renamed.similarity));
+  assert.equal(renamed.autoApply, true);
+  assert.match(renamed.evidence.join(" "), /is not defined anywhere in the new version/);
+
+  // --- Moved between files ------------------------------------------------
+  const relocated = plan.operations.find((operation) => operation.from.symbol === "clamp");
+  assert.equal(relocated.status, "moved-file");
+  assert.equal(relocated.to.path, "app/util/limits.py");
+  assert.equal(relocated.similarity, 1, "an unchanged body that changed file is still the same body");
+
+  // --- Split: one definition became two, and is never applied silently ----
+  const split = plan.operations.find((operation) => operation.from.symbol === "generate");
+  assert.equal(split.status, "split");
+  assert.equal(split.to.symbol, "generate");
+  assert.deepEqual(split.secondary.map((entry) => entry.symbol), ["step"]);
+  assert.equal(split.autoApply, false, "a split changes what a lesson is about, so it is always reviewed");
+  assert.equal(split.requiresReview, true);
+  assert.match(split.evidence.join(" "), /kept its name but now shares its body with 'step'/);
+  // The rename target must not be double-counted as a fragment of the split.
+  assert.equal(split.secondary.some((entry) => entry.symbol === "postprocess"), false);
+
+  // --- Disappeared: the whole file is gone --------------------------------
+  const gone = plan.operations.find((operation) => operation.from.symbol === "lookup");
+  assert.equal(gone.status, "file-removed");
+  assert.equal(gone.to, null);
+  assert.equal(gone.confidence, 0);
+  assert.match(gone.evidence.join(" "), /app\/prefix_cache\.py does not exist/);
+
+  assert.deepEqual(plan.counts, { moved: 1, split: 1, "moved-file": 1, unchanged: 1, renamed: 1, "file-removed": 1 });
+  assert.equal(plan.lessons.find((lesson) => lesson.lessonId === "cache").status, "orphaned");
+  assert.equal(plan.lessons.find((lesson) => lesson.lessonId === "loop").status, "needs-review");
+  assert.equal(plan.totals.orphanedLessons, 1);
+  assert.equal(statusOf("generate"), "split");
+
+  // --- Applying only what is safe ----------------------------------------
+  const auto = applyMigration(course, plan, { now: "2026-03-01T00:00:00.000Z" });
+  const loopLesson = auto.course.modules[0].lessons[0];
+  assert.equal(auto.applied, 3, "moved, renamed, and moved-file are safe; the split is not");
+  assert.equal(auto.retired, 1);
+  assert.equal(auto.added, 0);
+  assert.equal(auto.reviewRequired, 1);
+  assert.deepEqual(loopLesson.anchors, [
+    { path: "app/engine.py", line: 2, symbol: "add_request" },
+    { path: "app/engine.py", line: 8, symbol: "generate" },
+    { path: "app/util/limits.py", line: 1, symbol: "clamp" },
+  ], JSON.stringify(loopLesson.anchors));
+  // A timeline step is migrated exactly like a lesson anchor.
+  assert.deepEqual(loopLesson.content[0].steps[1].anchor, { path: "app/scheduler.py", line: 10, symbol: "postprocess" });
+  assert.deepEqual(loopLesson.content[0].steps[0].anchor, { path: "app/scheduler.py", line: 2, symbol: "schedule" });
+  // The split is described rather than performed.
+  assert.ok(loopLesson.reviewNotes.some((note) => /was split across 'generate', 'step'/.test(note)), JSON.stringify(loopLesson.reviewNotes));
+
+  // --- A dead anchor is retired, not deleted, and its lesson survives ------
+  const cacheLesson = auto.course.modules[0].lessons[1];
+  assert.deepEqual(cacheLesson.anchors, []);
+  assert.equal(cacheLesson.migrationStatus, "orphaned");
+  assert.deepEqual(cacheLesson.retiredAnchors.map((entry) => [entry.path, entry.line, entry.reason]), [["app/prefix_cache.py", 2, "file-removed"]]);
+  assert.ok(cacheLesson.retiredAnchors[0].evidence.length >= 1);
+  assert.equal(auto.orphaned, 1);
+  assert.equal(auto.course.modules[0].lessons.length, 2, "an orphaned lesson is flagged, never dropped");
+  assert.equal(auto.course.sourceCommit, secondCommit);
+  assert.equal(auto.migration.repointed, 3);
+  assert.equal(auto.migration.at, "2026-03-01T00:00:00.000Z");
+
+  // --- Accepting the split too --------------------------------------------
+  const everything = applyMigration(course, plan, { accept: "all" });
+  const splitAnchors = everything.course.modules[0].lessons[0].anchors;
+  assert.equal(everything.added, 1);
+  assert.ok(splitAnchors.some((anchor) => anchor.symbol === "step" && anchor.line === 7), JSON.stringify(splitAnchors));
+  assert.ok(splitAnchors.some((anchor) => anchor.symbol === "generate" && anchor.line === 13), JSON.stringify(splitAnchors));
+  // The same successor is never listed twice.
+  assert.equal(new Set(splitAnchors.map((anchor) => `${anchor.path}:${anchor.line}`)).size, splitAnchors.length);
+  // Naming specific operations takes those and no others.
+  const selective = applyMigration(course, plan, { accept: [renamed.id] });
+  assert.equal(selective.applied, 1);
+  assert.deepEqual(selective.course.modules[0].lessons[0].anchors[0], { path: "app/engine.py", line: 3, symbol: "add_request" }, "an unaccepted move is left alone");
+  assert.deepEqual(selective.course.modules[0].lessons[0].content[0].steps[1].anchor, { path: "app/scheduler.py", line: 10, symbol: "postprocess" });
+  // Retirement can be refused, in which case the dead anchor stays and says so.
+  const kept = applyMigration(course, plan, { retireMissing: false });
+  assert.equal(kept.retired, 0);
+  assert.deepEqual(kept.course.modules[0].lessons[1].anchors, [{ path: "app/prefix_cache.py", line: 2, symbol: "lookup" }]);
+  assert.ok(kept.course.modules[0].lessons[1].reviewNotes.some((note) => /file no longer exists/.test(note)));
+
+  // --- Reversibility is exact ---------------------------------------------
+  const reverted = revertMigration(everything.course);
+  assert.equal(reverted.reverted, true);
+  assert.equal(JSON.stringify(reverted.course.modules), JSON.stringify(course.modules), "a reverted course is byte-identical to the original");
+  assert.deepEqual(reverted.course.migrations, []);
+  assert.equal(reverted.course.sourceCommit, firstCommit);
+  assert.equal(revertMigration({ id: "x", modules: [] }).reverted, false);
+  // Reverting the automatic migration is equally exact.
+  assert.equal(JSON.stringify(revertMigration(auto.course).course.modules), JSON.stringify(course.modules));
+
+  // --- Comment churn is a move, not an edit -------------------------------
+  const commented = { ...afterSources, "app/scheduler.py": schedulerV2.replace("class Scheduler:", "# a docstring-sized comment\n# spanning two lines\nclass Scheduler:") };
+  const afterComments = await snapshotOf(commented, { label: "v3", commit: "cccc", files: ["app/engine.py", "app/scheduler.py", "app/util/limits.py"] });
+  const commentPlan = planMigration(course, before, afterComments);
+  const shifted = commentPlan.operations.find((operation) => operation.from.symbol === "schedule");
+  assert.equal(shifted.status, "moved", "adding comments moves a definition; it does not edit it");
+  assert.equal(shifted.to.line, 4);
+  assert.equal(shifted.similarity, 1);
+
+  // --- A real edit is reported as an edit ---------------------------------
+  const edited = { ...afterSources, "app/scheduler.py": schedulerV2.replace("            self.blocks.allocate(seq)", "            self.blocks.allocate(seq, self.reserve)\n            self.metrics.count(seq)") };
+  const editedPlan = planMigration(course, before, await snapshotOf(edited, { label: "v4", files: Object.keys(edited) }));
+  const editedOperation = editedPlan.operations.find((operation) => operation.from.symbol === "schedule");
+  assert.equal(editedOperation.status, "edited");
+  assert.equal(editedOperation.changesAnchor, false, "an edit in place does not move the anchor");
+  assert.match(editedOperation.evidence.join(" "), /its body changed/);
+
+  // --- Ambiguity is reported, never guessed -------------------------------
+  const twins = {
+    "app/scheduler.py": schedulerV1,
+    "app/engine.py": engineV1,
+    "app/copy_a.py": helpersV1.replace("def clamp(", "def bound_a("),
+    "app/copy_b.py": helpersV1.replace("def clamp(", "def bound_b("),
+  };
+  const ambiguousPlan = planMigration(course, before, await snapshotOf(twins, { label: "v5", files: Object.keys(twins) }));
+  const ambiguous = ambiguousPlan.operations.find((operation) => operation.from.symbol === "clamp");
+  assert.equal(ambiguous.status, "ambiguous");
+  assert.equal(ambiguous.autoApply, false);
+  assert.ok(ambiguous.secondary.length >= 1);
+  assert.match(ambiguous.evidence.join(" "), /match the old body about equally/);
+  assert.equal(applyMigration(course, ambiguousPlan).course.modules[0].lessons[0].anchors.some((anchor) => /copy_[ab]/.test(anchor.path)), false, "an ambiguous match is never applied automatically");
+
+  // --- Without bodies, the honest answer is a stated limitation -----------
+  const bodyless = buildSymbolSnapshot(before.symbols.map((symbol) => ({ ...symbol })), {}, { label: "no-source", files: oldTree.files });
+  assert.equal(bodyless.bodied, false);
+  const blindPlan = planMigration(course, bodyless, buildSymbolSnapshot(after.symbols, {}, { files: after.files }));
+  assert.match(blindPlan.limitation, /renames and splits could not be detected/);
+  assert.equal(blindPlan.operations.find((operation) => operation.from.symbol === "add_request").status, "moved", "a move is still detectable without bodies");
+  assert.equal(blindPlan.operations.find((operation) => operation.from.symbol === "finish_batch").status, "disappeared", "a rename is not guessed at without evidence");
+
+  // --- Regression: a file-level anchor is not a vanished symbol -----------
+  // Found against real history. A starter course anchors "start here" at the
+  // top of a README or a build file, where there is no definition to follow.
+  // Classifying that as a disappearance retired live anchors and orphaned four
+  // working lessons.
+  const fileAnchored = {
+    id: "course-2",
+    modules: [{ id: "m", lessons: [{ id: "top", title: "Start here", anchors: [
+      { path: "app/engine.py", line: 1, symbol: null },
+      { path: "app/scheduler.py", line: 1, symbol: null },
+      { path: "app/prefix_cache.py", line: 1, symbol: null },
+    ] }] }],
+  };
+  const filePlan = planMigration(fileAnchored, before, after);
+  assert.deepEqual(filePlan.operations.map((operation) => operation.status), ["edited", "edited", "file-removed"]);
+  assert.match(filePlan.operations[0].evidence.join(" "), /names no definition, but the file's contents changed/);
+  assert.equal(filePlan.operations[0].changesAnchor, false, "a file anchor is never re-pointed, only reported on");
+  // Against an unchanged version the same anchors are simply unchanged.
+  const stablePlan = planMigration(fileAnchored, before, before);
+  assert.deepEqual(stablePlan.operations.map((operation) => operation.status), ["unchanged", "unchanged", "unchanged"]);
+  assert.match(stablePlan.operations[0].evidence.join(" "), /nothing to re-point/);
+  const fileApplied = applyMigration(fileAnchored, filePlan);
+  assert.deepEqual(fileApplied.course.modules[0].lessons[0].anchors, [
+    { path: "app/engine.py", line: 1, symbol: null },
+    { path: "app/scheduler.py", line: 1, symbol: null },
+  ], "only the anchor whose file really went away is retired");
+  assert.equal(fileApplied.retired, 1);
+
+  // --- Regression: an indexer gap is not a deletion -----------------------
+  // A CUDA kernel the C++ definition query does not capture looked exactly like
+  // a deleted function. "Not in the index" and "not in the source" are
+  // different claims and only one of them justifies retiring an anchor.
+  const unknownName = {
+    id: "course-3",
+    modules: [{ id: "m", lessons: [{ id: "kernel", title: "Kernel", anchors: [{ path: "app/engine.py", line: 4, symbol: "act_and_mul_kernel" }] }] }],
+  };
+  const unknownPlan = planMigration(unknownName, before, after);
+  assert.equal(unknownPlan.operations[0].status, "unverified");
+  assert.equal(unknownPlan.operations[0].requiresReview, true);
+  assert.match(unknownPlan.operations[0].evidence.join(" "), /cannot be decided from the index/);
+  const unknownApplied = applyMigration(unknownName, unknownPlan);
+  assert.equal(unknownApplied.retired, 0, "an anchor the index cannot speak to is left alone");
+  assert.deepEqual(unknownApplied.course.modules[0].lessons[0].anchors, unknownName.modules[0].lessons[0].anchors);
+
+  // --- The migration indexes exactly what the live index indexes ----------
+  // `analyzeContent` is the shared path: tree-sitter first, regex fallback
+  // second. A migration that used only tree-sitter disagreed with the index.
+  const cudaSource = "template <typename T>\n__global__ void act_and_mul_kernel(T* out, const T* input) {\n  out[0] = input[0];\n}\n";
+  const cuda = await analyzeContent("k.cuh", "cuda", cudaSource);
+  assert.ok(cuda.symbols.some((symbol) => symbol.name === "act_and_mul_kernel"), JSON.stringify(cuda));
+  const fallback = await analyzeContent("build.gradle.kts", "kotlin", "fun buildAll() {\n}\n");
+  assert.ok(["tree-sitter", "regex"].includes(fallback.indexer), fallback.indexer);
+  assert.deepEqual(await analyzeContent("x.py", "python", null), { symbols: [], indexer: "none" });
+
+  // --- Definitions without an end line still get a comparable body --------
+  // The regex indexer reports only a first line; without inferring an end, every
+  // body would be one line long and no rename would ever be detectable.
+  const spanless = buildSymbolSnapshot(
+    [{ name: "alpha", path: "s.py", line: 1 }, { name: "beta", path: "s.py", line: 5 }],
+    { "s.py": ["def alpha():", "    a = 1", "    b = 2", "    return a + b", "def beta():", "    return 0"].join("\n") },
+    { files: ["s.py"] },
+  );
+  assert.equal(spanless.symbols[0].endLine, 4, "an end line is inferred from the next definition");
+  assert.equal(spanless.symbols[1].endLine, 6, "the last definition runs to the end of the file");
+  assert.ok(spanless.symbols[0].tokenCount > 8, String(spanless.symbols[0].tokenCount));
+  assert.equal(spanless.bodied, true);
+
+  // --- Similarity primitives ----------------------------------------------
+  assert.equal(jaccard([], [1, 2]), 0);
+  assert.equal(jaccard([1, 2, 3], [1, 2, 3]), 1);
+  assert.equal(coverage([1, 2, 3, 4], [[1, 2], [3]]), 0.75);
+  assert.deepEqual(bodyTokens("# comment only\nvalue = 1\n// also a comment"), ["value", "=", "1"]);
+  // The fingerprint hash is the single shared one, not a second copy of it.
+  assert.equal(hash32("abc"), 440920331);
+  assert.notEqual(hash32("abc"), hash32("abd"));
+  // Order is meaning: the same tokens in a different order are not the same body.
+  assert.notDeepEqual(shingles(["a", "b", "c", "d"]), shingles(["d", "c", "b", "a"]));
 });

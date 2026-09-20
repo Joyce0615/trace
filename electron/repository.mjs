@@ -394,6 +394,27 @@ function regexSymbols(file, source) {
 }
 
 /**
+ * Index one file from text rather than from disk.
+ *
+ * Course migration (item 46) has to index a *previous* version of a file, which
+ * exists only as a git blob. Reusing this rather than calling `analyzeSource`
+ * directly matters: the first attempt did call tree-sitter alone, and every
+ * CUDA kernel — which the C++ grammar's definition query does not capture —
+ * came back as "disappeared" from a file where it was plainly still defined.
+ * The regex fallback is what the live index uses, so the migration has to use
+ * it too or the two disagree about what the repository contains.
+ */
+export async function analyzeContent(filePath, language, source) {
+  if (typeof source !== "string") return { symbols: [], indexer: "none" };
+  if (treeSitterSupports(language, filePath)) {
+    const analysis = await analyzeSource(filePath, language, source);
+    if (analysis?.definitions?.length) return { symbols: analysis.definitions.slice(0, 80), indexer: "tree-sitter" };
+  }
+  const symbols = regexSymbols({ path: filePath, language }, source);
+  return { symbols, indexer: symbols.length ? "regex" : "none" };
+}
+
+/**
  * Structural index for one file. Tree-sitter supplies definitions, references,
  * and call edges; the regex indexer remains the deterministic fallback for
  * languages without a grammar or when a parse fails.

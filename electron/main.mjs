@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { askAgent, detectAgents, generateCourseWithAgent } from "./agents.mjs";
 import { generateStarterCourse, normalizeAgentCourse } from "./course.mjs";
 import { loadCourse, saveCourse } from "./course-store.mjs";
-import { DEFAULT_INDEX_LIMITS, IndexCancelledError, inspectRepository, readRepositoryFile } from "./repository.mjs";
+import { DEFAULT_INDEX_LIMITS, IndexCancelledError, analyzeContent, inspectRepository, languageFor, readRepositoryFile } from "./repository.mjs";
 import { createPracticeSession, getPracticeSessionPath, inspectPracticeSession, removePracticeSession } from "./practice.mjs";
 import { answerFromLocalIndex, buildContextPack, loadCachedResponse, responseCacheKey, saveCachedResponse } from "./context-engine.mjs";
 import { loadLearnerState, saveLearnerState } from "./learning-store.mjs";
@@ -18,7 +18,7 @@ import { buildLocalizationExercise, nextHint, publicLocalizationExercise, scoreL
 import { buildRaceTask, gradeRaceSubmission, publicRaceTask } from "./race-grader.mjs";
 import { detectRuntimes, runExecutionTrace, suggestTraceSnippets, summarizeTrace } from "./execution-trace.mjs";
 import { buildArchitecture, dataFlow, symbolNeighborhood } from "./architecture.mjs";
-import { historyLessons, historySummary, readCommits } from "./git-history.mjs";
+import { detectRenames, historyLessons, historySummary, listFilesAtCommit, readCommits, readFileAtCommit } from "./git-history.mjs";
 import { evidenceForSkills, importEvidence } from "./evidence-import.mjs";
 import { buildSearchIndex, search } from "./search.mjs";
 import { runEvaluation } from "./evaluation.mjs";
@@ -33,6 +33,7 @@ import { analyticsReport } from "./analytics.mjs";
 import { EXPERIMENTS, experimentReport, settingsFor } from "./experiments.mjs";
 import { goalPlan } from "./goals.mjs";
 import { detectLicense, importCourse, packageCourse, verifyPackage } from "./course-package.mjs";
+import { applyMigration, buildSymbolSnapshot, courseAnchorSites, planMigration, revertMigration } from "./course-migration.mjs";
 import { anchorPayload, loadOrCreateKeyPair, loadTrustedKeys, publicIdentity, responsePayload, setKeyTrust, signPackage, signPayload, verifyPackageSignature, verifyPayload } from "./signing.mjs";
 import { forgetEverything, loadExperimentState, recordObservation, setConsent } from "./experiment-store.mjs";
 
@@ -62,6 +63,13 @@ const hintsTaken = new Map();
 
 // Files the learner has opened, which is what makes an activity "near" transfer.
 const inspectedPaths = new Map();
+
+/**
+ * Bounds on a migration. Reconstructing a previous version means reading blobs
+ * out of git one at a time, so an unbounded course could turn one click into
+ * thousands of subprocess calls.
+ */
+const MIGRATION_LIMITS = { anchoredFiles: 60, candidateFiles: 120, maxFileBytes: 400_000 };
 
 function activityLogDirectory() {
   return path.join(app.getPath("userData"), "activity-log");
@@ -660,6 +668,104 @@ const ipcHandlers = {
       anchorSignature: verifyPayload("source-anchors", anchorPayload(request.package?.integrity?.anchors), request.package?.anchorSignature, { trustedKeyIds }),
       trustedKeyIds,
     };
+  },
+
+  "course:migrate": async (_event, request) => {
+    const repository = openedRepository(request.repository);
+    if (!Array.isArray(request.course?.modules)) throw new Error("Invalid course migration request.");
+    const course = request.course;
+    const sites = courseAnchorSites(course);
+    if (!sites.length) return { available: false, reason: "This course has no source anchors to migrate.", plan: null, course: null };
+
+    const fromCommit = request.fromCommit ?? course.sourceCommit ?? null;
+    if (!fromCommit || fromCommit === "unversioned") {
+      return { available: false, reason: "This course does not record the commit it was written against, so there is nothing to migrate from.", plan: null, course: null };
+    }
+    const oldTree = await listFilesAtCommit(repository.rootPath, fromCommit);
+    if (!oldTree.ok) {
+      return { available: false, reason: `Commit ${String(fromCommit).slice(0, 12)} is not in this repository's history.`, plan: null, course: null };
+    }
+
+    const anchoredPaths = [...new Set(sites.map((site) => site.anchor.path))].slice(0, MIGRATION_LIMITS.anchoredFiles);
+    const currentPaths = new Set(repository.files.map((file) => file.path));
+    const rename = await detectRenames(repository.rootPath, fromCommit, repository.head ?? "HEAD");
+    const renamedTo = new Map(rename.renames.map((entry) => [entry.from, entry.to]));
+
+    // Candidate destinations: the anchored paths themselves, anything git says
+    // an anchored path was renamed into, and same-basename files elsewhere —
+    // enough to catch a definition that changed file without reading the tree.
+    // Order matters as much as membership: the candidate list is truncated, and
+    // an early basename sweep over a name like `__init__.py` once filled it with
+    // 120 unrelated files and pushed real anchored files past the cut, which
+    // reported live definitions as deleted. Anchored paths go in first.
+    const candidates = new Set();
+    for (const anchored of anchoredPaths) {
+      if (currentPaths.has(anchored)) candidates.add(anchored);
+      const moved = renamedTo.get(anchored);
+      if (moved && currentPaths.has(moved)) candidates.add(moved);
+    }
+    // Siblings next. The commonest real relocation is a definition extracted
+    // into a new module beside the one it came from — `CommBackend` left
+    // `flashinfer/comm/mnnvl.py` for `flashinfer/comm/abstractions.py` — and
+    // without the directory the matcher can only call that a disappearance.
+    const anchoredDirectories = new Set(anchoredPaths.map((anchored) => anchored.split("/").slice(0, -1).join("/")));
+    for (const file of repository.files) {
+      if (candidates.size >= MIGRATION_LIMITS.candidateFiles) break;
+      if (anchoredDirectories.has(file.directory)) candidates.add(file.path);
+    }
+    const anchoredBasenames = new Set(anchoredPaths.map((anchored) => anchored.split("/").at(-1)));
+    for (const file of repository.files) {
+      if (candidates.size >= MIGRATION_LIMITS.candidateFiles) break;
+      if (anchoredBasenames.has(file.name)) candidates.add(file.path);
+    }
+
+    const snapshotFor = async (paths, read) => {
+      const sources = {};
+      const symbols = [];
+      for (const filePath of [...paths].slice(0, MIGRATION_LIMITS.candidateFiles)) {
+        const content = await read(filePath);
+        if (typeof content !== "string" || content.length > MIGRATION_LIMITS.maxFileBytes) continue;
+        sources[filePath] = content;
+        // The same tree-sitter-then-regex path the live index uses, so the two
+        // never disagree about which definitions a file contains.
+        const analysis = await analyzeContent(filePath, languageFor(filePath), content);
+        symbols.push(...analysis.symbols);
+      }
+      return { sources, symbols };
+    };
+
+    const oldFiles = new Set(oldTree.files);
+    const before = await snapshotFor(anchoredPaths.filter((filePath) => oldFiles.has(filePath)), async (filePath) => {
+      const read = await readFileAtCommit(repository.rootPath, fromCommit, filePath, { maxBytes: MIGRATION_LIMITS.maxFileBytes });
+      return read.ok ? read.content : null;
+    });
+    const after = await snapshotFor(candidates, async (filePath) => {
+      try {
+        return await readRepositoryFile(repository.rootPath, filePath);
+      } catch {
+        return null;
+      }
+    });
+
+    const beforeSnapshot = buildSymbolSnapshot(before.symbols, before.sources, {
+      label: "packaged", commit: fromCommit, files: oldTree.files.filter((filePath) => filePath.length < 400),
+    });
+    const afterSnapshot = buildSymbolSnapshot(after.symbols, after.sources, {
+      label: "current", commit: repository.head ?? null, sourceVersion: repository.versionId ?? null, files: [...currentPaths],
+    });
+    const plan = planMigration(course, beforeSnapshot, afterSnapshot);
+    const gitEvidence = rename.renames.filter((entry) => anchoredPaths.includes(entry.from)).slice(0, 20);
+
+    if (!request.apply) return { available: true, plan, course: null, gitRenames: gitEvidence, filesCompared: Object.keys(before.sources).length };
+    const accept = Array.isArray(request.acceptIds) ? request.acceptIds : request.accept === "none" ? [] : request.accept ?? "auto";
+    const applied = applyMigration(course, plan, { accept, retireMissing: request.retireMissing ?? true });
+    return { available: true, plan, ...applied, gitRenames: gitEvidence, filesCompared: Object.keys(before.sources).length };
+  },
+
+  "course:revert-migration": async (_event, request) => {
+    openedRepository(request.repository);
+    if (!Array.isArray(request.course?.modules)) throw new Error("Invalid revert request.");
+    return revertMigration(request.course, request.migrationId ?? null);
   },
 
   "signing:identity": async (_event, request) => {

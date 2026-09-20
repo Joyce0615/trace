@@ -25,6 +25,8 @@
  * id, and no observation leaves the machine.
  */
 
+import { hash32 } from "./hashing.mjs";
+
 export const EXPERIMENT_VERSION = 1;
 
 /** Fields an observation may contain. Everything else is dropped. */
@@ -79,22 +81,13 @@ export function controlArm(experiment) {
 }
 
 /**
- * A 32-bit FNV-1a hash.
- *
  * Arm assignment is not a security boundary — it decides which of two equally
  * available behaviours a consenting learner sees — so it needs determinism and
- * a flat distribution, not cryptographic strength. Using a small local hash
- * instead of `node:crypto` also keeps this module Node-free, so the browser
- * demo enforces the same consent gate and assignment rules as the desktop app.
+ * a flat distribution, not cryptographic strength. The hash is shared with the
+ * migration matcher rather than copied, and it keeps this module Node-free so
+ * the browser demo enforces the same consent gate and assignment rules.
  */
-export function hash32(text) {
-  let hash = 0x811c9dc5;
-  for (let index = 0; index < text.length; index += 1) {
-    hash ^= text.charCodeAt(index);
-    hash = Math.imul(hash, 0x01000193) >>> 0;
-  }
-  return hash >>> 0;
-}
+export { hash32 } from "./hashing.mjs";
 
 /**
  * Deterministic arm assignment.
