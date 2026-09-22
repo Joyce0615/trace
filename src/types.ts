@@ -959,6 +959,95 @@ export interface MigrationResult {
   note?: string;
 }
 
+/** Item 47: a learner-written note, attached to a lesson and optionally to source. */
+export interface LearnerNote {
+  id: string;
+  lessonId: string | null;
+  anchor: CodeAnchor | null;
+  text: string;
+  createdAt: string | null;
+  updatedAt: string | null;
+  /** Set when an import kept this note alongside a colliding one. */
+  forkedFrom?: string;
+}
+
+export interface ArchiveExcerpt {
+  path: string;
+  line: number;
+  startLine: number;
+  endLine: number;
+  text: string;
+  truncated: boolean;
+  digest: string;
+  fileDigest: string;
+  symbol: string | null;
+  blobId: string | null;
+  language: string | null;
+}
+
+export interface OfflineArchive {
+  format: string;
+  version: number;
+  exportedAt: string;
+  provenance: { repositoryId: string | null; repositoryName: string | null; commit: string | null; sourceVersion: string | null; exportedBy: string };
+  content: {
+    course: Course | null;
+    skillGraph: SkillGraph | null;
+    progress: (Omit<LearnerState, "repositoryId"> & { repositoryId: string | null }) | null;
+    notes: LearnerNote[];
+    excerpts: ArchiveExcerpt[];
+  };
+  completeness: {
+    anchors: number;
+    excerpted: number;
+    missing: Array<{ path: string; line: number; reason: string }>;
+    notes: number;
+    skills: number;
+    reviews: number;
+    memories: number;
+    truncated: Array<{ limit: string; value: number; skipped: number }>;
+    offlineReadable: boolean;
+  };
+  checksum: string;
+  signature?: CourseSignature | null;
+}
+
+export interface ArchiveVerification {
+  readable: boolean;
+  verdict: "intact" | "drifted" | "altered" | "unreadable";
+  reason?: string | null;
+  intact?: boolean;
+  checksumOk?: boolean;
+  alteredExcerpts?: number;
+  offlineReadable?: boolean;
+  excerpts?: { total: number; counts: Record<string, number>; results: Array<{ path: string; line: number; status: string }> };
+  provenance?: OfflineArchive["provenance"] | null;
+  contents?: OfflineArchive["completeness"] | null;
+  problems: string[];
+}
+
+export interface ArchiveImportResult {
+  imported: boolean;
+  preview?: boolean;
+  mode?: "merge" | "replace";
+  reason?: string;
+  verification: ArchiveVerification;
+  seal?: SignatureVerification | null;
+  course?: Course | null;
+  skillGraph?: SkillGraph | null;
+  learnerState?: LearnerState | null;
+  notes?: LearnerNote[];
+  excerpts?: ArchiveExcerpt[];
+  merge?: {
+    conflicts: Array<{ kind: string; skillId?: string; noteId?: string; detail: string; kept: unknown }>;
+    evidenceGained: number;
+    memoriesGained: number;
+    notesAdded: number;
+    notesIdentical: number;
+  };
+  offlineReadable?: boolean;
+}
+
 export interface SigningIdentity {
   algorithm: string;
   keyId: string;
@@ -1453,6 +1542,10 @@ export interface TraceBridge {
   importCourse(request: { repository: RepositoryRef; package: CoursePackage; force?: boolean }): Promise<CourseImportResult>;
   migrateCourse(request: { repository: RepositoryRef; course: Course; fromCommit?: string | null; apply?: boolean; accept?: "auto" | "all" | "none"; acceptIds?: string[]; retireMissing?: boolean }): Promise<MigrationResult>;
   revertCourseMigration(request: { repository: RepositoryRef; course: Course; migrationId?: string | null }): Promise<{ course: Course; reverted: boolean; reason?: string; migrationId?: string; restored?: number }>;
+  listNotes(request: { repository: RepositoryRef }): Promise<{ notes: LearnerNote[] }>;
+  saveNote(request: { repository: RepositoryRef; id: string; lessonId?: string | null; anchor?: CodeAnchor | null; text: string }): Promise<{ notes: LearnerNote[]; removed: boolean; note: LearnerNote | null }>;
+  exportArchive(request: { repository: RepositoryRef; course: Course; skillGraph?: SkillGraph | null; learnerState?: LearnerState | null; includeExcerpts?: boolean }): Promise<OfflineArchive>;
+  importArchive(request: { repository: RepositoryRef; archive: OfflineArchive; mode?: "merge" | "replace"; apply?: boolean; force?: boolean; learnerState?: LearnerState | null }): Promise<ArchiveImportResult>;
   goalPlan(request: { repository: RepositoryRef; goal: LearnerGoal; course?: Course; limit?: number }): Promise<GoalPlan>;
   experiments(request: { repository: RepositoryRef }): Promise<ExperimentReport>;
   setExperimentConsent(request: { repository: RepositoryRef; granted: boolean }): Promise<ExperimentReport>;
@@ -1501,6 +1594,7 @@ export interface TraceWorkspaceSnapshot {
   skillGraph: SkillGraph | null;
   learnerState: LearnerState | null;
   knowledgeGraph: KnowledgeGraphSummary | null;
+  notes?: LearnerNote[];
 }
 
 declare global {

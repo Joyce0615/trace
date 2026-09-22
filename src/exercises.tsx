@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import { Icon, bridge, readableError, repositoryRef } from "./shell";
-import type { ContrastGrade, Course, LearnerGoal, LearnerState, Lesson, PredictionExercise, PredictionOutcome, Repository, ReviewGradeId, SkillGraph, TeachBackGrade } from "./types";
-import type { ActivityState, AnalyticsState, ArchitectureState, ExperimentState, GoalState, MigrationState, SharingState, ChainState, DiagnosisState, EvaluationState, EvidenceState, ExecutableQuizState, ExplanationState, HistoryState, LocalizationState, ReviewState, ScheduleState, TraceState } from "./exercise-state";
+import { Icon, bridge, readableError, repositoryRef, useLoadOnce } from "./shell";
+import type { ContrastGrade, Course, LearnerGoal, LearnerNote, LearnerState, Lesson, PredictionExercise, PredictionOutcome, Repository, ReviewGradeId, SkillGraph, TeachBackGrade } from "./types";
+import type { ActivityState, AnalyticsState, ArchitectureState, ArchiveState, ExperimentState, GoalState, MigrationState, SharingState, ChainState, DiagnosisState, EvaluationState, EvidenceState, ExecutableQuizState, ExplanationState, HistoryState, LocalizationState, ReviewState, ScheduleState, TraceState } from "./exercise-state";
 
 /**
  * Exercise, visualization, quality, and diagnosis panels (items 26-36).
@@ -22,23 +22,17 @@ import type { ActivityState, AnalyticsState, ArchitectureState, ExperimentState,
 export function CallChainPanel({ repository, state, onState, onAnchor }: { repository: Repository; state: ChainState; onState: (update: Partial<ChainState>) => void; onAnchor: (path: string, line: number) => void }) {
   const { chains, exercises, activeChain, choice, grades, status } = state;
 
-  useEffect(() => {
-    if (status !== "idle") return;
-    let active = true;
+  useLoadOnce(repository.id, status === "idle", () => {
     onState({ status: "loading" });
     void bridge.callChains({ repository: repositoryRef(repository), limit: 8 })
-      .then((result) => {
-        if (!active) return;
-        onState({
-          chains: result.chains,
-          exercises: result.exercises,
-          activeChain: result.chains[0]?.id ?? null,
-          status: result.chains.length ? "ready" : "empty",
-        });
-      })
-      .catch(() => { if (active) onState({ status: "error" }); });
-    return () => { active = false; };
-  }, [onState, repository, status]);
+      .then((result) => onState({
+        chains: result.chains,
+        exercises: result.exercises,
+        activeChain: result.chains[0]?.id ?? null,
+        status: result.chains.length ? "ready" : "empty",
+      }))
+      .catch(() => onState({ status: "error" }));
+  });
 
   const chain = chains.find((candidate) => candidate.id === activeChain) ?? chains[0];
   const chainExercises = exercises.filter((exercise) => exercise.chainId === chain?.id);
@@ -185,15 +179,12 @@ export function ArchitecturePanel({ repository, currentFile, symbol, state, onSt
 }) {
   const { architecture, flow, status, activeModule } = state;
 
-  useEffect(() => {
-    if (status !== "idle") return;
-    let active = true;
+  useLoadOnce(repository.id, status === "idle", () => {
     onState({ status: "loading" });
     void bridge.architecture({ repository: repositoryRef(repository), moduleDepth: 2 })
-      .then((result) => { if (active) onState({ architecture: result, status: "ready" }); })
-      .catch(() => { if (active) onState({ status: "error" }); });
-    return () => { active = false; };
-  }, [onState, repository, status]);
+      .then((result) => onState({ architecture: result, status: "ready" }))
+      .catch(() => onState({ status: "error" }));
+  });
 
   useEffect(() => {
     if (!symbol) return;
@@ -286,15 +277,12 @@ export function HistoryPanel({ repository, state, onState, onAnchor, onLesson }:
 }) {
   const { summary, lessons, status, view } = state;
 
-  useEffect(() => {
-    if (status !== "idle") return;
-    let active = true;
+  useLoadOnce(repository.id, status === "idle", () => {
     onState({ status: "loading" });
     void bridge.history({ repository: repositoryRef(repository), commits: 400 })
-      .then((result) => { if (active) onState({ summary: result.summary, lessons: result.lessons, status: "ready" }); })
-      .catch(() => { if (active) onState({ status: "error" }); });
-    return () => { active = false; };
-  }, [onState, repository, status]);
+      .then((result) => onState({ summary: result.summary, lessons: result.lessons, status: "ready" }))
+      .catch(() => onState({ status: "error" }));
+  });
 
   if (status !== "ready" || !summary) {
     return <section className="history-panel empty" data-status={status}>
@@ -372,15 +360,12 @@ export function EvidencePanel({ repository, skillGraph, currentFile, state, onSt
 }) {
   const { evidence, status, kind, onlyCurrentFile } = state;
 
-  useEffect(() => {
-    if (status !== "idle") return;
-    let active = true;
+  useLoadOnce(repository.id, status === "idle", () => {
     onState({ status: "loading" });
     void bridge.importEvidence({ repository: repositoryRef(repository), commits: 300, skillGraph: skillGraph ?? undefined })
-      .then((result) => { if (active) onState({ evidence: result, status: "ready" }); })
-      .catch(() => { if (active) onState({ status: "error" }); });
-    return () => { active = false; };
-  }, [onState, repository, skillGraph, status]);
+      .then((result) => onState({ evidence: result, status: "ready" }))
+      .catch(() => onState({ status: "error" }));
+  });
 
   if (status !== "ready" || !evidence) {
     return <section className="evidence-panel empty" data-status={status}>
@@ -848,6 +833,91 @@ export function MigrationPanel({ repository, course, state, onState, onCourse, o
         <strong>{applied.applied} re-pointed</strong>
         <small>{applied.retired} retired · {applied.added} added · {applied.reviewRequired} still need review</small>
         {(applied.plan?.lessons ?? []).filter((lesson) => lesson.status !== "intact").slice(0, 5).map((lesson) => <i key={lesson.lessonId} data-lesson={lesson.lessonId} data-lesson-status={lesson.status}>{lesson.title}: {lesson.status}</i>)}
+      </div>}
+    </>}
+  </section>;
+}
+
+/**
+ * Offline export and import (item 47).
+ *
+ * The panel leads with the one number that decides whether the archive is worth
+ * carrying: how many of the course's anchors it could take the source for. An
+ * archive that is only anchors is not offline, and saying "exported" without
+ * saying that would be a lie the learner discovers on a plane.
+ */
+export function ArchivePanel({ repository, course, skillGraph, learnerState, notes, state, onState, onLearnerState, onNotes }: {
+  repository: Repository;
+  course: Course | null;
+  skillGraph: SkillGraph | null;
+  learnerState: LearnerState | null;
+  notes: LearnerNote[];
+  state: ArchiveState;
+  onState: (update: Partial<ArchiveState>) => void;
+  onLearnerState: (state: LearnerState) => void;
+  onNotes: (notes: LearnerNote[]) => void;
+}) {
+  const { archive, result, mode, status } = state;
+
+  const exportArchive = async () => {
+    if (!course) return;
+    onState({ status: "exporting", result: null });
+    try {
+      onState({ archive: await bridge.exportArchive({ repository: repositoryRef(repository), course, skillGraph, learnerState }), status: "ready" });
+    } catch {
+      onState({ status: "error" });
+    }
+  };
+
+  const readBack = async (apply: boolean, doctored = false) => {
+    if (!archive) return;
+    // Reading an archive back into the machine it came from is the check that
+    // matters: if that loses anything, moving it to another machine will too.
+    const candidate = doctored
+      ? { ...archive, content: { ...archive.content, notes: archive.content.notes.map((note, index) => (index === 0 ? { ...note, text: `${note.text} (edited outside Trace)` } : note)) } }
+      : archive;
+    const next = await bridge.importArchive({ repository: repositoryRef(repository), archive: candidate, apply, mode });
+    onState({ result: next });
+    if (next.imported && next.learnerState) onLearnerState(next.learnerState);
+    if (next.imported && next.notes) onNotes(next.notes);
+  };
+
+  const completeness = archive?.completeness ?? null;
+  return <section className="archive-panel" data-status={status} data-offline={String(Boolean(completeness?.offlineReadable))}>
+    <div className="archive-head">
+      <span>TAKE THIS WITH YOU</span>
+      <button className="ghost" disabled={status === "exporting" || !course} onClick={() => void exportArchive()}>{status === "exporting" ? "Exporting…" : archive ? "Re-export" : "Export everything"}</button>
+    </div>
+    {status === "error" && <p className="archive-note">Exporting is unavailable for this repository.</p>}
+    {archive && completeness && <>
+      <div className="archive-totals" data-anchors={completeness.anchors} data-excerpts={completeness.excerpted} data-notes={completeness.notes} data-skills={completeness.skills}>
+        <div><em>{completeness.excerpted}/{completeness.anchors}</em><small>source excerpts</small></div>
+        <div><em>{completeness.skills}</em><small>skills</small></div>
+        <div><em>{completeness.reviews}</em><small>review schedules</small></div>
+        <div><em>{completeness.notes}</em><small>notes</small></div>
+      </div>
+      <p className="archive-note" data-note="offline">
+        {completeness.offlineReadable
+          ? "Every anchor carries its source, so this archive can be studied with the repository closed."
+          : `${completeness.missing.length} anchor(s) had no readable source, so parts of this archive need the repository.`}
+      </p>
+      {archive.signature && <p className="archive-seal" data-key={archive.signature.keyId}>Sealed {archive.signature.algorithm} · key {archive.signature.keyId.slice(0, 12)}…</p>}
+      <div className="archive-actions">
+        <label className="archive-toggle"><input type="checkbox" checked={mode === "replace"} onChange={(event) => onState({ mode: event.target.checked ? "replace" : "merge" })} />Replace instead of merging</label>
+        <button className="ghost" onClick={() => void readBack(false)}>Check it</button>
+        <button className="ghost" onClick={() => void readBack(true)}>Read it back</button>
+        <button className="ghost" data-action="tamper" onClick={() => void readBack(false, true)}>Check an edited copy</button>
+      </div>
+      {result && <div className="archive-result" data-verdict={result.verification.verdict} data-imported={String(result.imported)} data-conflicts={result.merge?.conflicts.length ?? 0}>
+        <strong>{result.verification.verdict}</strong>
+        <small>
+          {result.verification.excerpts?.counts.current ?? 0} excerpt(s) match the current source
+          {result.verification.excerpts?.counts.drifted ? ` · ${result.verification.excerpts.counts.drifted} drifted` : ""}
+          {result.imported ? ` · merged ${result.merge?.evidenceGained ?? 0} evidence, ${result.merge?.notesAdded ?? 0} note(s)` : ""}
+        </small>
+        {result.reason && <em data-reason="refused">{result.reason}</em>}
+        {(result.merge?.conflicts ?? []).slice(0, 4).map((conflict) => <i key={`${conflict.kind}-${conflict.skillId ?? conflict.noteId}`} data-conflict={conflict.kind}>{conflict.detail}</i>)}
+        {result.verification.problems.map((problem) => <i key={problem} data-problem="true">{problem}</i>)}
       </div>}
     </>}
   </section>;

@@ -1,6 +1,6 @@
+import { useEffect, useRef } from "react";
 import type { ReactNode } from "react";
-import { browserBridge } from "./demo";
-import type { Repository } from "./types";
+import type { Repository, TraceBridge } from "./types";
 
 /**
  * Shared renderer primitives.
@@ -14,9 +14,75 @@ const missingDesktopBridge = new Proxy({}, {
   get() {
     return async () => { throw new Error("Desktop bridge failed to load. Restart Trace or reinstall the app."); };
   },
-}) as unknown as typeof browserBridge;
-export const bridge = window.trace ?? (navigator.userAgent.includes("Electron") ? missingDesktopBridge : browserBridge);
+}) as unknown as TraceBridge;
 
+/**
+ * The browser demo, resolved on first use rather than imported.
+ *
+ * The demo implements every bridge method against a bundled fixture, which is
+ * tens of kilobytes the desktop app can never execute: in Electron
+ * `window.trace` is always present. Importing it eagerly put the entire fixture
+ * in the entry chunk and spent most of the bundle budget on code one of the two
+ * targets never runs. Every bridge method is already asynchronous and awaited,
+ * so a proxy that loads the module on the first call is indistinguishable from
+ * the real thing at the call site.
+ */
+const lazyBrowserBridge = new Proxy({}, {
+  get(_target, method) {
+    // `onIndexProgress` is the one member that is *not* a promise: it subscribes
+    // and returns an unsubscribe function, which `useEffect` calls as cleanup.
+    // Wrapping it like the rest handed React a promise as a destructor and
+    // crashed the start screen with "destroy is not a function".
+    if (method === "onIndexProgress") {
+      return (callback: (progress: unknown) => void) => {
+        let unsubscribe: (() => void) | null = null;
+        let cancelled = false;
+        void import("./demo").then(({ browserBridge }) => {
+          if (cancelled) return;
+          unsubscribe = browserBridge.onIndexProgress(callback as never) as unknown as () => void;
+        });
+        return () => { cancelled = true; unsubscribe?.(); };
+      };
+    }
+    return async (...args: unknown[]) => {
+      const { browserBridge } = await import("./demo");
+      const implementation = (browserBridge as unknown as Record<string, (...rest: unknown[]) => unknown>)[String(method)];
+      if (typeof implementation !== "function") throw new Error(`The browser demo does not implement ${String(method)}.`);
+      return implementation(...args);
+    };
+  },
+}) as unknown as TraceBridge;
+
+export const bridge = window.trace ?? (navigator.userAgent.includes("Electron") ? missingDesktopBridge : lazyBrowserBridge);
+
+
+/**
+ * Start a panel's initial load exactly once per key, and never cancel it.
+ *
+ * Several panels shared a shape that was wrong in a way that only timing hid:
+ * mark the state "loading", start a request, and cancel it from the effect's
+ * cleanup — with `status` in the dependency list. Marking it loading changes
+ * that dependency, so React ran the cleanup *immediately* and cancelled the
+ * request the effect had just started. It worked only because the response
+ * arrived on the microtask before React committed the re-render. Making the
+ * browser demo lazy added one module fetch to that race and every one of those
+ * panels hung on "Loading…" forever.
+ *
+ * There is also nothing to cancel. Panel state is owned by `App`, precisely so
+ * that switching to the editor and back does not throw away work in progress, so
+ * a result that arrives after the panel unmounts is *wanted*. The only event
+ * that invalidates a request is the key changing, which is what `key` is for.
+ */
+export function useLoadOnce(key: string, ready: boolean, start: () => void) {
+  const started = useRef<string | null>(null);
+  // Deliberately no dependency array: the ref, not React's comparison, decides
+  // when to run, which is the whole point.
+  useEffect(() => {
+    if (!ready || started.current === key) return;
+    started.current = key;
+    start();
+  });
+}
 
 export function Icon({ name, size = 16 }: { name: string; size?: number }) {
   const paths: Record<string, ReactNode> = {

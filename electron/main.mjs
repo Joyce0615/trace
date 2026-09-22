@@ -34,6 +34,9 @@ import { EXPERIMENTS, experimentReport, settingsFor } from "./experiments.mjs";
 import { goalPlan } from "./goals.mjs";
 import { detectLicense, importCourse, packageCourse, verifyPackage } from "./course-package.mjs";
 import { applyMigration, buildSymbolSnapshot, courseAnchorSites, planMigration, revertMigration } from "./course-migration.mjs";
+import { buildArchive, importArchive, verifyArchive } from "./offline-archive.mjs";
+import { loadNotes, saveNotes } from "./notes-store.mjs";
+import { applyNoteEdit } from "./notes.mjs";
 import { anchorPayload, loadOrCreateKeyPair, loadTrustedKeys, publicIdentity, responsePayload, setKeyTrust, signPackage, signPayload, verifyPackageSignature, verifyPayload } from "./signing.mjs";
 import { forgetEverything, loadExperimentState, recordObservation, setConsent } from "./experiment-store.mjs";
 
@@ -82,6 +85,21 @@ function experimentDirectory() {
 function signingDirectory() {
   return path.join(app.getPath("userData"), "signing");
 }
+
+function notesDirectory() {
+  return path.join(app.getPath("userData"), "notes");
+}
+
+function learningDirectory() {
+  return path.join(app.getPath("userData"), "learning");
+}
+
+/**
+ * An archive is only useful offline if it carries the source its anchors point
+ * at, and reading source is the expensive half of an export, so it is bounded
+ * the same way indexing is.
+ */
+const ARCHIVE_LIMITS = { maxFiles: 200, maxFileBytes: 400_000 };
 
 /** The machine's signing key, created on first use and cached for the session. */
 let signingKeyPromise = null;
@@ -766,6 +784,91 @@ const ipcHandlers = {
     openedRepository(request.repository);
     if (!Array.isArray(request.course?.modules)) throw new Error("Invalid revert request.");
     return revertMigration(request.course, request.migrationId ?? null);
+  },
+
+  "notes:list": async (_event, request) => {
+    const repository = openedRepository(request.repository);
+    return { notes: await loadNotes(notesDirectory(), repository.id) };
+  },
+
+  "notes:save": async (_event, request) => {
+    const repository = openedRepository(request.repository);
+    const notes = await loadNotes(notesDirectory(), repository.id);
+    const edit = applyNoteEdit(notes, {
+      id: request.id,
+      lessonId: request.lessonId ?? null,
+      anchor: request.anchor ?? null,
+      text: request.text,
+    });
+    const saved = await saveNotes(notesDirectory(), repository.id, edit.notes);
+    return { notes: saved, removed: edit.removed, note: saved.find((note) => note.id === request.id) ?? null };
+  },
+
+  "archive:export": async (_event, request) => {
+    const repository = openedRepository(request.repository);
+    if (!Array.isArray(request.course?.modules)) throw new Error("Invalid archive request.");
+    // Only the files the course actually anchors into are read, so exporting a
+    // course never turns into reading the repository.
+    const sources = {};
+    if (request.includeExcerpts !== false) {
+      const anchored = [...new Set(courseAnchorSites(request.course).map((site) => site.anchor.path))].slice(0, ARCHIVE_LIMITS.maxFiles);
+      for (const filePath of anchored) {
+        const file = repository.files.find((candidate) => candidate.path === filePath);
+        if (!file || file.size > ARCHIVE_LIMITS.maxFileBytes) continue;
+        try {
+          sources[filePath] = await readRepositoryFile(repository.rootPath, filePath);
+        } catch {
+          // An unreadable file is reported as a missing excerpt, not hidden.
+        }
+      }
+    }
+    const learnerState = request.learnerState ?? await loadLearnerState(learningDirectory(), repository.id);
+    const archive = buildArchive({
+      repository,
+      course: request.course,
+      skillGraph: request.skillGraph ?? null,
+      learnerState,
+      notes: await loadNotes(notesDirectory(), repository.id),
+      sources,
+    });
+    // Item 45's seal, over the archive as a whole: a learner carrying their own
+    // progress between machines should be able to tell whether it arrived intact.
+    const keyPair = await signingKey();
+    return { ...archive, signature: signPayload("offline-archive", archive, keyPair) };
+  },
+
+  "archive:import": async (_event, request) => {
+    const repository = openedRepository(request.repository);
+    const archive = request.archive;
+    // Verification reads only the files the archive claims excerpts from.
+    const sources = {};
+    for (const excerpt of (archive?.content?.excerpts ?? []).slice(0, ARCHIVE_LIMITS.maxFiles)) {
+      if (sources[excerpt.path] !== undefined) continue;
+      try {
+        sources[excerpt.path] = await readRepositoryFile(repository.rootPath, excerpt.path);
+      } catch {
+        sources[excerpt.path] = null;
+      }
+    }
+    const trustedKeyIds = await loadTrustedKeys(signingDirectory());
+    const { signature, ...payload } = archive ?? {};
+    const seal = verifyPayload("offline-archive", payload, signature ?? null, { trustedKeyIds });
+    if (!request.apply) return { imported: false, preview: true, verification: verifyArchive(archive, { sources }), seal };
+
+    const learnerState = request.learnerState ?? await loadLearnerState(learningDirectory(), repository.id);
+    const result = importArchive(archive, {
+      sources,
+      mode: request.mode ?? "merge",
+      learnerState,
+      notes: await loadNotes(notesDirectory(), repository.id),
+      force: Boolean(request.force),
+    });
+    if (!result.imported) return { ...result, seal };
+    // Persisted only after the merge succeeded, so a refused archive cannot
+    // leave the learner half-migrated.
+    if (result.learnerState) await saveLearnerState(learningDirectory(), { ...result.learnerState, repositoryId: repository.id });
+    const notes = await saveNotes(notesDirectory(), repository.id, result.notes);
+    return { ...result, notes, seal };
   },
 
   "signing:identity": async (_event, request) => {

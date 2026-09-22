@@ -1,4 +1,4 @@
-import type { Architecture, ArchitectureModule, DataFlow, DiagnosisReport, CallChain, CallChainStep, ContextPack, LocalizationExercise, RaceStageResult, RaceTask, ContextSection, KnowledgeGraphEdge, KnowledgeGraphNode, KnowledgeGraphSummary, LearnerState, LinkClassification, PredictionExercise, TraceBridge } from "./types";
+import type { Architecture, ArchitectureModule, DataFlow, DiagnosisReport, CallChain, CallChainStep, ContextPack, LocalizationExercise, RaceStageResult, RaceTask, ContextSection, KnowledgeGraphEdge, KnowledgeGraphNode, KnowledgeGraphSummary, LearnerNote, LearnerState, LinkClassification, PredictionExercise, TraceBridge } from "./types";
 import { nanoCourse, nanoLearnerState, nanoRepository, nanoSkillGraph, nanoSourceByPath } from "./nano-demo";
 // The demo runs the *same* retrieval and evaluation code as the desktop app, so
 // both behave identically with and without a main process. They are imported
@@ -11,6 +11,14 @@ export const demoSkillGraph = nanoSkillGraph;
 export const demoLearnerState = nanoLearnerState;
 
 let savedLearning: LearnerState = structuredClone(nanoLearnerState);
+
+/**
+ * Notes for the session (item 47). The desktop app persists these; the browser
+ * has no user-data directory, so the demo keeps them in memory and says so.
+ */
+let demoNotes: LearnerNote[] = [
+  { id: "note-engine-map", lessonId: "engine-map", anchor: { path: "nanovllm/engine/llm_engine.py", line: 46, symbol: "step" }, text: "step() is the whole engine in six lines: schedule, run, postprocess, collect.", createdAt: "2026-01-04T09:00:00.000Z", updatedAt: "2026-01-04T09:00:00.000Z" },
+];
 let demoSearchIndex: SearchIndex | null = null;
 let demoProbes: Record<string, Parameters<typeof import("../electron/misconception.mjs").gradeProbe>[0]> = {};
 let demoActivities: import("../electron/activities.mjs").InternalActivitySet | null = null;
@@ -748,6 +756,44 @@ export const browserBridge: TraceBridge = {
   async revertCourseMigration(request) {
     const migration = await import("../electron/course-migration.mjs");
     return migration.revertMigration(request.course, request.migrationId ?? null);
+  },
+  async listNotes() {
+    return { notes: demoNotes };
+  },
+  async saveNote(request) {
+    // The demo keeps notes in memory for the session; the desktop app writes
+    // them to disk. Both go through the same edit rules.
+    const notes = await import("../electron/notes.mjs");
+    const edit = notes.applyNoteEdit(demoNotes, { id: request.id, lessonId: request.lessonId ?? null, anchor: request.anchor ?? null, text: request.text });
+    demoNotes = edit.notes;
+    return { notes: demoNotes, removed: edit.removed, note: edit.note };
+  },
+  async exportArchive(request) {
+    const archive = await import("../electron/offline-archive.mjs");
+    // The demo has its fixture source in memory, so an exported archive really
+    // is readable with no repository — the same claim the desktop app makes.
+    return archive.buildArchive({
+      repository: nanoRepository,
+      course: request.course,
+      skillGraph: request.skillGraph ?? nanoSkillGraph,
+      learnerState: request.learnerState ?? savedLearning,
+      notes: demoNotes,
+      sources: nanoSourceByPath,
+    });
+  },
+  async importArchive(request) {
+    const archive = await import("../electron/offline-archive.mjs");
+    const verification = archive.verifyArchive(request.archive, { sources: nanoSourceByPath });
+    if (!request.apply) return { imported: false, preview: true, verification, seal: null };
+    const result = archive.importArchive(request.archive, {
+      sources: nanoSourceByPath,
+      mode: request.mode ?? "merge",
+      learnerState: request.learnerState ?? savedLearning,
+      notes: demoNotes,
+      force: Boolean(request.force),
+    });
+    if (result.imported && result.notes) demoNotes = result.notes;
+    return { ...result, seal: null };
   },
   async goalPlan(request) {
     // The demo ranks with the same signal detectors as the desktop app.

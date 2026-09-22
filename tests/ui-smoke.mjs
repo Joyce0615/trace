@@ -312,6 +312,49 @@ try {
   assert.match(await migrationResult.innerText(), /Prefix Cache Lookups: orphaned/);
   await page.screenshot({ path: path.join(artifactDirectory, "course-migration.png") });
 
+  // Item 47: a note the learner writes is persisted through the bridge and then
+  // travels in the offline archive alongside the source its anchors point at.
+  await page.locator(".content-tabs").getByRole("button", { name: "Notes" }).click();
+  const notesPane = page.locator(".lesson-notes");
+  await notesPane.waitFor();
+  const noteId = await notesPane.getAttribute("data-note-id");
+  assert.match(noteId ?? "", /^lesson:/);
+  await notesPane.locator("textarea").fill("The scheduler decides the batch; the runner executes it.");
+  await page.waitForFunction(() => (window.traceWorkspace?.notes ?? []).some((note) => /scheduler decides the batch/.test(note.text)));
+  // Switching to another view and back must not lose it: notes are App-owned.
+  await page.locator(".content-tabs").getByRole("button", { name: "Lesson" }).click();
+  await page.locator(".content-tabs").getByRole("button", { name: "Notes" }).click();
+  await notesPane.waitFor();
+  assert.match(await notesPane.locator("textarea").inputValue(), /scheduler decides the batch/);
+
+  // The archive lives with the other course-level panels.
+  await page.locator(".content-tabs").getByRole("button", { name: "Diagram" }).click();
+  const archivePanel = page.locator(".archive-panel");
+  await archivePanel.waitFor();
+  await archivePanel.getByRole("button", { name: "Export everything" }).click();
+  await archivePanel.locator(".archive-totals").waitFor();
+  const archiveTotals = archivePanel.locator(".archive-totals");
+  const archiveAnchors = Number(await archiveTotals.getAttribute("data-anchors"));
+  assert.ok(archiveAnchors >= 4, String(archiveAnchors));
+  assert.equal(await archiveTotals.getAttribute("data-excerpts"), String(archiveAnchors), "every anchor must carry its source");
+  assert.equal(await archivePanel.getAttribute("data-offline"), "true");
+  assert.match(await archivePanel.locator('[data-note="offline"]').innerText(), /studied with the repository closed/);
+  assert.ok(Number(await archiveTotals.getAttribute("data-notes")) >= 2, "the note just written is in the archive");
+  // Reading it back into the repository it came from finds every excerpt current.
+  await archivePanel.getByRole("button", { name: "Check it", exact: true }).click();
+  await archivePanel.locator(".archive-result").waitFor();
+  assert.equal(await archivePanel.locator(".archive-result").getAttribute("data-verdict"), "intact");
+  assert.match(await archivePanel.locator(".archive-result small").innerText(), new RegExp(`${archiveAnchors} excerpt\\(s\\) match the current source`));
+  // An archive edited outside Trace is detected and refused.
+  await archivePanel.getByRole("button", { name: "Check an edited copy" }).click();
+  await page.locator('.archive-result[data-verdict="altered"]').waitFor();
+  assert.match(await archivePanel.locator(".archive-result").innerText(), /checksum does not match/);
+  // Reading the intact one back merges without conflicts and keeps the notes.
+  await archivePanel.getByRole("button", { name: "Read it back" }).click();
+  await page.locator('.archive-result[data-imported="true"]').waitFor();
+  assert.equal(await archivePanel.locator(".archive-result").getAttribute("data-verdict"), "intact");
+  await page.screenshot({ path: path.join(artifactDirectory, "offline-archive.png") });
+
   // Item 42: consent is the gate, and it is reversible.
   const experiments = page.locator(".experiment-panel");
   await experiments.waitFor();

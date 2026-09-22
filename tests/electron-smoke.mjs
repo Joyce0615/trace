@@ -1159,6 +1159,111 @@ try {
     starterCourse: { anchors: starterPlan.totals.anchors, counts: starterPlan.counts, retired: starterMigration.retired, orphaned: starterPlan.totals.orphanedLessons },
   };
 
+  // Item 47: everything the learner owns, exported so it can be studied with the
+  // repository closed, and read back without losing a single piece of evidence.
+  const archiveAudit = await page.evaluate(async () => {
+    const workspace = window.traceWorkspace;
+    const repository = { id: workspace.repository.id, rootPath: workspace.repository.rootPath };
+    // Two notes, one of them quoting a credential, so redaction is exercised on
+    // the real path to disk rather than in a unit test.
+    await window.trace.saveNote({ repository, id: "lesson:one", lessonId: workspace.course.modules[0].lessons[0].id, text: "The JIT cache is keyed by architecture, not by device." });
+    await window.trace.saveNote({ repository, id: "lesson:secret", lessonId: "two", text: "the CI token is ghp_abcdefghij0123456789abcdefghij012345 apparently" });
+    const listed = await window.trace.listNotes({ repository });
+    const archive = await window.trace.exportArchive({ repository, course: workspace.course, skillGraph: workspace.skillGraph, learnerState: workspace.learnerState });
+    const checked = await window.trace.importArchive({ repository, archive });
+    // An archive edited after export must be refused, not merged.
+    const doctored = structuredClone(archive);
+    doctored.content.excerpts[0].text = `${doctored.content.excerpts[0].text}\n# inserted later`;
+    const doctoredCheck = await window.trace.importArchive({ repository, archive: doctored });
+    const doctoredImport = await window.trace.importArchive({ repository, archive: doctored, apply: true });
+    // Reading the intact archive back into the machine it came from must be a
+    // no-op that loses nothing.
+    const readBack = await window.trace.importArchive({ repository, archive, apply: true });
+    const afterNotes = await window.trace.listNotes({ repository });
+    // Deleting is saving empty text.
+    const deleted = await window.trace.saveNote({ repository, id: "lesson:secret", text: "" });
+    const unreadable = await window.trace.importArchive({ repository, archive: { format: "not-an-archive" } });
+    return { listed, archive, checked, doctoredCheck, doctoredImport, readBack, afterNotes, deleted, unreadable, serialized: JSON.stringify(archive) };
+  });
+
+  const exported = archiveAudit.archive;
+  assert.equal(exported.format, "trace-archive-v1");
+  assert.equal(exported.provenance.repositoryId, identity.id);
+  assert.equal(exported.provenance.commit, identity.head);
+  // The claim that makes an archive worth carrying.
+  assert.ok(exported.completeness.anchors >= 4, String(exported.completeness.anchors));
+  assert.equal(exported.completeness.excerpted, exported.completeness.anchors, JSON.stringify(exported.completeness.missing));
+  assert.equal(exported.completeness.offlineReadable, true);
+  assert.equal(exported.completeness.notes, 2);
+  // Every excerpt is the real FlashInfer source at the lines it claims.
+  const archiveTargets = await page.evaluate(async (excerpts) => {
+    const rootPath = window.traceWorkspace.repository.rootPath;
+    const seen = {};
+    for (const excerpt of excerpts) {
+      if (seen[excerpt.path]) continue;
+      seen[excerpt.path] = String(await window.trace.readFile(rootPath, excerpt.path));
+    }
+    return seen;
+  }, exported.content.excerpts.map((excerpt) => ({ path: excerpt.path })));
+  for (const excerpt of exported.content.excerpts) {
+    const lines = archiveTargets[excerpt.path].split("\n").slice(excerpt.startLine - 1, excerpt.endLine).join("\n");
+    assert.equal(excerpt.truncated ? lines.startsWith(excerpt.text) : lines === excerpt.text, true, `${excerpt.path}:${excerpt.line} is not the source it claims`);
+    assert.ok(excerpt.blobId, `${excerpt.path} has no blob id`);
+  }
+  // A credential typed into a note never reaches the archive, and no absolute
+  // home path travels in a file meant to be carried around.
+  assert.equal(archiveAudit.serialized.includes("ghp_abcdefghij0123456789abcdefghij012345"), false, "a secret in a note left the machine");
+  assert.equal(/\/Users\/[A-Za-z0-9._-]+\//.test(archiveAudit.serialized), false, "an absolute home path leaked into the archive");
+  // Item 45's seal covers the archive too.
+  assert.equal(exported.signature.subject, "offline-archive");
+  assert.equal(exported.signature.algorithm, "ed25519");
+  assert.equal(archiveAudit.checked.seal.verified, true, archiveAudit.checked.seal.reason);
+
+  // Checking it against the repository it came from finds every excerpt current.
+  assert.equal(archiveAudit.checked.preview, true);
+  assert.equal(archiveAudit.checked.verification.verdict, "intact");
+  assert.equal(archiveAudit.checked.verification.excerpts.counts.current, exported.content.excerpts.length);
+  assert.equal(archiveAudit.checked.verification.excerpts.counts.drifted, 0);
+  assert.deepEqual(archiveAudit.checked.verification.problems, []);
+
+  // An edited archive is detected and refused.
+  assert.equal(archiveAudit.doctoredCheck.verification.verdict, "altered");
+  assert.equal(archiveAudit.doctoredCheck.seal.verified, false, "the seal breaks too");
+  assert.equal(archiveAudit.doctoredImport.imported, false);
+  assert.match(archiveAudit.doctoredImport.reason, /altered after export/);
+
+  // Reading the intact archive back merges without gaining or losing anything.
+  assert.equal(archiveAudit.readBack.imported, true);
+  assert.equal(archiveAudit.readBack.mode, "merge");
+  assert.equal(archiveAudit.readBack.merge.evidenceGained, 0, "importing your own archive cannot invent evidence");
+  assert.equal(archiveAudit.readBack.merge.notesAdded, 0);
+  assert.deepEqual(archiveAudit.readBack.merge.conflicts, []);
+  assert.equal(archiveAudit.readBack.offlineReadable, true);
+  assert.deepEqual(
+    archiveAudit.afterNotes.notes.map((note) => note.id).sort(),
+    archiveAudit.listed.notes.map((note) => note.id).sort(),
+    "a round trip through the archive changed the note set",
+  );
+  // Notes really are persisted, and a redacted one stays redacted.
+  assert.equal(archiveAudit.listed.notes.length, 2);
+  assert.equal(archiveAudit.listed.notes.some((note) => note.text.includes("ghp_abcdefghij")), false, "a secret was persisted");
+  assert.equal(archiveAudit.deleted.removed, true);
+  assert.equal(archiveAudit.deleted.notes.length, 1);
+  assert.equal(archiveAudit.unreadable.verification.verdict, "unreadable");
+
+  const archiveReport = {
+    anchors: exported.completeness.anchors,
+    excerpts: exported.completeness.excerpted,
+    excerptBytes: exported.content.excerpts.reduce((sum, excerpt) => sum + excerpt.text.length, 0),
+    offlineReadable: exported.completeness.offlineReadable,
+    notes: exported.completeness.notes,
+    skills: exported.completeness.skills,
+    sealed: exported.signature.subject,
+    checkVerdict: archiveAudit.checked.verification.verdict,
+    doctoredVerdict: archiveAudit.doctoredCheck.verification.verdict,
+    readBackGained: archiveAudit.readBack.merge,
+  };
+
   // Item 43: five goals over the same real repository, each ranked from counted
   // source signals rather than from a label.
   const goalAudit = await page.evaluate(async () => {
@@ -1580,6 +1685,7 @@ try {
     diagnosis: { skills: diagnosis.skills.length, assessed: diagnosis.summary.assessed, meanConfidence: diagnosis.summary.meanConfidence, brier: diagnosis.summary.meanBrier, overconfident: diagnosis.summary.overconfidentSkills, misconceptions: diagnosis.summary.misconceptionCounts },
     signing: { algorithm: signingAudit.identity.algorithm, keyId: `${signingAudit.identity.keyId.slice(0, 12)}…`, packageSealed: signingAudit.asIs.signature.verified, anchorsSealed: signingAudit.asIs.anchorSignature.verified, tamperReason: signingAudit.doctoredCheck.signature.reason, tamperedImport: signingAudit.doctoredImport.imported, trustBefore: signingAudit.beforeTrust.signature.trust, trustAfter: signingAudit.afterTrust.signature.trust },
     migration: migrationReport,
+    archive: archiveReport,
     coursePackage: { format: coursePackage.format, commit: (coursePackage.provenance.commit ?? "").slice(0, 8), anchors: coursePackage.integrity.anchorCount, license: coursePackage.license.id, policy: coursePackage.license.policy, embeddedFiles: packageAudit.requested.integrity.excerptCount, roundTrip: packageAudit.roundTrip.verification.verdict, foreign: packageAudit.foreign.verification.verdict },
     goals: Object.fromEntries(goalIds.map((goal) => [goal, { top: rankings[goal][0], targets: rankings[goal].length, topReasons: goalAudit.plans[goal].targets[0].reasons.map((reason) => reason.detail) }])),
     experiments: { arms: experimentAudit.armsSeen.map(([arm, observed]) => `${arm}:declared=${observed.declared},applied=${observed.applied},queued=${observed.queued}`), unconsentedLimit: experimentAudit.controlPlan.parameters.dailyLimit, assignedArm: experimentAudit.consented.assignments.map((item) => `${item.experimentId}=${item.arm}`), assignedLimit, explicitLimit: experimentAudit.explicitPlan.parameters.dailyLimit, observations: experimentAudit.afterObservation.observations, verdict: limitResult.verdict, afterWithdrawal: experimentAudit.afterWithdrawalPlan.parameters.dailyLimit, deleted: experimentAudit.forgotten.deletedObservations },

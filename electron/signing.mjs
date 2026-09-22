@@ -33,7 +33,7 @@ export const SIGNING_VERSION = 1;
 export const SIGNING_ALGORITHM = "ed25519";
 
 /** The kinds of thing that can be signed. A signature is bound to exactly one. */
-export const SIGNABLE_SUBJECTS = ["course-package", "source-anchors", "assessment", "agent-response"];
+export const SIGNABLE_SUBJECTS = ["course-package", "source-anchors", "assessment", "agent-response", "offline-archive"];
 
 /**
  * Deterministic serialisation: object keys sorted at every depth, arrays left

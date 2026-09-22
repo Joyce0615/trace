@@ -1,4 +1,4 @@
-import type { ActivitySet, AnalyticsReport, Architecture, CourseImportResult, CoursePackage, ExperimentReport, MigrationResult, GoalPlan, LearnerGoal, ContrastGrade, DiagnosisReport, EvaluationReport, EvidenceImport, ExecutableQuiz, ExplanationGrade, ExplanationTask, HintRung, HistorySummary, PredictionOutcome, TeachBackGrade, Lesson, ProbeGrade, QuizGrade, ReviewPlan, ReviewResult, SymbolFlow, CallChain, LocalizationExercise, LocalizationHint, LocalizationScore, PredictionExercise, PredictionGrade, RaceReport, RaceTask, TraceRunResult, TraceRuntime } from "./types";
+import type { ActivitySet, AnalyticsReport, Architecture, ArchiveImportResult, CourseImportResult, CoursePackage, ExperimentReport, MigrationResult, OfflineArchive, GoalPlan, LearnerGoal, ContrastGrade, DiagnosisReport, EvaluationReport, EvidenceImport, ExecutableQuiz, ExplanationGrade, ExplanationTask, HintRung, HistorySummary, PredictionOutcome, TeachBackGrade, Lesson, ProbeGrade, QuizGrade, ReviewPlan, ReviewResult, SymbolFlow, CallChain, LocalizationExercise, LocalizationHint, LocalizationScore, PredictionExercise, PredictionGrade, RaceReport, RaceTask, TraceRunResult, TraceRuntime } from "./types";
 
 /**
  * Exercise state shapes.
@@ -191,3 +191,14 @@ export type MigrationState = {
 };
 
 export const emptyMigrationState: MigrationState = { result: null, applied: null, expanded: null, accept: "auto", status: "idle" };
+
+/** Item 47. The exported archive and the last import report are kept apart so a
+ * learner can see what they produced and what it did when it was read back. */
+export type ArchiveState = {
+  archive: OfflineArchive | null;
+  result: ArchiveImportResult | null;
+  mode: "merge" | "replace";
+  status: "idle" | "exporting" | "ready" | "error";
+};
+
+export const emptyArchiveState: ArchiveState = { archive: null, result: null, mode: "merge", status: "idle" };

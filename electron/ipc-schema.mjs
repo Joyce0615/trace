@@ -357,6 +357,30 @@ export const IPC_SCHEMAS = {
     course: s.opaque(),
     migrationId: s.string({ maxLength: 160, optional: true, nullable: true }),
   }),
+  "notes:list": s.object({ repository: repositoryReference }),
+  "notes:save": s.object({
+    repository: repositoryReference,
+    id: s.string({ maxLength: 120, minLength: 1 }),
+    lessonId: s.string({ maxLength: 120, optional: true, nullable: true }),
+    anchor: s.object({ path: s.string({ maxLength: 1_024 }), line: s.number({ integer: true, min: 1 }), symbol: s.string({ maxLength: 200, optional: true, nullable: true }) }, { optional: true, nullable: true }),
+    // An empty note is a delete; see `applyNoteEdit`.
+    text: s.string({ maxLength: 8_000 }),
+  }),
+  "archive:export": s.object({
+    repository: repositoryReference,
+    course: s.opaque(),
+    skillGraph: s.opaque({ optional: true, nullable: true }),
+    learnerState: s.opaque({ optional: true, nullable: true }),
+    includeExcerpts: s.boolean({ optional: true }),
+  }),
+  "archive:import": s.object({
+    repository: repositoryReference,
+    archive: s.opaque(),
+    mode: s.literal(["merge", "replace"], { optional: true }),
+    apply: s.boolean({ optional: true }),
+    force: s.boolean({ optional: true }),
+    learnerState: s.opaque({ optional: true, nullable: true }),
+  }),
   "goals:plan": s.object({
     repository: repositoryReference,
     goal: s.literal(GOAL_IDS),

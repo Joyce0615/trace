@@ -1,5 +1,3 @@
-import os from "node:os";
-import path from "node:path";
 
 /**
  * Secret and personal-data scanning.
@@ -89,7 +87,7 @@ export function scanText(text, options = {}) {
       // style example in documentation would be reported.
       if (detector.id === "assigned-secret" && shannonEntropy(captured) < minimumEntropy) continue;
       // The learner's own account name is personal data even at low entropy.
-      if (detector.id === "home-directory" && raw === `/Users/${os.userInfo().username}` && options.includeOwnHome === false) continue;
+      if (detector.id === "home-directory" && raw === `/Users/${currentUserName()}` && options.includeOwnHome === false) continue;
       findings.push({
         id: detector.id,
         severity: detector.severity,
@@ -126,11 +124,32 @@ export function redact(text) {
   return value;
 }
 
+/**
+ * The home directory, when there is a process to ask.
+ *
+ * This module is shared with the browser demo, so it must not import
+ * `node:os`: Vite externalizes it and the *first call* throws, which is a
+ * failure that only appears in the one target nobody runs under a debugger.
+ * Where there is no process, the `home-directory` detector below still redacts
+ * `/Users/name` and `/home/name` by shape.
+ */
+function homeDirectory() {
+  const environment = typeof process === "undefined" ? null : process.env;
+  return environment?.HOME || environment?.USERPROFILE || null;
+}
+
+function currentUserName() {
+  const home = homeDirectory();
+  return home ? home.split(/[/\\]/).filter(Boolean).at(-1) ?? "" : "";
+}
+
 /** Redact absolute paths that expose the user's account name. */
 export function anonymizePath(filePath) {
-  const home = os.homedir();
+  const home = homeDirectory();
   const value = String(filePath ?? "");
-  return value.startsWith(home) ? path.join("~", path.relative(home, value)) : redact(value);
+  if (!home || !value.startsWith(home)) return redact(value);
+  const relative = value.slice(home.length).replace(/^[/\\]+/, "");
+  return relative ? `~/${relative}` : "~";
 }
 
 /**

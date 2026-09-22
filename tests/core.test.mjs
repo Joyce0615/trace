@@ -22,6 +22,9 @@ import { GIT_HISTORY_VERSION, busFactor, detectRenames, historyLessons, historyS
 import { MISCONCEPTIONS, MISCONCEPTION_VERSION, buildProbe, calibrateSkill, detectMisconceptions, diagnoseLearner, gradeProbe } from "../electron/misconception.mjs";
 import { SIGNING_ALGORITHM, SIGNING_VERSION, anchorPayload, assessmentPayload, canonicalize, createKeyPair, digestOf, keyIdFor, loadOrCreateKeyPair, loadTrustedKeys, packagePayload, publicIdentity, responsePayload, setKeyTrust, signPackage, signPayload, verifyPackageSignature, verifyPayload } from "../electron/signing.mjs";
 import { COURSE_PACKAGE_FORMAT, COURSE_PACKAGE_VERSION, anchorManifest, detectLicense, importCourse, packageCourse, verifyPackage } from "../electron/course-package.mjs";
+import { ARCHIVE_FORMAT, ARCHIVE_VERSION, buildArchive, canonicalJson, digestOfText, excerptAround, importArchive, mergeNotes, mergeProgress, verifyArchive } from "../electron/offline-archive.mjs";
+import { loadNotes, saveNotes } from "../electron/notes-store.mjs";
+import { MAX_NOTES, MAX_NOTE_CHARS, NOTES_VERSION, applyNoteEdit, boundNotes } from "../electron/notes.mjs";
 import { DEFAULT_MIGRATION_THRESHOLDS, MIGRATION_VERSION, applyMigration, bodyTokens, buildSymbolSnapshot, courseAnchorSites, coverage, jaccard, planMigration, revertMigration, shingles } from "../electron/course-migration.mjs";
 import { GOALS, GOALS_VERSION, goalKeywords, goalPlan, orderLessonsForGoal, rankTargets, resolveGoal } from "../electron/goals.mjs";
 import { EXPERIMENTS, EXPERIMENT_VERSION, OBSERVATION_FIELDS, activeAssignments, analyzeExperiment, assignArm, consentState, experimentReport, hash32, sanitizeObservation, settingsFor } from "../electron/experiments.mjs";
@@ -515,6 +518,16 @@ test("the production entry bundle excludes Monaco and stays inside its budget", 
   const exerciseChunk = assets.find((asset) => /^exercises-.*\.js$/.test(asset));
   assert.ok(exerciseChunk, "the exercise panels must be emitted as their own chunk");
   assert.equal(eager.includes(exerciseChunk), false, "the exercise panels must not be preloaded by the entry");
+
+  // The browser demo is a fixture the desktop app can never execute, because
+  // `window.trace` is always present in Electron. It must not be in the entry.
+  const demoChunk = assets.find((asset) => /^demo-.*\.js$/.test(asset));
+  assert.ok(demoChunk, "the browser demo must be emitted as its own chunk");
+  assert.equal(eager.includes(demoChunk), false, "the browser demo must not be preloaded by the entry");
+  for (const asset of eager) {
+    const source = await readFile(path.join(assetDirectory, asset), "utf8");
+    assert.equal(/nano-vllm-featured-course|A lightweight vLLM implementation/.test(source), false, `${asset} statically bundles the demo fixture`);
+  }
   for (const asset of eager) {
     const source = await readFile(path.join(assetDirectory, asset), "utf8");
     assert.equal(/CROSS-FILE REASONING|LOCALIZATION DRILL|GRADED REVIEW/.test(source), false, `${asset} statically bundles an exercise panel`);
@@ -761,7 +774,7 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
     "learning:diagnose", "learning:probe", "learning:schedule", "learning:review",
     "quiz:build", "quiz:grade", "explain:task", "explain:grade",
     "activity:build", "activity:grade", "hint:next", "analytics:report",
-    "course:package", "course:import", "course:verify-signature", "course:migrate", "course:revert-migration",
+    "course:package", "course:import", "course:verify-signature", "course:migrate", "course:revert-migration", "notes:list", "notes:save", "archive:export", "archive:import",
     "signing:identity", "signing:trust", "goals:plan", "experiment:state", "experiment:consent", "experiment:forget", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
@@ -4594,4 +4607,339 @@ test("course migrations follow symbols that move, split, are renamed, or disappe
   assert.notEqual(hash32("abc"), hash32("abd"));
   // Order is meaning: the same tokens in a different order are not the same body.
   assert.notDeepEqual(shingles(["a", "b", "c", "d"]), shingles(["d", "c", "b", "a"]));
+});
+
+test("an offline archive carries verified excerpts and merges back without losing work", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-archive-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "app"), { recursive: true });
+  await writeFile(path.join(rootPath, "app", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "app", "queue.py"), Array.from({ length: 60 }, (_, index) => (index === 29 ? "def enqueue(job):" : `# filler line ${index}`)).join("\n") + "\n    return job\n");
+  await writeFile(path.join(rootPath, "app", "worker.py"), "from app.queue import enqueue\n\n\ndef work(job):\n    return enqueue(job)\n");
+  await execFileAsync("git", ["init", "-q"], { cwd: rootPath });
+  await execFileAsync("git", ["config", "user.email", "a@b.c"], { cwd: rootPath });
+  await execFileAsync("git", ["config", "user.name", "Tester"], { cwd: rootPath });
+  await execFileAsync("git", ["add", "-A"], { cwd: rootPath });
+  await execFileAsync("git", ["commit", "-qm", "first"], { cwd: rootPath });
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const course = generateStarterCourse(repository);
+  const skillGraph = buildSkillGraph(repository, course);
+  const sources = {};
+  for (const file of repository.files) sources[file.path] = await readRepositoryFile(rootPath, file.path);
+
+  const notes = [
+    { id: "lesson:one", lessonId: "one", anchor: { path: "app/queue.py", line: 30, symbol: "enqueue" }, text: "enqueue is the only writer", createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" },
+    { id: "lesson:two", lessonId: "two", anchor: null, text: "come back to the worker retry path", createdAt: "2026-01-02T00:00:00.000Z", updatedAt: "2026-01-02T00:00:00.000Z" },
+  ];
+  const learnerState = {
+    repositoryId: repository.id,
+    diagnosticCompleted: true,
+    mastery: {
+      "skill-a": {
+        skillId: "skill-a", mastery: 0.4, confidence: 0.5, status: "learning",
+        evidence: [{ id: "e1", skillId: "skill-a", kind: "lesson", strength: 0.4, detail: "read the lesson", createdAt: "2026-01-01T00:00:00.000Z" }],
+        review: { stability: 3, difficulty: 5, reviews: 2, lapses: 0, lastReviewedAt: "2026-01-03T00:00:00.000Z", lastGrade: "good" },
+      },
+      "skill-b": {
+        skillId: "skill-b", mastery: 0.2, confidence: 0.3, status: "learning",
+        evidence: [{ id: "e2", skillId: "skill-b", kind: "quiz", strength: 0.2, detail: "failed the quiz", createdAt: "2026-01-01T00:00:00.000Z" }],
+      },
+    },
+    memory: [{ id: "m1", text: "the scheduler owns admission", source: "side-chat", createdAt: "2026-01-01T00:00:00.000Z" }],
+    updatedAt: "2026-01-03T00:00:00.000Z",
+  };
+
+  // --- Export --------------------------------------------------------------
+  const archive = buildArchive({ repository, course, skillGraph, learnerState, notes, sources, now: "2026-02-01T00:00:00.000Z" });
+  assert.equal(archive.format, ARCHIVE_FORMAT);
+  assert.equal(archive.provenance.repositoryId, repository.id);
+  assert.equal(archive.provenance.commit, repository.head);
+  assert.ok(archive.completeness.anchors >= 2, String(archive.completeness.anchors));
+  assert.equal(archive.completeness.excerpted, archive.completeness.anchors);
+  assert.equal(archive.completeness.offlineReadable, true, JSON.stringify(archive.completeness.missing));
+  assert.equal(archive.completeness.notes, 2);
+  assert.equal(archive.completeness.skills, 2);
+  assert.equal(archive.completeness.reviews, 1);
+
+  // --- The claim that makes it "offline" -----------------------------------
+  // Every excerpt is real source, not a placeholder, and it really contains the
+  // anchored line rather than pointing at it.
+  for (const excerpt of archive.content.excerpts) {
+    // An empty file really does have an empty excerpt; anything else must not.
+    assert.equal(excerpt.text.length === 0, sources[excerpt.path].length === 0, JSON.stringify(excerpt));
+    assert.ok(excerpt.startLine <= excerpt.line && excerpt.line <= excerpt.endLine);
+    const original = sources[excerpt.path].split("\n").slice(excerpt.startLine - 1, excerpt.endLine).join("\n");
+    assert.ok(original.startsWith(excerpt.text) || excerpt.text === original, `${excerpt.path}:${excerpt.line} is not the source it claims`);
+    assert.equal(excerpt.digest, digestOfText(excerpt.text));
+    assert.ok(excerpt.blobId, "an excerpt records the blob it came from");
+  }
+  // The window is centred on the anchor and includes context either side.
+  const deep = archive.content.excerpts.find((excerpt) => excerpt.path === "app/queue.py" && excerpt.line > 20);
+  if (deep) {
+    assert.ok(deep.startLine < deep.line, "an excerpt carries the lines before the anchor");
+    assert.ok(deep.text.split("\n").length > 10, "an excerpt is readable on its own");
+  }
+
+  // --- Verification without the repository ---------------------------------
+  const blind = verifyArchive(archive);
+  assert.equal(blind.readable, true);
+  assert.equal(blind.verdict, "intact");
+  assert.equal(blind.checksumOk, true);
+  assert.equal(blind.offlineReadable, true);
+  assert.equal(blind.excerpts.counts.unchecked, archive.content.excerpts.length, "with no repository nothing is claimed about the source");
+  assert.deepEqual(blind.problems, []);
+
+  // --- Verification against the repository ---------------------------------
+  const here = verifyArchive(archive, { sources });
+  assert.equal(here.verdict, "intact");
+  assert.equal(here.excerpts.counts.current, archive.content.excerpts.length);
+  assert.equal(here.excerpts.counts.drifted, 0);
+
+  // --- Tampering is detected without the repository ------------------------
+  const edited = structuredClone(archive);
+  edited.content.excerpts[0].text = `${edited.content.excerpts[0].text}\n# inserted by someone`;
+  const tampered = verifyArchive(edited);
+  assert.equal(tampered.verdict, "altered");
+  assert.equal(tampered.intact, false);
+  assert.equal(tampered.alteredExcerpts, 1);
+  assert.ok(tampered.problems.some((problem) => /do not match their own digest/.test(problem)), JSON.stringify(tampered.problems));
+  // Rewriting a note breaks the archive checksum even though every excerpt is fine.
+  const rewritten = structuredClone(archive);
+  rewritten.content.notes[0].text = "something the learner never wrote";
+  const rewrittenCheck = verifyArchive(rewritten);
+  assert.equal(rewrittenCheck.checksumOk, false);
+  assert.equal(rewrittenCheck.alteredExcerpts, 0, "the excerpts are untouched; only the checksum catches this");
+  assert.equal(rewrittenCheck.verdict, "altered");
+  // A hand-edited claim of completeness does not survive verification.
+  const boastful = structuredClone(archive);
+  boastful.completeness.anchors = archive.completeness.anchors + 5;
+  assert.equal(verifyArchive(boastful).offlineReadable, false);
+  assert.equal(verifyArchive({ format: "something-else" }).verdict, "unreadable");
+  assert.match(verifyArchive({ format: ARCHIVE_FORMAT, version: 99 }).reason, /newer than this build/);
+
+  // --- Drift: the source moved on ------------------------------------------
+  const movedSources = { ...sources, "app/worker.py": `# a new header\n${sources["app/worker.py"]}` };
+  const drifted = verifyArchive(archive, { sources: movedSources });
+  assert.equal(drifted.verdict, "drifted");
+  assert.equal(drifted.intact, true, "drift is a statement about the repository, not about the archive");
+  assert.ok(drifted.excerpts.counts.drifted >= 1, JSON.stringify(drifted.excerpts.counts));
+  assert.ok(drifted.problems.some((problem) => /no longer match the current source/.test(problem)));
+  // A file the importer does not have is "absent", which is not the same as drift.
+  const withoutWorker = { ...sources };
+  delete withoutWorker["app/worker.py"];
+  const partial = verifyArchive(archive, { sources: withoutWorker });
+  assert.ok(partial.excerpts.counts.absent >= 1, JSON.stringify(partial.excerpts.counts));
+
+  // --- Secrets never travel ------------------------------------------------
+  const leaky = buildArchive({
+    repository,
+    course,
+    learnerState,
+    notes: [{ id: "n", lessonId: "one", text: "the token is ghp_abcdefghij0123456789abcdefghij012345 apparently", createdAt: null, updatedAt: null }],
+    sources,
+  });
+  assert.equal(JSON.stringify(leaky).includes("ghp_abcdefghij0123456789abcdefghij012345"), false, "a secret in a note left the machine");
+  // Redaction happens before the checksum, so a redacted archive still verifies.
+  assert.equal(verifyArchive(leaky).checksumOk, true);
+
+  // --- Import: nothing is lost ---------------------------------------------
+  // The other machine reviewed skill-a again, learned skill-c, and wrote a note.
+  const elsewhere = {
+    repositoryId: repository.id,
+    diagnosticCompleted: false,
+    mastery: {
+      "skill-a": {
+        skillId: "skill-a", mastery: 0.9, confidence: 0.8, status: "mastered",
+        evidence: [
+          { id: "e1", skillId: "skill-a", kind: "lesson", strength: 0.4, detail: "read the lesson", createdAt: "2026-01-01T00:00:00.000Z" },
+          { id: "e3", skillId: "skill-a", kind: "review", strength: 0.9, detail: "recalled it cold", createdAt: "2026-01-05T00:00:00.000Z" },
+        ],
+        review: { stability: 9, difficulty: 4, reviews: 4, lapses: 1, lastReviewedAt: "2026-01-05T00:00:00.000Z", lastGrade: "easy" },
+      },
+      "skill-c": { skillId: "skill-c", mastery: 0.6, confidence: 0.6, status: "learning", evidence: [{ id: "e4", skillId: "skill-c", kind: "quiz", strength: 0.6, detail: "passed", createdAt: "2026-01-06T00:00:00.000Z" }] },
+    },
+    memory: [{ id: "m2", text: "block manager owns eviction", source: "learner", createdAt: "2026-01-06T00:00:00.000Z" }],
+    updatedAt: "2026-01-06T00:00:00.000Z",
+  };
+  const laptopNotes = [
+    { id: "lesson:one", lessonId: "one", anchor: null, text: "enqueue is the only writer, and it never blocks", createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-06T00:00:00.000Z" },
+    { id: "lesson:three", lessonId: "three", anchor: null, text: "written only on the laptop", createdAt: "2026-01-06T00:00:00.000Z", updatedAt: "2026-01-06T00:00:00.000Z" },
+  ];
+  const laptopArchive = buildArchive({ repository, course, skillGraph, learnerState: elsewhere, notes: laptopNotes, sources });
+  const imported = importArchive(laptopArchive, { sources, learnerState, notes, mode: "merge" });
+  assert.equal(imported.imported, true);
+  assert.equal(imported.mode, "merge");
+
+  // Every piece of evidence from *both* sides survives.
+  const mergedEvidence = Object.values(imported.learnerState.mastery).flatMap((entry) => entry.evidence.map((item) => item.id));
+  for (const id of ["e1", "e2", "e3", "e4"]) assert.ok(mergedEvidence.includes(id), `${id} was lost in the merge`);
+  assert.equal(imported.merge.evidenceGained, 2);
+  assert.deepEqual(Object.keys(imported.learnerState.mastery).sort(), ["skill-a", "skill-b", "skill-c"]);
+  assert.equal(imported.learnerState.mastery["skill-b"].evidence.length, 1, "a skill only this machine knew about is untouched");
+  // Both memories survive, and the diagnostic stays completed.
+  assert.deepEqual(imported.learnerState.memory.map((entry) => entry.id).sort(), ["m1", "m2"]);
+  assert.equal(imported.learnerState.diagnosticCompleted, true, "completing the diagnostic cannot be undone by importing a copy that had not");
+  // The later review wins and the collision is reported rather than hidden.
+  assert.equal(imported.learnerState.mastery["skill-a"].review.lastReviewedAt, "2026-01-05T00:00:00.000Z");
+  assert.equal(imported.learnerState.mastery["skill-a"].review.reviews, 4);
+  assert.equal(imported.learnerState.mastery["skill-a"].review.lapses, 1);
+  assert.ok(imported.merge.conflicts.some((conflict) => conflict.kind === "review-schedule" && conflict.skillId === "skill-a"), JSON.stringify(imported.merge.conflicts));
+  assert.ok(imported.merge.conflicts.some((conflict) => conflict.kind === "mastery" && conflict.skillId === "skill-a"));
+
+  // Neither copy of a colliding note is destroyed.
+  const noteIds = imported.notes.map((note) => note.id);
+  assert.ok(noteIds.includes("lesson:one"));
+  assert.ok(noteIds.includes("lesson:one~imported"));
+  assert.ok(noteIds.includes("lesson:two"), "a note only this machine had survives");
+  assert.ok(noteIds.includes("lesson:three"), "a note only the other machine had arrives");
+  assert.equal(imported.notes.find((note) => note.id === "lesson:one").text, "enqueue is the only writer");
+  assert.equal(imported.notes.find((note) => note.id === "lesson:one~imported").text, "enqueue is the only writer, and it never blocks");
+  assert.ok(imported.merge.conflicts.some((conflict) => conflict.kind === "note" && conflict.noteId === "lesson:one"));
+  assert.equal(imported.merge.notesAdded, 2);
+
+  // Re-importing the same archive is a no-op: nothing is duplicated.
+  const again = importArchive(laptopArchive, { sources, learnerState: imported.learnerState, notes: imported.notes, mode: "merge" });
+  assert.equal(again.merge.evidenceGained, 0);
+  assert.equal(again.merge.notesAdded, 0);
+  assert.equal(again.merge.notesIdentical, 2, "both imported notes are already present, by text rather than by id");
+  assert.equal(again.notes.length, imported.notes.length);
+  assert.deepEqual(
+    Object.values(again.learnerState.mastery).flatMap((entry) => entry.evidence.map((item) => item.id)).sort(),
+    mergedEvidence.sort(),
+  );
+
+  // --- Import refuses an altered archive -----------------------------------
+  const refused = importArchive(edited, { sources, learnerState, notes });
+  assert.equal(refused.imported, false);
+  assert.match(refused.reason, /altered after export/);
+  assert.equal(importArchive({ format: "nope" }).imported, false);
+  // ...unless the importer insists, which is a decision they had to make.
+  assert.equal(importArchive(edited, { sources, learnerState, notes, force: true }).imported, true);
+
+  // --- Replace is available and is not the default -------------------------
+  const replaced = importArchive(laptopArchive, { sources, learnerState, notes, mode: "replace" });
+  assert.equal(replaced.mode, "replace");
+  assert.deepEqual(Object.keys(replaced.learnerState.mastery).sort(), ["skill-a", "skill-c"]);
+  assert.equal(replaced.notes.length, 2);
+  assert.equal(importArchive(laptopArchive, { sources, learnerState, notes }).mode, "merge", "merge is what happens when nobody chooses");
+
+  // --- Incomplete exports say so -------------------------------------------
+  const withoutSource = buildArchive({ repository, course, skillGraph, learnerState, notes, sources: {} });
+  assert.equal(withoutSource.completeness.excerpted, 0);
+  assert.equal(withoutSource.completeness.offlineReadable, false);
+  assert.equal(withoutSource.completeness.missing.length, withoutSource.completeness.anchors);
+  assert.equal(withoutSource.completeness.missing[0].reason, "source-not-available");
+  assert.equal(verifyArchive(withoutSource).offlineReadable, false);
+  // Limits are reported rather than silently applied.
+  const tiny = buildArchive({ repository, course, skillGraph, learnerState, notes, sources, limits: { maxExcerpts: 1 } });
+  assert.equal(tiny.content.excerpts.length, 1);
+  assert.ok(tiny.completeness.truncated.some((entry) => entry.limit === "maxExcerpts"), JSON.stringify(tiny.completeness.truncated));
+  assert.equal(tiny.completeness.offlineReadable, false);
+
+  // --- The excerpt window itself -------------------------------------------
+  const window20 = excerptAround("a\nb\nc\nd\ne", { path: "x", line: 3 }, { limits: { contextLines: 1, maxExcerptChars: 4_000 } });
+  assert.deepEqual([window20.startLine, window20.endLine, window20.text], [2, 4, "b\nc\nd"]);
+  // The window is clamped to the file rather than running off either end.
+  assert.deepEqual(excerptAround("a\nb", { path: "x", line: 1 }, { limits: { contextLines: 50, maxExcerptChars: 4_000 } }), {
+    path: "x", line: 1, startLine: 1, endLine: 2, text: "a\nb", truncated: false, digest: digestOfText("a\nb"), fileDigest: digestOfText("a\nb"),
+  });
+  // An anchor past the end of the file lands on the last line instead of failing.
+  assert.equal(excerptAround("a\nb", { path: "x", line: 900 }, { limits: { contextLines: 0, maxExcerptChars: 4_000 } }).line, 2);
+  assert.equal(excerptAround(undefined, { path: "x", line: 1 }), null);
+  const clipped = excerptAround("x".repeat(500), { path: "x", line: 1 }, { limits: { contextLines: 2, maxExcerptChars: 100 } });
+  assert.equal(clipped.truncated, true);
+  assert.equal(clipped.text.length, 100);
+  assert.equal(clipped.digest, digestOfText(clipped.text), "the digest covers what was kept, not what was read");
+
+  // --- Canonical form: a round trip does not change the checksum ----------
+  const roundTripped = JSON.parse(JSON.stringify(archive));
+  assert.equal(verifyArchive(roundTripped).checksumOk, true);
+  // Regression: the seal is attached after the archive is built, so it cannot be
+  // inside the bytes the checksum covers. Item 45 shipped exactly this bug once.
+  const sealed = { ...archive, signature: { algorithm: "ed25519", subject: "offline-archive", keyId: "abc", signature: "not-checked-here", signedAt: "2026-02-01T00:00:00.000Z" } };
+  assert.equal(verifyArchive(sealed).checksumOk, true, "attaching a signature must not break the archive's own checksum");
+  assert.equal(verifyArchive(sealed).verdict, "intact");
+  assert.equal(canonicalJson({ b: 1, a: [2, 3] }), canonicalJson({ a: [2, 3], b: 1 }));
+  assert.notEqual(canonicalJson({ a: [2, 3] }), canonicalJson({ a: [3, 2] }), "array order is meaning");
+
+  // --- The note store: edits, deletes, bounds, atomic writes ---------------
+  const notesDirectory = path.join(workspace, "notes");
+  const created = applyNoteEdit([], { id: "lesson:x", lessonId: "x", text: "first thought" }, "2026-02-02T00:00:00.000Z");
+  assert.equal(created.notes.length, 1);
+  assert.equal(created.note.createdAt, "2026-02-02T00:00:00.000Z");
+  const updated = applyNoteEdit(created.notes, { id: "lesson:x", text: "second thought" }, "2026-02-03T00:00:00.000Z");
+  assert.equal(updated.notes[0].text, "second thought");
+  assert.equal(updated.notes[0].createdAt, "2026-02-02T00:00:00.000Z", "editing a note does not reset when it was written");
+  assert.equal(updated.notes[0].lessonId, "x", "an edit that omits the lesson keeps the one it had");
+  const cleared = applyNoteEdit(updated.notes, { id: "lesson:x", text: "   " });
+  assert.deepEqual(cleared.notes, []);
+  assert.equal(cleared.removed, true);
+  assert.deepEqual(await loadNotes(notesDirectory, repository.id), [], "a repository with no notes reads as empty, not as an error");
+  await saveNotes(notesDirectory, repository.id, [{ id: "lesson:x", lessonId: "x", text: "kept", createdAt: null, updatedAt: null }]);
+  assert.deepEqual((await loadNotes(notesDirectory, repository.id)).map((note) => note.text), ["kept"]);
+  // Notes are per repository, not per app.
+  assert.deepEqual(await loadNotes(notesDirectory, "some-other-repository"), []);
+  // A note is prose and can quote a secret, so it is redacted on the way to disk.
+  await saveNotes(notesDirectory, repository.id, [{ id: "lesson:secret", lessonId: "s", text: "aws key AKIAIOSFODNN7EXAMPLE is in the config", createdAt: null, updatedAt: null }]);
+  const persisted = await readFile(path.join(notesDirectory, createHash("sha256").update(repository.id).digest("hex").slice(0, 24) + ".json"), "utf8");
+  assert.equal(persisted.includes("AKIAIOSFODNN7EXAMPLE"), false, "a secret was written to disk");
+  // Oversized input is bounded rather than refused.
+  const bounded = await saveNotes(notesDirectory, repository.id, Array.from({ length: MAX_NOTES + 20 }, (_, index) => ({ id: `n${index}`, text: "x".repeat(MAX_NOTE_CHARS + 500), createdAt: null, updatedAt: null })));
+  assert.equal(bounded.length, MAX_NOTES);
+  assert.equal(bounded[0].text.length, MAX_NOTE_CHARS);
+  await assert.rejects(() => saveNotes(notesDirectory, null, []), /Notes need a repository/);
+});
+
+test("every module the browser demo shares with the desktop app is Node-free", async () => {
+  // Found the hard way: the demo imported `notes-store.mjs` for its edit rules,
+  // Vite externalized `node:crypto`, every save rejected, and the renderer's
+  // optimistic copy made notes look saved when they were not. The invariant is
+  // structural, so it is checked structurally rather than remembered.
+  const electronDirectory = path.resolve("electron");
+  const rendererDirectory = path.resolve("src");
+  const rendererFiles = (await readdir(rendererDirectory)).filter((name) => /\.tsx?$/.test(name));
+
+  const seeds = new Set();
+  for (const name of rendererFiles) {
+    const source = await readFile(path.join(rendererDirectory, name), "utf8");
+    for (const match of source.matchAll(/from\s+"\.\.\/electron\/([\w.-]+\.mjs)"|import\(\s*"\.\.\/electron\/([\w.-]+\.mjs)"\s*\)/g)) {
+      seeds.add(match[1] ?? match[2]);
+    }
+  }
+  assert.ok(seeds.size >= 8, `expected the renderer to share several modules, found ${[...seeds].join(", ")}`);
+
+  // Walk the whole import closure: a Node-free module that imports a Node-only
+  // one is just as broken, and only shows up at run time.
+  const visited = new Set();
+  const offenders = [];
+  const queue = [...seeds].map((entry) => ({ module: entry, via: [entry] }));
+  while (queue.length) {
+    const { module, via } = queue.shift();
+    if (visited.has(module)) continue;
+    visited.add(module);
+    let source;
+    try {
+      source = await readFile(path.join(electronDirectory, module), "utf8");
+    } catch {
+      offenders.push(`${module} is imported by the renderer but does not exist`);
+      continue;
+    }
+    const builtins = [...source.matchAll(/from\s+"(node:[\w/]+)"|require\(\s*"(node:[\w/]+)"\s*\)/g)].map((match) => match[1] ?? match[2]);
+    for (const builtin of builtins) offenders.push(`${via.join(" -> ")} imports ${builtin}`);
+    for (const match of source.matchAll(/from\s+"\.\/([\w.-]+\.mjs)"|import\(\s*"\.\/([\w.-]+\.mjs)"\s*\)/g)) {
+      const next = match[1] ?? match[2];
+      queue.push({ module: next, via: [...via, next] });
+    }
+  }
+  assert.deepEqual(offenders, [], `these modules cannot run in the browser demo:\n${offenders.join("\n")}`);
+
+  // Sanity: the checker really would catch one. `notes-store.mjs` is the module
+  // that caused the defect and is deliberately *not* shared.
+  const store = await readFile(path.join(electronDirectory, "notes-store.mjs"), "utf8");
+  assert.match(store, /from "node:crypto"/, "the persistence half is expected to need Node");
+  assert.equal(visited.has("notes-store.mjs"), false, "the renderer must not reach the persistence half");
+  assert.equal(visited.has("notes.mjs"), true, "the renderer shares the Node-free edit rules");
 });
