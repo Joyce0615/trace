@@ -34,6 +34,68 @@ const LazySharingPanel = lazy(async () => ({ default: (await import("./exercises
 const LazyMigrationPanel = lazy(async () => ({ default: (await import("./exercises")).MigrationPanel }));
 const LazyArchivePanel = lazy(async () => ({ default: (await import("./exercises")).ArchivePanel }));
 
+type DisplaySettings = { theme: "dark" | "light"; contrast: "normal" | "high"; motion: "full" | "reduced"; vision: "default" | "deuteranopia" | "protanopia" | "tritanopia" | "monochrome" };
+
+const DEFAULT_DISPLAY: DisplaySettings = { theme: "dark", contrast: "normal", motion: "full", vision: "default" };
+
+/**
+ * Display settings (item 49).
+ *
+ * Four independent switches rather than one "accessibility mode", because they
+ * are four unrelated needs: a bright room, a low-vision reader, a vestibular
+ * disorder, and a colour-vision deficiency have nothing to do with each other,
+ * and bundling them forces three unwanted changes on anyone who needs the
+ * fourth. The motion setting starts from the operating system's answer, which
+ * the learner may then override for this app alone.
+ */
+function useDisplaySettings(): [DisplaySettings, (update: Partial<DisplaySettings>) => void] {
+  const [settings, setSettings] = useState<DisplaySettings>(() => {
+    let stored: Partial<DisplaySettings> = {};
+    try {
+      stored = JSON.parse(localStorage.getItem("trace:display") ?? "{}");
+    } catch {
+      stored = {};
+    }
+    const systemMotion = typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches ? "reduced" : "full";
+    return { ...DEFAULT_DISPLAY, motion: systemMotion, ...stored };
+  });
+  useEffect(() => {
+    const root = document.documentElement;
+    root.dataset.theme = settings.theme;
+    root.dataset.contrast = settings.contrast;
+    root.dataset.motion = settings.motion;
+    root.dataset.vision = settings.vision;
+    root.style.colorScheme = settings.theme;
+    try {
+      localStorage.setItem("trace:display", JSON.stringify(settings));
+    } catch {
+      // A refused write costs the preference on the next launch, not this session.
+    }
+  }, [settings]);
+  return [settings, useCallback((update: Partial<DisplaySettings>) => setSettings((value) => ({ ...value, ...update })), [])];
+}
+
+function DisplayControls({ settings, onChange }: { settings: DisplaySettings; onChange: (update: Partial<DisplaySettings>) => void }) {
+  return <div className="display-settings" role="group" aria-label="Display settings" data-theme-setting={settings.theme} data-contrast-setting={settings.contrast} data-motion-setting={settings.motion} data-vision-setting={settings.vision}>
+    <label>Theme<select value={settings.theme} onChange={(event) => onChange({ theme: event.target.value as DisplaySettings["theme"] })}>
+      <option value="dark">Dark</option><option value="light">Light</option>
+    </select></label>
+    <label>Contrast<select value={settings.contrast} onChange={(event) => onChange({ contrast: event.target.value as DisplaySettings["contrast"] })}>
+      <option value="normal">Normal</option><option value="high">High</option>
+    </select></label>
+    <label>Motion<select value={settings.motion} onChange={(event) => onChange({ motion: event.target.value as DisplaySettings["motion"] })}>
+      <option value="full">Full</option><option value="reduced">Reduced</option>
+    </select></label>
+    <label>Colour<select value={settings.vision} onChange={(event) => onChange({ vision: event.target.value as DisplaySettings["vision"] })}>
+      <option value="default">Default</option>
+      <option value="deuteranopia">Deuteranopia-safe</option>
+      <option value="protanopia">Protanopia-safe</option>
+      <option value="tritanopia">Tritanopia-safe</option>
+      <option value="monochrome">Monochrome</option>
+    </select></label>
+  </div>;
+}
+
 function Logo() {
   return <div className="logo-mark" aria-label="Trace"><span /><span /><span /></div>;
 }
@@ -108,7 +170,7 @@ function editorLanguage(language?: string) {
   return language ?? "plaintext";
 }
 
-function StartScreen({ onOpen, onDemo, onCancel, busy, progress, error, fontScale, onFontScale }: { onOpen: (source?: string, profile?: LearnerProfile) => void; onDemo: (profile: LearnerProfile) => void; onCancel: () => void; busy: boolean; progress: IndexProgress | null; error: string | null; fontScale: FontScale; onFontScale: (value: FontScale) => void }) {
+function StartScreen({ onOpen, onDemo, onCancel, busy, progress, error, fontScale, onFontScale, display, onDisplay }: { onOpen: (source?: string, profile?: LearnerProfile) => void; onDemo: (profile: LearnerProfile) => void; onCancel: () => void; busy: boolean; progress: IndexProgress | null; error: string | null; fontScale: FontScale; onFontScale: (value: FontScale) => void; display: DisplaySettings; onDisplay: (update: Partial<DisplaySettings>) => void }) {
   const [source, setSource] = useState("");
   const [profile, setProfile] = useState<LearnerProfile>({ goal: "architecture", level: "adaptive" });
   const submit = (event: FormEvent) => {
@@ -119,7 +181,7 @@ function StartScreen({ onOpen, onDemo, onCancel, busy, progress, error, fontScal
   return (
     <div className="welcome-shell">
       <div className="welcome-glow" />
-      <header className="welcome-header"><Logo /><span>TRACE</span><em>CODEBASE LEARNING STUDIO</em><span className="welcome-header-spacer" /><FontSizeControl value={fontScale} onChange={onFontScale} /></header>
+      <header className="welcome-header"><Logo /><span>TRACE</span><em>CODEBASE LEARNING STUDIO</em><span className="welcome-header-spacer" /><DisplayControls settings={display} onChange={onDisplay} /><FontSizeControl value={fontScale} onChange={onFontScale} /></header>
       <main className="welcome-card">
         <div className="eyebrow"><Icon name="spark" size={14} /> Learn the system, not just the syntax</div>
         <h1>Turn any unfamiliar codebase<br /><span>into a guided learning path.</span></h1>
@@ -217,6 +279,20 @@ function DiagnosticOverlay({ graph, onComplete, onSkip }: { graph: SkillGraph; o
   </div>;
 }
 
+/**
+ * The second channel (item 49). Status is carried by a glyph and a border style
+ * as well as by colour, so the tree stays readable with a colour-vision
+ * deficiency, on a greyscale display, and on a printout.
+ */
+const SKILL_STATUS_GLYPHS = [
+  { id: "mastered", label: "Mastered", glyph: "\u25cf" },
+  { id: "recommended", label: "Recommended", glyph: "\u25c6" },
+  { id: "available", label: "Available", glyph: "\u25a0" },
+  { id: "locked", label: "Locked", glyph: "\u25b2" },
+  { id: "stale", label: "Needs review", glyph: "\u2715" },
+];
+const glyphFor = (status: string) => SKILL_STATUS_GLYPHS.find((entry) => entry.id === status)?.glyph ?? "\u25a0";
+
 function skillLevel(node: SkillNode, nodes: SkillNode[], memo = new Map<string, number>()): number {
   if (memo.has(node.id)) return memo.get(node.id)!;
   const parents = node.prerequisites.map((id) => nodes.find((candidate) => candidate.id === id)).filter(Boolean) as SkillNode[];
@@ -227,7 +303,7 @@ function skillLevel(node: SkillNode, nodes: SkillNode[], memo = new Map<string, 
 
 function SkillTree({ graph, state, activeSkill, onSelect, onFamiliar, onChallenge }: { graph: SkillGraph; state: LearnerState; activeSkill?: SkillNode; onSelect: (node: SkillNode) => void; onFamiliar: (node: SkillNode) => void; onChallenge: (node: SkillNode) => void }) {
   return <div className="skill-tree" role="tree" aria-label="Repository skill tree">
-    <div className="skill-legend"><span><i className="mastered" />Mastered</span><span><i className="recommended" />Recommended</span><span><i className="locked" />Locked</span></div>
+    <div className="skill-legend">{SKILL_STATUS_GLYPHS.map((entry) => <span key={entry.id}><i className={entry.id} data-glyph={entry.glyph} aria-hidden="true" />{entry.label}</span>)}</div>
     {graph.nodes.map((node) => {
       const mastery = state.mastery[node.id];
       const status = mastery?.status ?? "locked";
@@ -235,8 +311,8 @@ function SkillTree({ graph, state, activeSkill, onSelect, onFamiliar, onChalleng
       return <div className="skill-row" key={node.id} style={{ "--skill-level": level } as React.CSSProperties}>
         <span className="skill-rail" />
         <button className={`skill-node ${status} ${activeSkill?.id === node.id ? "active" : ""}`} onClick={() => onSelect(node)} title={node.summary}>
-          <span className="skill-orb">{status === "mastered" ? <Icon name="check" size={12} /> : status === "locked" ? "·" : Math.round((mastery?.mastery ?? 0) * 100)}</span>
-          <span><strong>{node.title}</strong><small>{node.branch} · {node.estimatedMinutes} min</small></span>
+          <span className="skill-orb" data-status={status}>{status === "mastered" ? <Icon name="check" size={12} /> : status === "locked" ? "·" : Math.round((mastery?.mastery ?? 0) * 100)}</span>
+          <span><strong><i className="skill-status-glyph" aria-hidden="true">{glyphFor(status)}</i>{node.title}</strong><small>{node.branch} · {node.estimatedMinutes} min</small></span>
           {status === "recommended" && <em>NEXT</em>}
         </button>
         {activeSkill?.id === node.id && status !== "mastered" && <div className="skill-shortcuts"><button onClick={() => onFamiliar(node)}>Mark familiar</button><button onClick={() => onChallenge(node)}>Take 60s challenge</button></div>}
@@ -569,10 +645,16 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
     else if (event.key === "End") next = WORKSPACE_TABS.length - 1;
     if (next < 0) return;
     event.preventDefault();
+    const strip = event.currentTarget;
     onWorkspaceMode(WORKSPACE_TABS[next].mode);
     // Focus follows selection, which is the automatic-activation variant of the
-    // pattern and the right one here: every view is cheap to show.
-    requestAnimationFrame(() => document.getElementById(`workspace-tab-${WORKSPACE_TABS[next].mode}`)?.focus());
+    // pattern and the right one here: every view is cheap to show. The guard
+    // matters — the move is queued for after the re-render, and without it a
+    // learner who tabs away in that frame is yanked back to the strip.
+    requestAnimationFrame(() => {
+      if (!strip.contains(document.activeElement)) return;
+      document.getElementById(`workspace-tab-${WORKSPACE_TABS[next].mode}`)?.focus();
+    });
   };
 
   const noteId = `lesson:${lesson.id}`;
@@ -994,6 +1076,7 @@ export default function App() {
     const saved = localStorage.getItem("trace:text-size");
     return saved === "compact" || saved === "large" ? saved : "comfortable";
   });
+  const [display, setDisplay] = useDisplaySettings();
   const [repository, setRepository] = useState<Repository | null>(null);
   const [course, setCourse] = useState<Course | null>(null);
   const [skillGraph, setSkillGraph] = useState<SkillGraph | null>(null);
@@ -1343,7 +1426,7 @@ export default function App() {
       void bridge.graphSummary({ repository: repositoryRef(demoRepository) }).then(setKnowledgeGraph).catch(() => setKnowledgeGraph(null));
       return activateWorkspace(demoRepository, { ...demoCourse, profile, level: profile.level }, personalizeSkillGraph(demoSkillGraph, profile.goal), { ...structuredClone(demoLearnerState), diagnosticCompleted: false });
     };
-    return <StartScreen onOpen={openRepository} onDemo={(profile) => { void startDemo(profile); }} onCancel={cancelIndexing} busy={busy} progress={indexProgress} error={error} fontScale={fontScale} onFontScale={setFontScale} />;
+    return <StartScreen onOpen={openRepository} onDemo={(profile) => { void startDemo(profile); }} onCancel={cancelIndexing} busy={busy} progress={indexProgress} error={error} fontScale={fontScale} onFontScale={setFontScale} display={display} onDisplay={setDisplay} />;
   }
 
   const openFile = (file: RepoFile, targetLine = 1) => loadSource(repository, file, targetLine);
@@ -1405,6 +1488,7 @@ export default function App() {
         <button className="repo-switcher" onClick={() => openRepository()}><span className="repo-icon"><Icon name="code" size={15} /></span><strong>{repository.name}</strong><Icon name="chevron" size={13} /></button>
         <div className="repo-meta"><span><Icon name="branch" size={13} />{repository.branch}</span><span>{commit}</span>{repository.isDirty && <span className="dirty">modified</span>}{!(repository.stats.complete ?? true) && <span className="dirty" title={(repository.stats.truncated ?? []).map((item) => `${item.limit}=${item.value}`).join(", ")} data-truncated={(repository.stats.truncated ?? []).length}>partial index</span>}<span className="index-badge" data-indexer={repository.stats.indexer ?? "regex"} title={`${repository.stats.symbolCount} definitions · ${repository.stats.referenceCount ?? 0} references · ${repository.stats.resolvedCallEdgeCount ?? 0}/${repository.stats.callEdgeCount ?? 0} resolved call edges`}>{repository.stats.fileCount} files · {repository.stats.indexer === "tree-sitter" ? "tree-sitter" : "regex"} index</span></div>
         <div className="app-bar-spacer" />
+        <DisplayControls settings={display} onChange={setDisplay} />
         <FontSizeControl value={fontScale} onChange={setFontScale} />
         <span className="privacy"><i />LOCAL · CONTEXT BUDGETED</span>
         <button className="avatar" aria-label="Account: BJ">BJ</button>

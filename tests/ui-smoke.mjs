@@ -753,6 +753,84 @@ try {
     assert.ok((region.top ?? -1) >= 0 && (region.bottom ?? Infinity) <= fit.viewport.height + 1, `${region.selector} clips vertically`);
   }
 
+  // Item 49: every theme and contrast level is audited, because a palette that
+  // is only checked in the dark theme is a palette that is only correct there.
+  const displaySettings = page.locator(".display-settings").first();
+  await displaySettings.waitFor();
+  for (const theme of ["dark", "light"]) {
+    for (const contrast of ["normal", "high"]) {
+      await displaySettings.getByLabel("Theme").selectOption(theme);
+      await displaySettings.getByLabel("Contrast").selectOption(contrast);
+      await page.waitForTimeout(200);
+      assert.equal(await page.evaluate(() => document.documentElement.dataset.theme), theme);
+      assert.equal(await page.evaluate(() => document.documentElement.dataset.contrast), contrast);
+      await auditAccessibility(`${theme}/${contrast}`);
+    }
+  }
+  // The light theme really is light and the dark theme really is dark.
+  const surfaceOf = () => page.evaluate(() => getComputedStyle(document.querySelector(".course-sidebar")).backgroundColor);
+  await displaySettings.getByLabel("Theme").selectOption("light");
+  await displaySettings.getByLabel("Contrast").selectOption("normal");
+  await page.waitForTimeout(200);
+  const lightSurface = await surfaceOf();
+  await page.screenshot({ path: path.join(artifactDirectory, "theme-light.png") });
+  await displaySettings.getByLabel("Theme").selectOption("dark");
+  await page.waitForTimeout(200);
+  const darkSurface = await surfaceOf();
+  const brightness = (color) => (([r, g, b]) => 0.2126 * r + 0.7152 * g + 0.0722 * b)((/(\d+),\s*(\d+),\s*(\d+)/.exec(color) ?? []).slice(1).map(Number));
+  assert.ok(brightness(lightSurface) > 180, `the light theme surface is ${lightSurface}`);
+  assert.ok(brightness(darkSurface) < 40, `the dark theme surface is ${darkSurface}`);
+  // The setting survives a new session, which is the only reason to store it.
+  // Checked in a second tab rather than by reloading this one, so the workspace
+  // under test is not thrown away to prove a preference persisted.
+  await displaySettings.getByLabel("Theme").selectOption("light");
+  await displaySettings.getByLabel("Contrast").selectOption("high");
+  await page.waitForTimeout(150);
+  const secondSession = await context.newPage();
+  await secondSession.goto(targetUrl, { waitUntil: "networkidle" });
+  assert.equal(await secondSession.evaluate(() => document.documentElement.dataset.theme), "light", "the theme did not persist");
+  assert.equal(await secondSession.evaluate(() => document.documentElement.dataset.contrast), "high");
+  await secondSession.close();
+  await displaySettings.getByLabel("Theme").selectOption("dark");
+  await displaySettings.getByLabel("Contrast").selectOption("normal");
+  await page.waitForTimeout(150);
+
+  // Item 49: reduced motion removes motion rather than shortening it.
+  const animatedCount = () => page.evaluate(() => [...document.querySelectorAll("*")]
+    .filter((element) => {
+      const style = getComputedStyle(element);
+      return Number.parseFloat(style.transitionDuration) > 0.01 || Number.parseFloat(style.animationDuration) > 0.01;
+    }).length);
+  assert.ok(await animatedCount() > 0, "nothing animates, so the reduced-motion check would prove nothing");
+  await page.evaluate(() => { document.documentElement.dataset.motion = "reduced"; });
+  await page.waitForTimeout(150);
+  assert.equal(await animatedCount(), 0, "reduced motion left something animating");
+  await page.evaluate(() => { document.documentElement.dataset.motion = "full"; });
+
+  // Item 49: the colour-vision modes really repaint the graph categories, and
+  // the categories carry a second, non-colour channel regardless of the mode.
+  const categoryColors = () => page.evaluate(() => ["mastered", "recommended", "available", "locked", "stale"]
+    .map((category) => getComputedStyle(document.documentElement).getPropertyValue(`--cat-${category}`).trim()));
+  const defaultCategories = await categoryColors();
+  assert.equal(new Set(defaultCategories).size, 5, JSON.stringify(defaultCategories));
+  const seen = new Set([defaultCategories.join(",")]);
+  for (const mode of ["deuteranopia", "protanopia", "tritanopia", "monochrome"]) {
+    await page.evaluate((value) => { document.documentElement.dataset.vision = value; }, mode);
+    await page.waitForTimeout(120);
+    const colors = await categoryColors();
+    assert.equal(new Set(colors).size, 5, `${mode}: ${JSON.stringify(colors)}`);
+    assert.equal(seen.has(colors.join(",")), false, `${mode} reuses another mode's palette`);
+    seen.add(colors.join(","));
+  }
+  await page.evaluate(() => { document.documentElement.dataset.vision = "default"; });
+  // Glyphs and border patterns are present whatever the palette is.
+  const legendGlyphs = await page.locator(".skill-legend i").evaluateAll((nodes) => nodes.map((node) => node.dataset.glyph));
+  assert.equal(legendGlyphs.length, 5, JSON.stringify(legendGlyphs));
+  assert.equal(new Set(legendGlyphs).size, 5, "two categories share a glyph");
+  const borderStyles = await page.locator(".skill-node").evaluateAll((nodes) => [...new Set(nodes.map((node) => getComputedStyle(node).borderStyle))]);
+  assert.ok(borderStyles.length >= 2, `every skill node has the same border style: ${JSON.stringify(borderStyles)}`);
+  await page.screenshot({ path: path.join(artifactDirectory, "colour-vision.png") });
+
   // Item 48: every view a learner can reach, audited, not just the first one.
   for (const view of ["Diagram", "Code", "Chains", "Locate", "Review", "Notes", "Lesson"]) {
     await page.locator(".content-tabs").getByRole("tab", { name: view }).click();

@@ -1683,6 +1683,62 @@ try {
     await page.waitForTimeout(900);
     await auditAccessibility(`${view} view`);
   }
+
+  // Item 49: the derived themes hold up over the real repository, not only over
+  // the fixture — the same palette, a hundred times more markup.
+  const displaySettings = page.locator(".app-bar .display-settings");
+  await displaySettings.waitFor();
+  for (const theme of ["dark", "light"]) {
+    for (const contrast of ["normal", "high"]) {
+      await displaySettings.getByLabel("Theme").selectOption(theme);
+      await displaySettings.getByLabel("Contrast").selectOption(contrast);
+      await page.waitForTimeout(250);
+      await auditAccessibility(`${theme}/${contrast}`);
+    }
+  }
+  const surfaceBrightness = async () => page.evaluate(() => {
+    const color = getComputedStyle(document.querySelector(".course-sidebar")).backgroundColor;
+    const [r, g, b] = (/(\d+),\s*(\d+),\s*(\d+)/.exec(color) ?? []).slice(1).map(Number);
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  });
+  await displaySettings.getByLabel("Theme").selectOption("light");
+  await page.waitForTimeout(200);
+  const lightBrightness = await surfaceBrightness();
+  await displaySettings.getByLabel("Theme").selectOption("dark");
+  await displaySettings.getByLabel("Contrast").selectOption("normal");
+  await page.waitForTimeout(200);
+  const darkBrightness = await surfaceBrightness();
+  assert.ok(lightBrightness > 180 && darkBrightness < 40, `light=${lightBrightness} dark=${darkBrightness}`);
+
+  // Reduced motion removes motion rather than shortening it.
+  const animatedCount = () => page.evaluate(() => [...document.querySelectorAll("*")]
+    .filter((element) => {
+      const style = getComputedStyle(element);
+      return Number.parseFloat(style.transitionDuration) > 0.01 || Number.parseFloat(style.animationDuration) > 0.01;
+    }).length);
+  const animatedBefore = await animatedCount();
+  assert.ok(animatedBefore > 0, "nothing animates, so the reduced-motion check would prove nothing");
+  await displaySettings.getByLabel("Motion").selectOption("reduced");
+  await page.waitForTimeout(200);
+  assert.equal(await animatedCount(), 0, "reduced motion left something animating");
+  await displaySettings.getByLabel("Motion").selectOption("full");
+
+  // Each colour-vision mode repaints the categories, and none of them reuses
+  // another mode's palette.
+  const categoryColors = () => page.evaluate(() => ["mastered", "recommended", "available", "locked", "stale"]
+    .map((category) => getComputedStyle(document.documentElement).getPropertyValue(`--cat-${category}`).trim()));
+  const palettesSeen = new Set();
+  for (const mode of ["default", "deuteranopia", "protanopia", "tritanopia", "monochrome"]) {
+    await displaySettings.getByLabel("Colour").selectOption(mode);
+    await page.waitForTimeout(200);
+    const colors = await categoryColors();
+    assert.equal(new Set(colors).size, 5, `${mode}: ${JSON.stringify(colors)}`);
+    assert.equal(palettesSeen.has(colors.join(",")), false, `${mode} reuses another mode's palette`);
+    palettesSeen.add(colors.join(","));
+    await auditAccessibility(`${mode} palette`);
+  }
+  await displaySettings.getByLabel("Colour").selectOption("default");
+  const themeReport = { lightBrightness: Math.round(lightBrightness), darkBrightness: Math.round(darkBrightness), animatedBefore, palettes: palettesSeen.size };
   // Keyboard navigation works against the real index, not only the fixture.
   const tabStrip = page.locator('.content-tabs[role="tablist"]');
   assert.equal(await tabStrip.locator('[role="tab"][tabindex="0"]').count(), 1, "the tab strip must expose exactly one tab stop");
@@ -1725,6 +1781,7 @@ try {
     signing: { algorithm: signingAudit.identity.algorithm, keyId: `${signingAudit.identity.keyId.slice(0, 12)}…`, packageSealed: signingAudit.asIs.signature.verified, anchorsSealed: signingAudit.asIs.anchorSignature.verified, tamperReason: signingAudit.doctoredCheck.signature.reason, tamperedImport: signingAudit.doctoredImport.imported, trustBefore: signingAudit.beforeTrust.signature.trust, trustAfter: signingAudit.afterTrust.signature.trust },
     migration: migrationReport,
     accessibility: accessibilityAudits,
+    display: themeReport,
     archive: archiveReport,
     coursePackage: { format: coursePackage.format, commit: (coursePackage.provenance.commit ?? "").slice(0, 8), anchors: coursePackage.integrity.anchorCount, license: coursePackage.license.id, policy: coursePackage.license.policy, embeddedFiles: packageAudit.requested.integrity.excerptCount, roundTrip: packageAudit.roundTrip.verification.verdict, foreign: packageAudit.foreign.verification.verdict },
     goals: Object.fromEntries(goalIds.map((goal) => [goal, { top: rankings[goal][0], targets: rankings[goal].length, topReasons: goalAudit.plans[goal].targets[0].reasons.map((reason) => reason.detail) }])),

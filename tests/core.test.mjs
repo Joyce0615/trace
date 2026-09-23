@@ -22,6 +22,7 @@ import { GIT_HISTORY_VERSION, busFactor, detectRenames, historyLessons, historyS
 import { MISCONCEPTIONS, MISCONCEPTION_VERSION, buildProbe, calibrateSkill, detectMisconceptions, diagnoseLearner, gradeProbe } from "../electron/misconception.mjs";
 import { SIGNING_ALGORITHM, SIGNING_VERSION, anchorPayload, assessmentPayload, canonicalize, createKeyPair, digestOf, keyIdFor, loadOrCreateKeyPair, loadTrustedKeys, packagePayload, publicIdentity, responsePayload, setKeyTrust, signPackage, signPayload, verifyPackageSignature, verifyPayload } from "../electron/signing.mjs";
 import { COURSE_PACKAGE_FORMAT, COURSE_PACKAGE_VERSION, anchorManifest, detectLicense, importCourse, packageCourse, verifyPackage } from "../electron/course-package.mjs";
+import { CONTRAST_LEVELS, CONTRAST_TARGETS, GRAPH_CATEGORIES, GRAPH_PALETTES, THEMES, THEME_VERSION, colorDistance, contrast as contrastOf, deriveColor, hexToRgb, luminance, luminanceForContrast, normalizeDisplaySettings, paletteFor, paletteSeparation, parseHex, rgbToHex, simulateVision, withLuminance } from "../electron/theme.mjs";
 import { A11Y_VERSION, auditSnapshot, collectAccessibilitySnapshot, contrastRatio, isLargeText, relativeLuminance, roleOf, summarizeAudit } from "../electron/accessibility.mjs";
 import { ARCHIVE_FORMAT, ARCHIVE_VERSION, buildArchive, canonicalJson, digestOfText, excerptAround, importArchive, mergeNotes, mergeProgress, verifyArchive } from "../electron/offline-archive.mjs";
 import { loadNotes, saveNotes } from "../electron/notes-store.mjs";
@@ -5174,4 +5175,161 @@ test("the accessibility auditor decides the rules it claims to", () => {
   // browser as-is; the smoke tests depend on that.
   assert.equal(typeof collectAccessibilitySnapshot, "function");
   assert.equal(/\bimport\b|require\(/.test(collectAccessibilitySnapshot.toString()), false, "the collector must be self-contained");
+});
+
+test("themes are derived by contrast ratio and graph palettes survive colour-vision simulation", () => {
+  // --- Colour arithmetic ---------------------------------------------------
+  assert.deepEqual(hexToRgb("#0b0e14"), [11, 14, 20]);
+  assert.deepEqual(hexToRgb("#abc"), [170, 187, 204], "three-digit hex expands");
+  assert.deepEqual(parseHex("#0006"), { rgb: [0, 0, 0], alpha: "66" }, "a four-digit hex carries alpha");
+  assert.deepEqual(parseHex("#070a0fd9").alpha, "d9");
+  assert.equal(rgbToHex([11, 14, 20]), "#0b0e14");
+  assert.equal(rgbToHex([11, 14, 20], "d9"), "#0b0e14d9", "alpha is put back untouched");
+  assert.equal(luminance([255, 255, 255]), 1);
+  assert.equal(luminance([0, 0, 0]), 0);
+  assert.equal(contrastOf([0, 0, 0], [255, 255, 255]), 21);
+  // `withLuminance` hits its target and keeps the hue recognisable.
+  const brightened = withLuminance(hexToRgb("#3b6a2a"), 0.5);
+  assert.ok(Math.abs(luminance(brightened) - 0.5) < 0.01, String(luminance(brightened)));
+  assert.ok(brightened[1] > brightened[0] && brightened[1] > brightened[2], "a green stays a green");
+  // The luminance a foreground needs, checked against the ratio it produces.
+  const needed = luminanceForContrast(0.74, 4.5, false);
+  assert.ok(Math.abs((0.74 + 0.05) / (needed + 0.05) - 4.5) < 0.001);
+
+  // --- Derivation ----------------------------------------------------------
+  // The dark theme is the authored palette, untouched.
+  assert.equal(deriveColor("#8792a4", { kind: "foreground", theme: "dark", contrast: "normal" }), "#8792a4");
+  assert.equal(deriveColor("#0b0e14", { kind: "surface", theme: "dark", contrast: "normal" }), "#0b0e14");
+
+  // Every derived foreground clears the ratio its level promises, against the
+  // worst surface that level allows. This is the property the whole scheme
+  // rests on, so it is checked over the real palette rather than one sample.
+  const sampleForegrounds = ["#8792a4", "#dce2ec", "#9ee66f", "#79c8ff", "#e0bd7a", "#586273", "#a991ff", "#6f7d92"];
+  const sampleSurfaces = ["#0b0e14", "#0f131b", "#121722", "#161c27", "#202734"];
+  for (const theme of THEMES) {
+    for (const level of CONTRAST_LEVELS) {
+      if (theme === "dark" && level === "normal") continue;
+      const surfaces = sampleSurfaces.map((surface) => hexToRgb(deriveColor(surface, { kind: "surface", theme, contrast: level })));
+      const worstSurface = theme === "light"
+        ? surfaces.reduce((darkest, candidate) => (luminance(candidate) < luminance(darkest) ? candidate : darkest))
+        : surfaces.reduce((lightest, candidate) => (luminance(candidate) > luminance(lightest) ? candidate : lightest));
+      for (const foreground of sampleForegrounds) {
+        const derived = hexToRgb(deriveColor(foreground, { kind: "foreground", theme, contrast: level }));
+        const ratio = contrastOf(derived, worstSurface);
+        assert.ok(ratio >= CONTRAST_TARGETS[level].text - 0.15, `${foreground} in ${theme}/${level} reaches only ${ratio}:1 on ${rgbToHex(worstSurface)}`);
+      }
+    }
+  }
+  // Light surfaces really are light and dark surfaces really are dark, or the
+  // theme is a name rather than a theme.
+  assert.ok(luminance(hexToRgb(deriveColor("#0b0e14", { kind: "surface", theme: "light" }))) > 0.7);
+  assert.ok(luminance(hexToRgb(deriveColor("#dce2ec", { kind: "foreground", theme: "light" }))) < 0.2);
+  assert.ok(luminance(hexToRgb(deriveColor("#0f131b", { kind: "surface", theme: "dark", contrast: "high" })))
+    <= luminance(hexToRgb("#0f131b")), "high contrast pushes panels away from the text");
+  // Alpha survives derivation, so a scrim stays a scrim in every theme.
+  assert.match(deriveColor("#070a0fd9", { kind: "surface", theme: "light" }), /^#[0-9a-f]{6}d9$/);
+
+  // --- Colour-vision simulation --------------------------------------------
+  // Grey is unchanged by any deficiency; that is the sanity check on the matrices.
+  for (const mode of ["protanopia", "deuteranopia", "tritanopia", "monochrome"]) {
+    const grey = simulateVision("#808080", mode);
+    const rgb = hexToRgb(grey);
+    assert.ok(Math.max(...rgb) - Math.min(...rgb) <= 3, `${mode} shifted a neutral grey to ${grey}`);
+  }
+  // Red and green collapse toward each other under deuteranopia, and stay apart
+  // under tritanopia. If this were not true the simulation would be decorative.
+  const redGreenNormal = colorDistance("#e00000", "#00c000");
+  const redGreenDeutan = colorDistance(simulateVision("#e00000", "deuteranopia"), simulateVision("#00c000", "deuteranopia"));
+  assert.ok(redGreenDeutan < redGreenNormal * 0.5, `${redGreenDeutan} vs ${redGreenNormal}`);
+  assert.ok(colorDistance(simulateVision("#e00000", "tritanopia"), simulateVision("#00c000", "tritanopia")) > redGreenDeutan);
+  assert.equal(colorDistance("#123456", "#123456"), 0);
+  assert.equal(simulateVision("#9ee66f", "not-a-mode"), "#9ee66f");
+
+  // --- The palettes --------------------------------------------------------
+  // Each mode's palette must keep its five categories apart *under that mode*,
+  // and remain usable for everyone else.
+  for (const mode of ["deuteranopia", "protanopia", "tritanopia"]) {
+    const palette = paletteFor(mode);
+    const own = paletteSeparation(palette, mode);
+    assert.ok(own.distance >= 25, `${mode} palette collapses ${JSON.stringify(own.pair)} to ${own.distance}`);
+    const normal = paletteSeparation(palette, "default");
+    assert.ok(normal.distance >= 25, `${mode} palette is unusable with normal vision (${normal.distance})`);
+    assert.equal(Object.keys(palette).length, GRAPH_CATEGORIES.length);
+  }
+  // The greyscale palette separates by lightness, which is the only channel left.
+  assert.ok(paletteSeparation(paletteFor("monochrome"), "monochrome").distance >= 15);
+
+  // And the honest part: the default palette is *not* safe, which is precisely
+  // why the other modes exist. A test that pretended otherwise would remove the
+  // reason for the feature.
+  const defaultUnderDeuteranopia = paletteSeparation(paletteFor("default"), "deuteranopia");
+  assert.ok(defaultUnderDeuteranopia.distance < 25, String(defaultUnderDeuteranopia.distance));
+  assert.ok(paletteSeparation(paletteFor("deuteranopia"), "deuteranopia").distance > defaultUnderDeuteranopia.distance * 3);
+  assert.deepEqual(paletteFor("nonsense"), paletteFor("default"), "an unknown mode falls back rather than failing");
+
+  // --- Colour is never the only channel ------------------------------------
+  const glyphs = GRAPH_CATEGORIES.map((category) => category.glyph);
+  const shapes = GRAPH_CATEGORIES.map((category) => category.shape);
+  assert.equal(new Set(glyphs).size, GRAPH_CATEGORIES.length, "two categories share a glyph");
+  assert.equal(new Set(shapes).size, GRAPH_CATEGORIES.length, "two categories share a shape");
+  assert.ok(GRAPH_CATEGORIES.every((category) => category.label && category.pattern), JSON.stringify(GRAPH_CATEGORIES));
+
+  // --- Settings ------------------------------------------------------------
+  assert.deepEqual(normalizeDisplaySettings(), { theme: "dark", contrast: "normal", motion: "full", vision: "default" });
+  assert.deepEqual(normalizeDisplaySettings({ theme: "light", contrast: "high", motion: "reduced", vision: "tritanopia" }),
+    { theme: "light", contrast: "high", motion: "reduced", vision: "tritanopia" });
+  assert.deepEqual(normalizeDisplaySettings({ theme: "neon", vision: "x" }), { theme: "dark", contrast: "normal", motion: "full", vision: "default" });
+  assert.equal(THEME_VERSION, 1);
+});
+
+test("the stylesheet is fully tokenized and every theme block is complete", async () => {
+  // The four palettes are generated, so the thing worth checking is that the
+  // generation actually covered the file: one literal colour left behind is a
+  // colour that does not change with the theme, and it will be the one nobody
+  // can read.
+  const css = await readFile(path.resolve("src", "styles.css"), "utf8");
+  const blocks = [":root", 'html[data-theme="light"]', 'html[data-contrast="high"]', 'html[data-theme="light"][data-contrast="high"]'];
+  const tokensIn = (selector) => {
+    const start = css.indexOf(`${selector} {`);
+    assert.notEqual(start, -1, `${selector} block is missing`);
+    const body = css.slice(start, css.indexOf("}", start));
+    return new Map([...body.matchAll(/(--[\w-]+):\s*([^;]+);/g)].map((match) => [match[1], match[2].trim()]));
+  };
+  const base = tokensIn(":root");
+  assert.ok(base.size > 400, `only ${base.size} tokens were generated`);
+  for (const selector of blocks.slice(1)) {
+    const derived = tokensIn(selector);
+    for (const name of base.keys()) {
+      assert.ok(derived.has(name), `${selector} is missing ${name}`);
+    }
+    // Named variables are overridden only in the derived blocks, and there they
+    // must out-specify the stylesheet's own `:root`, which comes later in the file.
+    assert.ok(derived.has("--muted") && derived.has("--bg"), `${selector} does not override the named variables`);
+    assert.match(selector, /^html/, "a derived block must be element-qualified to beat :root");
+  }
+  assert.equal(base.has("--muted"), false, "the base block must leave the named variables to the stylesheet");
+
+  // Everything the humans wrote uses tokens rather than literals. The generated
+  // palette above and the generated colour-vision modes below are excluded by
+  // markers rather than by counting, so the check cannot drift.
+  const start = css.indexOf("--- generated palette ends");
+  const end = css.indexOf("--- generated modes begin ---");
+  assert.ok(start > 0 && end > start, "the generated boundaries are missing");
+  const body = css.slice(start, end);
+  const literals = [...body.matchAll(/#[0-9a-fA-F]{3,8}\b/g)].map((match) => match[0]);
+  // The stylesheet's own `:root` still declares the dark values of the named
+  // variables; nothing else may be a literal.
+  assert.ok(literals.length <= 12, `${literals.length} literal colours survived tokenization: ${literals.slice(0, 12).join(", ")}`);
+  assert.ok(body.includes("var(--p"), "the body does not use the generated tokens");
+
+  // Reduced motion is honoured from the system preference *and* the setting.
+  assert.match(css, /@media \(prefers-reduced-motion: reduce\)/);
+  assert.match(css, /\[data-motion="reduced"\]/);
+  // Every colour-vision mode has a block, and every category a variable.
+  for (const mode of ["deuteranopia", "protanopia", "tritanopia", "monochrome"]) {
+    assert.ok(css.includes(`[data-vision="${mode}"]`), `no block for ${mode}`);
+  }
+  for (const category of GRAPH_CATEGORIES) {
+    assert.ok(css.includes(`--cat-${category.id}:`), `no variable for ${category.id}`);
+  }
 });
