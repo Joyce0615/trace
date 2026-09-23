@@ -40,6 +40,17 @@ function Logo() {
 
 const fontBoosts: Record<FontScale, number> = { compact: 0, comfortable: 2, large: 4 };
 
+/** The lesson views, in the order the tab strip presents them (item 48). */
+const WORKSPACE_TABS: Array<{ mode: WorkspaceMode; label: string; icon: string }> = [
+  { mode: "lesson", label: "Lesson", icon: "book" },
+  { mode: "diagram", label: "Diagram", icon: "layers" },
+  { mode: "code", label: "Code", icon: "code" },
+  { mode: "chains", label: "Chains", icon: "branch" },
+  { mode: "locate", label: "Locate", icon: "search" },
+  { mode: "review", label: "Review", icon: "target" },
+  { mode: "notes", label: "Notes", icon: "file" },
+];
+
 /**
  * Every outbound link is routed through the main-process policy, so the renderer
  * can never hand a URL straight to the shell.
@@ -127,7 +138,7 @@ function StartScreen({ onOpen, onDemo, onCancel, busy, progress, error, fontScal
           <span />
           <button className="text-button featured-demo" onClick={() => onDemo(profile)} disabled={busy}><Icon name="spark" />Explore nano-vllm <em>FEATURED</em></button>
         </div>
-        {busy && <div className="index-progress" data-phase={progress?.phase ?? "prepare"}>
+        {busy && <div className="index-progress" data-phase={progress?.phase ?? "prepare"} role="status" aria-live="polite">
           <div className="index-progress-bar"><span style={{ width: `${Math.round((progress?.ratio ?? 0) * 100)}%` }} /></div>
           <div className="index-progress-meta">
             <strong>{indexPhaseLabels[progress?.phase ?? "prepare"]}</strong>
@@ -135,7 +146,7 @@ function StartScreen({ onOpen, onDemo, onCancel, busy, progress, error, fontScal
             <button type="button" className="index-cancel" onClick={onCancel}>Cancel indexing</button>
           </div>
         </div>}
-        {error && <div className="error-banner">{error}</div>}
+        {error && <div className="error-banner" role="alert">{error}</div>}
         <div className="feature-row">
           <div><Icon name="layers" /><strong>Adaptive skill trees</strong><small>Learn only what moves you forward</small></div>
           <div><Icon name="code" /><strong>Illustrated source lessons</strong><small>Every diagram links back to code</small></div>
@@ -147,11 +158,50 @@ function StartScreen({ onOpen, onDemo, onCancel, busy, progress, error, fontScal
   );
 }
 
+/**
+ * The diagnostic dialog (item 48).
+ *
+ * A dialog that only *looks* modal is worse than no dialog: the reader hears the
+ * page behind it, tabs into controls they cannot see, and never finds their way
+ * back. So focus moves into it on open, Tab cycles inside it, Escape dismisses
+ * it, and focus returns to whatever opened it.
+ */
 function DiagnosticOverlay({ graph, onComplete, onSkip }: { graph: SkillGraph; onComplete: (answers: Record<string, number>) => void; onSkip: () => void }) {
   const [answers, setAnswers] = useState<Record<string, number>>({});
+  const dialogRef = useRef<HTMLElement | null>(null);
   const complete = graph.diagnostic.every((question) => answers[question.id] !== undefined);
+
+  useEffect(() => {
+    const opener = document.activeElement as HTMLElement | null;
+    const focusables = () => [...(dialogRef.current?.querySelectorAll<HTMLElement>('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])') ?? [])]
+      .filter((element) => !element.hasAttribute("disabled") && element.offsetParent !== null);
+    focusables()[0]?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { event.preventDefault(); onSkip(); return; }
+      if (event.key !== "Tab") return;
+      const items = focusables();
+      if (!items.length) return;
+      const first = items[0];
+      const last = items.at(-1)!;
+      // The wrap is done by hand because the browser will happily tab out of a
+      // dialog that is only visually on top.
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    };
+    document.addEventListener("keydown", onKeyDown, true);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown, true);
+      // Returning focus to the opener is the rule, but the opener here is on the
+      // start screen, which the dialog's own completion replaces. Landing on
+      // `body` would drop the reader at the top of a page they have already
+      // moved through, so the workspace takes focus when the opener is gone.
+      if (opener?.isConnected) opener.focus();
+      else document.getElementById("workspace-main")?.focus();
+    };
+  }, [onSkip]);
+
   return <div className="diagnostic-backdrop">
-    <section className="diagnostic-card" role="dialog" aria-label="Adaptive skill assessment">
+    <section className="diagnostic-card" role="dialog" aria-modal="true" aria-label="Adaptive skill assessment" ref={dialogRef}>
       <div className="diagnostic-kicker"><Icon name="target" size={14} /> ADAPTIVE START</div>
       <h2>Let’s map what you already know.</h2>
       <p>Four quick checks shape your skill tree. They do not consume agent credits, and you can revisit any branch later.</p>
@@ -176,7 +226,7 @@ function skillLevel(node: SkillNode, nodes: SkillNode[], memo = new Map<string, 
 }
 
 function SkillTree({ graph, state, activeSkill, onSelect, onFamiliar, onChallenge }: { graph: SkillGraph; state: LearnerState; activeSkill?: SkillNode; onSelect: (node: SkillNode) => void; onFamiliar: (node: SkillNode) => void; onChallenge: (node: SkillNode) => void }) {
-  return <div className="skill-tree" aria-label="Repository skill tree">
+  return <div className="skill-tree" role="tree" aria-label="Repository skill tree">
     <div className="skill-legend"><span><i className="mastered" />Mastered</span><span><i className="recommended" />Recommended</span><span><i className="locked" />Locked</span></div>
     {graph.nodes.map((node) => {
       const mastery = state.mastery[node.id];
@@ -220,7 +270,7 @@ function CourseSidebar({ course, skillGraph, knowledgeGraph, learnerState, activ
   const percent = Math.round((mastered / Math.max(1, skillGraph.nodes.length)) * 100);
 
   return (
-    <aside className="course-sidebar panel-border">
+    <aside className="course-sidebar panel-border" aria-label="Course outline">
       <div className="course-heading">
         <div className="course-kicker">ADAPTIVE PATH <span>{course.generatedBy === "local-indexer" ? "LOCAL DRAFT" : `${course.generatedBy.toUpperCase()} CURATED`}</span></div>
         <h2>{course.title}</h2>
@@ -343,7 +393,7 @@ function FileExplorer({ repository, lesson, currentFile, query, onQuery, searchR
   );
 
   return (
-    <aside className="file-explorer">
+    <aside className="file-explorer" aria-label="Repository files">
       <div className="explorer-header"><span>EXPLORER</span><small>{repository.files.length}</small></div>
       <label className="explorer-search"><Icon name="search" size={13} /><input value={query} onChange={(event) => onQuery(event.target.value)} placeholder="Find file" /></label>
       <div className="explorer-scroll">
@@ -509,6 +559,22 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
   }, [currentFile?.path, line, repository.symbols]);
   // Item 47: notes are owned by `App` and persisted in the main process, so they
   // survive a tab switch, are redacted on the way to disk, and can be exported.
+  // Arrow-key navigation inside the tab strip, per the WAI-ARIA tabs pattern.
+  const onTabKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const keys: Record<string, number> = { ArrowRight: 1, ArrowLeft: -1 };
+    const current = WORKSPACE_TABS.findIndex((tab) => tab.mode === workspaceMode);
+    let next = -1;
+    if (event.key in keys) next = (current + keys[event.key] + WORKSPACE_TABS.length) % WORKSPACE_TABS.length;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = WORKSPACE_TABS.length - 1;
+    if (next < 0) return;
+    event.preventDefault();
+    onWorkspaceMode(WORKSPACE_TABS[next].mode);
+    // Focus follows selection, which is the automatic-activation variant of the
+    // pattern and the right one here: every view is cheap to show.
+    requestAnimationFrame(() => document.getElementById(`workspace-tab-${WORKSPACE_TABS[next].mode}`)?.focus());
+  };
+
   const noteId = `lesson:${lesson.id}`;
   const noteText = notesById[noteId] ?? "";
   const [monacoReady, setMonacoReady] = useState(false);
@@ -570,7 +636,7 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
   }, [line, currentFile?.path]);
 
   return (
-    <main className="code-workspace panel-border">
+    <main className="code-workspace panel-border" aria-label="Lesson workspace">
       <FileExplorer repository={repository} lesson={lesson} currentFile={currentFile} query={query} onQuery={setQuery} searchResults={searchResults} searchBusy={searchBusy} onOpen={(file, targetLine) => { onWorkspaceMode("code"); onOpen(file, targetLine); }} resolution={resolution} resolutionBusy={resolutionBusy} onResolve={onResolve} />
       <section className="editor-column">
         <div className="lesson-context">
@@ -578,21 +644,30 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
           <p>{lesson.objective}</p>
           <div className="context-anchor"><span className="pulse" />{lesson.anchors[0]?.symbol ?? currentFile?.name ?? "Repository map"}</div>
         </div>
-        <div className="content-tabs">
-          <button className={workspaceMode === "lesson" ? "active" : ""} onClick={() => onWorkspaceMode("lesson")}><Icon name="book" size={12} />Lesson</button>
-          <button className={workspaceMode === "diagram" ? "active" : ""} onClick={() => onWorkspaceMode("diagram")}><Icon name="layers" size={12} />Diagram</button>
-          <button className={workspaceMode === "code" ? "active" : ""} onClick={() => onWorkspaceMode("code")}><Icon name="code" size={12} />Code</button>
-          <button className={workspaceMode === "chains" ? "active" : ""} onClick={() => onWorkspaceMode("chains")}><Icon name="branch" size={12} />Chains</button>
-          <button className={workspaceMode === "locate" ? "active" : ""} onClick={() => onWorkspaceMode("locate")}><Icon name="search" size={12} />Locate</button>
-          <button className={workspaceMode === "review" ? "active" : ""} onClick={() => onWorkspaceMode("review")}><Icon name="target" size={12} />Review</button>
-          <button className={workspaceMode === "notes" ? "active" : ""} onClick={() => onWorkspaceMode("notes")}><Icon name="file" size={12} />Notes</button>
+        <div className="content-tabs" role="tablist" aria-label="Lesson views" onKeyDown={onTabKeyDown}>
+          {WORKSPACE_TABS.map((tab) => <button
+            key={tab.mode}
+            id={`workspace-tab-${tab.mode}`}
+            role="tab"
+            type="button"
+            aria-selected={workspaceMode === tab.mode}
+            aria-controls="workspace-tabpanel"
+            // Roving tabindex: one stop for the whole strip, then arrow keys
+            // inside it. Seven tab stops for seven views is how a keyboard user
+            // ends up tabbing forty times to reach the tutor.
+            tabIndex={workspaceMode === tab.mode ? 0 : -1}
+            className={workspaceMode === tab.mode ? "active" : ""}
+            onClick={() => onWorkspaceMode(tab.mode)}
+          ><Icon name={tab.icon} size={12} />{tab.label}</button>)}
           <span />
           {workspaceMode === "code" && <div className="editor-actions"><span>Ln {line}</span><span>{currentFile?.language ?? "text"}</span></div>}
         </div>
+        <p className="visually-hidden" role="status" aria-live="polite">{WORKSPACE_TABS.find((tab) => tab.mode === workspaceMode)?.label} view</p>
+        <div className="workspace-tabpanel" id="workspace-tabpanel" role="tabpanel" aria-labelledby={`workspace-tab-${workspaceMode}`} tabIndex={-1}>
         {workspaceMode === "code" && <><div className="editor-tabs">{currentFile ? <div className="editor-tab active"><Icon name="file" size={13} />{currentFile.name}<span>×</span></div> : <div className="editor-tab active">No file selected</div>}</div><div className="breadcrumb"><Icon name="code" size={13} />{currentFile?.path.split("/").map((part, index, parts) => <span key={`${part}-${index}`}>{part}{index < parts.length - 1 && <Icon name="chevron" size={11} />}</span>)}</div></>}
         {workspaceMode === "lesson" && <LessonCanvas lesson={lesson} onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }} />}
         {workspaceMode === "diagram" && <div className="diagram-column">
-          <Suspense fallback={<div className="panel-loading">Loading goals…</div>}><LazyGoalPanel
+          <Suspense fallback={<div className="panel-loading" role="status">Loading goals…</div>}><LazyGoalPanel
             repository={repository}
             course={course}
             state={goalState}
@@ -601,7 +676,7 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
             onLesson={(lessonId) => { const lesson = (course?.modules ?? []).flatMap((module) => module.lessons).find((item) => item.id === lessonId); if (lesson) onHistoryLesson(lesson); }}
           /></Suspense>
           <LessonCanvas lesson={lesson} diagramOnly onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }} />
-          <Suspense fallback={<div className="panel-loading">Loading architecture…</div>}><LazyArchitecturePanel
+          <Suspense fallback={<div className="panel-loading" role="status">Loading architecture…</div>}><LazyArchitecturePanel
             repository={repository}
             currentFile={currentFile?.path ?? null}
             symbol={architectureSymbol}
@@ -609,14 +684,14 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
             onState={onArchitectureState}
             onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }}
           /></Suspense>
-          <Suspense fallback={<div className="panel-loading">Loading history…</div>}><LazyHistoryPanel
+          <Suspense fallback={<div className="panel-loading" role="status">Loading history…</div>}><LazyHistoryPanel
             repository={repository}
             state={historyState}
             onState={onHistoryState}
             onLesson={onHistoryLesson}
             onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }}
           /></Suspense>
-          <Suspense fallback={<div className="panel-loading">Loading evidence…</div>}><LazyEvidencePanel
+          <Suspense fallback={<div className="panel-loading" role="status">Loading evidence…</div>}><LazyEvidencePanel
             repository={repository}
             skillGraph={skillGraph}
             currentFile={currentFile?.path ?? null}
@@ -624,7 +699,7 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
             onState={onEvidenceState}
             onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }}
           /></Suspense>
-          <Suspense fallback={<div className="panel-loading">Loading scorecards…</div>}><LazyEvaluationPanel
+          <Suspense fallback={<div className="panel-loading" role="status">Loading scorecards…</div>}><LazyEvaluationPanel
             repository={repository}
             course={course}
             skillGraph={skillGraph}
@@ -632,7 +707,7 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
             onState={onEvaluationState}
             onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }}
           /></Suspense>
-          <Suspense fallback={<div className="panel-loading">Loading diagnosis…</div>}><LazyDiagnosisPanel
+          <Suspense fallback={<div className="panel-loading" role="status">Loading diagnosis…</div>}><LazyDiagnosisPanel
             repository={repository}
             skillGraph={skillGraph}
             learnerState={learnerState}
@@ -640,14 +715,14 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
             onState={onDiagnosisState}
             onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }}
           /></Suspense>
-          <Suspense fallback={<div className="panel-loading">Loading sharing…</div>}><LazySharingPanel
+          <Suspense fallback={<div className="panel-loading" role="status">Loading sharing…</div>}><LazySharingPanel
             repository={repository}
             course={course}
             skillGraph={skillGraph}
             state={sharingState}
             onState={onSharingState}
           /></Suspense>
-          <Suspense fallback={<div className="panel-loading">Loading migration…</div>}><LazyMigrationPanel
+          <Suspense fallback={<div className="panel-loading" role="status">Loading migration…</div>}><LazyMigrationPanel
             repository={repository}
             course={course}
             state={migrationState}
@@ -655,7 +730,7 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
             onCourse={onCourse}
             onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }}
           /></Suspense>
-          <Suspense fallback={<div className="panel-loading">Loading archive…</div>}><LazyArchivePanel
+          <Suspense fallback={<div className="panel-loading" role="status">Loading archive…</div>}><LazyArchivePanel
             repository={repository}
             course={course}
             skillGraph={skillGraph}
@@ -666,19 +741,19 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
             onLearnerState={onLearnerState}
             onNotes={onNotes}
           /></Suspense>
-          <Suspense fallback={<div className="panel-loading">Loading experiments…</div>}><LazyExperimentPanel
+          <Suspense fallback={<div className="panel-loading" role="status">Loading experiments…</div>}><LazyExperimentPanel
             repository={repository}
             state={experimentState}
             onState={onExperimentState}
           /></Suspense>
-          <Suspense fallback={<div className="panel-loading">Loading analytics…</div>}><LazyAnalyticsPanel
+          <Suspense fallback={<div className="panel-loading" role="status">Loading analytics…</div>}><LazyAnalyticsPanel
             repository={repository}
             skillGraph={skillGraph}
             learnerState={learnerState}
             state={analyticsState}
             onState={onAnalyticsState}
           /></Suspense>
-          <Suspense fallback={<div className="panel-loading">Loading schedule…</div>}><LazySchedulePanel
+          <Suspense fallback={<div className="panel-loading" role="status">Loading schedule…</div>}><LazySchedulePanel
             repository={repository}
             skillGraph={skillGraph}
             learnerState={learnerState}
@@ -688,17 +763,17 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
             onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }}
           /></Suspense>
         </div>}
-        {workspaceMode === "chains" && <Suspense fallback={<div className="panel-loading">Loading exercises…</div>}><div className="chains-column"><LazyCallChainPanel repository={repository} state={chainState} onState={onChainState} onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }} /><LazyExecutionTracePanel repository={repository} state={traceState} onState={onTraceState} onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }} /><LazyExecutableQuizPanel repository={repository} state={executableQuizState} onState={onExecutableQuizState} onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }} /><LazyExplanationPanel repository={repository} state={explanationState} onState={onExplanationState} onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }} /></div></Suspense>}
-        {workspaceMode === "locate" && <Suspense fallback={<div className="panel-loading">Loading exercises…</div>}><div className="chains-column"><LazyActivityPanel repository={repository} state={activityState} onState={onActivityState} onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }} /><LazyLocalizationPanel repository={repository} trail={trail} state={localizationState} onState={onLocalizationState} onOpen={(filePath) => { const file = repository.files.find((item) => item.path === filePath); if (file) { onWorkspaceMode("code"); onOpen(file, 1); } }} /></div></Suspense>}
-        {workspaceMode === "review" && <Suspense fallback={<div className="panel-loading">Loading exercises…</div>}><LazyReviewPanel repository={repository} trail={trail} state={reviewState} onState={onReviewState} onOpen={(filePath) => { const file = repository.files.find((item) => item.path === filePath); if (file) { onWorkspaceMode("code"); onOpen(file, 1); } }} /></Suspense>}
+        {workspaceMode === "chains" && <Suspense fallback={<div className="panel-loading" role="status">Loading exercises…</div>}><div className="chains-column"><LazyCallChainPanel repository={repository} state={chainState} onState={onChainState} onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }} /><LazyExecutionTracePanel repository={repository} state={traceState} onState={onTraceState} onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }} /><LazyExecutableQuizPanel repository={repository} state={executableQuizState} onState={onExecutableQuizState} onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }} /><LazyExplanationPanel repository={repository} state={explanationState} onState={onExplanationState} onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }} /></div></Suspense>}
+        {workspaceMode === "locate" && <Suspense fallback={<div className="panel-loading" role="status">Loading exercises…</div>}><div className="chains-column"><LazyActivityPanel repository={repository} state={activityState} onState={onActivityState} onAnchor={(path, targetLine) => { const file = repository.files.find((item) => item.path === path); if (file) { onWorkspaceMode("code"); onOpen(file, targetLine); } }} /><LazyLocalizationPanel repository={repository} trail={trail} state={localizationState} onState={onLocalizationState} onOpen={(filePath) => { const file = repository.files.find((item) => item.path === filePath); if (file) { onWorkspaceMode("code"); onOpen(file, 1); } }} /></div></Suspense>}
+        {workspaceMode === "review" && <Suspense fallback={<div className="panel-loading" role="status">Loading exercises…</div>}><LazyReviewPanel repository={repository} trail={trail} state={reviewState} onState={onReviewState} onOpen={(filePath) => { const file = repository.files.find((item) => item.path === filePath); if (file) { onWorkspaceMode("code"); onOpen(file, 1); } }} /></Suspense>}
         {workspaceMode === "notes" && <div className="lesson-notes" data-note-id={noteId} data-notes={Object.keys(notesById).length}><span>PRIVATE LEARNING NOTES</span><h3>{lesson.title}</h3><textarea value={noteText} onChange={(event) => onNote(noteId, lesson.id, event.target.value)} placeholder="Capture an insight, question, or source reference…" /><small>Stored for this repository, included in an offline export, and never sent anywhere.</small></div>}
         <div className={`editor-wrap ${workspaceMode === "code" ? "" : "hidden"}`}>
-          {monacoReady ? <Suspense fallback={<div className="editor-loading">Loading local editor…</div>}><LazyEditor
+          {monacoReady ? <Suspense fallback={<div className="editor-loading" role="status">Loading local editor…</div>}><LazyEditor
             path={currentFile?.path ?? "empty.txt"}
             language={editorLanguage(currentFile?.language)}
             value={content}
             onMount={onMount}
-            loading={<div className="editor-loading">Loading source…</div>}
+            loading={<div className="editor-loading" role="status">Loading source…</div>}
             options={{
               readOnly: true,
               minimap: { enabled: false },
@@ -715,7 +790,8 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
               glyphMargin: false,
               lineNumbersMinChars: 3,
             }}
-          /></Suspense> : <div className="editor-loading">Loading local editor…</div>}
+          /></Suspense> : <div className="editor-loading" role="status">Loading local editor…</div>}
+        </div>
         </div>
       </section>
     </main>
@@ -837,7 +913,7 @@ function TutorPanel({ repository, lesson, skill, nextSkill, learnerState, provid
   };
 
   return (
-    <aside className="tutor-panel">
+    <aside className="tutor-panel" aria-label="Tutor">
       <div className="tutor-header">
         <div className="tutor-title"><span className="agent-orb"><Icon name="spark" size={15} /></span><div><strong>Learning Agent</strong><small><i className={agents[provider].available ? "online" : "offline"} />{agents[provider].available ? "Ready · read-only" : "CLI unavailable"}</small></div></div>
         <div className="provider-switch">
@@ -1323,16 +1399,17 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      <header className="app-bar">
+      <a className="skip-link" href="#workspace-main">Skip to the lesson</a>
+      <header className="app-bar" role="banner" aria-label="Workspace">
         <div className="brand"><Logo /><span>TRACE</span></div>
         <button className="repo-switcher" onClick={() => openRepository()}><span className="repo-icon"><Icon name="code" size={15} /></span><strong>{repository.name}</strong><Icon name="chevron" size={13} /></button>
         <div className="repo-meta"><span><Icon name="branch" size={13} />{repository.branch}</span><span>{commit}</span>{repository.isDirty && <span className="dirty">modified</span>}{!(repository.stats.complete ?? true) && <span className="dirty" title={(repository.stats.truncated ?? []).map((item) => `${item.limit}=${item.value}`).join(", ")} data-truncated={(repository.stats.truncated ?? []).length}>partial index</span>}<span className="index-badge" data-indexer={repository.stats.indexer ?? "regex"} title={`${repository.stats.symbolCount} definitions · ${repository.stats.referenceCount ?? 0} references · ${repository.stats.resolvedCallEdgeCount ?? 0}/${repository.stats.callEdgeCount ?? 0} resolved call edges`}>{repository.stats.fileCount} files · {repository.stats.indexer === "tree-sitter" ? "tree-sitter" : "regex"} index</span></div>
         <div className="app-bar-spacer" />
         <FontSizeControl value={fontScale} onChange={setFontScale} />
         <span className="privacy"><i />LOCAL · CONTEXT BUDGETED</span>
-        <button className="avatar">BJ</button>
+        <button className="avatar" aria-label="Account: BJ">BJ</button>
       </header>
-      <div className="workspace-grid">
+      <div className="workspace-grid" id="workspace-main" tabIndex={-1}>
         <CourseSidebar course={course} skillGraph={skillGraph} knowledgeGraph={knowledgeGraph} learnerState={learnerState} activeSkill={activeSkill} selectedLesson={selectedLesson} completed={completed} onSelect={selectLesson} onSelectSkill={selectSkill} onFamiliar={(node) => setLearnerState(addEvidence(learnerState, skillGraph, node.id, { kind: "self-report", strength: 0.62, detail: `Marked familiar: ${node.title}` }))} onChallenge={(node) => { const lesson = flattenLessons(course).find((item) => item.id === node.lessonId); if (lesson) void selectLesson(lesson).then(() => setMode("quiz")); }} onToggleComplete={toggleComplete} onEnhance={enhanceCourse} enhancing={courseBusy} enhanceElapsed={courseElapsed} provider={provider} canEnhance={agents[provider].available} />
         <CodeWorkspace repository={repository} lesson={selectedLesson} currentFile={currentFile} content={content} line={line} workspaceMode={workspaceMode} fontBoost={fontBoosts[fontScale]} trail={inspectionTrail} chainState={chainState} onChainState={updateChainState} localizationState={localizationState} onLocalizationState={updateLocalizationState} reviewState={reviewState} onReviewState={updateReviewState} traceState={traceState} onTraceState={updateTraceState} architectureState={architectureState} onArchitectureState={updateArchitectureState} historyState={historyState} onHistoryState={updateHistoryState} onHistoryLesson={selectLesson} evidenceState={evidenceState} onEvidenceState={updateEvidenceState} skillGraph={skillGraph} course={course} evaluationState={evaluationState} onEvaluationState={updateEvaluationState} learnerState={learnerState} onLearnerState={setLearnerState} diagnosisState={diagnosisState} onDiagnosisState={updateDiagnosisState} scheduleState={scheduleState} onScheduleState={updateScheduleState} executableQuizState={executableQuizState} onExecutableQuizState={updateExecutableQuizState} explanationState={explanationState} onExplanationState={updateExplanationState} activityState={activityState} onActivityState={updateActivityState} analyticsState={analyticsState} onAnalyticsState={updateAnalyticsState} experimentState={experimentState} onExperimentState={updateExperimentState} goalState={goalState} onGoalState={updateGoalState} sharingState={sharingState} onSharingState={updateSharingState} migrationState={migrationState} onMigrationState={updateMigrationState} archiveState={archiveState} onArchiveState={updateArchiveState} notesById={notesById} notesList={notes} onNote={saveNote} onNotes={setNotes} onCourse={setCourse} onOpen={openFile} onSelection={setSelection} onWorkspaceMode={changeWorkspaceMode} resolution={resolution} resolutionBusy={resolutionBusy} onResolve={resolveAtCursor} />
         <TutorPanel repository={repository} lesson={selectedLesson} skill={activeSkill} nextSkill={nextSkill} learnerState={learnerState} provider={provider} agents={agents} mode={mode} messages={messages} askMessages={askMessages} busy={agentBusy} currentFile={currentFile} selection={selection} guideStage={guideStage} onGuideStage={updateGuideStage} onWorkspaceMode={changeWorkspaceMode} onNextSkill={selectSkill} onProvider={setProvider} onMode={setMode} onAsk={ask} onSaveMemory={saveMemory} onQuizEvidence={() => updateEvidence("quiz", 0.55, `Submitted quiz answer for ${selectedLesson.title}`)} onDone={() => toggleComplete(selectedLesson)} complete={completed.has(selectedLesson.id)} practiceSession={practiceSession} practiceReport={practiceReport} practiceBusy={practiceBusy} onCreatePractice={createPractice} onInspectPractice={inspectPractice} onOpenPractice={() => { if (practiceSession) void bridge.openPractice(practiceSession.id); }} onRemovePractice={removePractice} />

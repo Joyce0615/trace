@@ -22,6 +22,7 @@ import { GIT_HISTORY_VERSION, busFactor, detectRenames, historyLessons, historyS
 import { MISCONCEPTIONS, MISCONCEPTION_VERSION, buildProbe, calibrateSkill, detectMisconceptions, diagnoseLearner, gradeProbe } from "../electron/misconception.mjs";
 import { SIGNING_ALGORITHM, SIGNING_VERSION, anchorPayload, assessmentPayload, canonicalize, createKeyPair, digestOf, keyIdFor, loadOrCreateKeyPair, loadTrustedKeys, packagePayload, publicIdentity, responsePayload, setKeyTrust, signPackage, signPayload, verifyPackageSignature, verifyPayload } from "../electron/signing.mjs";
 import { COURSE_PACKAGE_FORMAT, COURSE_PACKAGE_VERSION, anchorManifest, detectLicense, importCourse, packageCourse, verifyPackage } from "../electron/course-package.mjs";
+import { A11Y_VERSION, auditSnapshot, collectAccessibilitySnapshot, contrastRatio, isLargeText, relativeLuminance, roleOf, summarizeAudit } from "../electron/accessibility.mjs";
 import { ARCHIVE_FORMAT, ARCHIVE_VERSION, buildArchive, canonicalJson, digestOfText, excerptAround, importArchive, mergeNotes, mergeProgress, verifyArchive } from "../electron/offline-archive.mjs";
 import { loadNotes, saveNotes } from "../electron/notes-store.mjs";
 import { MAX_NOTES, MAX_NOTE_CHARS, NOTES_VERSION, applyNoteEdit, boundNotes } from "../electron/notes.mjs";
@@ -4942,4 +4943,235 @@ test("every module the browser demo shares with the desktop app is Node-free", a
   assert.match(store, /from "node:crypto"/, "the persistence half is expected to need Node");
   assert.equal(visited.has("notes-store.mjs"), false, "the renderer must not reach the persistence half");
   assert.equal(visited.has("notes.mjs"), true, "the renderer shares the Node-free edit rules");
+});
+
+test("the accessibility auditor decides the rules it claims to", () => {
+  // The auditor is only worth running if it fails on real problems and stays
+  // quiet on things that are fine, so both directions are asserted here and the
+  // smoke tests then run it against the actual DOM.
+  let nextIndex = 0;
+  const element = (tag, overrides = {}) => ({
+    index: nextIndex++,
+    tag,
+    parentIndex: -1,
+    classes: [],
+    attributes: {},
+    ownText: "",
+    text: "",
+    tabIndex: tag === "button" || tag === "input" || tag === "a" ? 0 : -1,
+    disabled: false,
+    width: 40,
+    height: 40,
+    display: "block",
+    visibility: "visible",
+    opacity: 1,
+    color: "rgb(255, 255, 255)",
+    backgroundColor: "rgb(0, 0, 0)",
+    fontSize: 14,
+    fontWeight: 400,
+    outlineStyle: "none",
+    ...overrides,
+  });
+  const page = (nodes, extra = {}) => ({ url: "http://test", title: "Trace", lang: "en", activeElementIndex: -1, nodes, ...extra });
+
+  // --- Contrast maths against the values WCAG itself publishes -------------
+  assert.equal(contrastRatio("rgb(0,0,0)", "rgb(255,255,255)"), 21);
+  assert.equal(contrastRatio("rgb(255,255,255)", "rgb(255,255,255)"), 1);
+  assert.equal(contrastRatio("rgb(119,119,119)", "rgb(255,255,255)"), 4.48, "#777 on white is the canonical near-miss");
+  assert.equal(contrastRatio("rgb(118,118,118)", "rgb(255,255,255)"), 4.54);
+  assert.equal(contrastRatio("not a color", "rgb(0,0,0)"), null);
+  // A translucent foreground is composited before comparing, because that is
+  // what a reader sees.
+  assert.ok(contrastRatio("rgba(255,255,255,0.2)", "rgb(0,0,0)") < contrastRatio("rgb(255,255,255)", "rgb(0,0,0)"));
+  assert.equal(isLargeText(24, 400), true);
+  assert.equal(isLargeText(19, 700), true);
+  assert.equal(isLargeText(19, 400), false);
+  assert.equal(relativeLuminance({ r: 255, g: 255, b: 255 }), 1);
+
+  // --- Roles ---------------------------------------------------------------
+  assert.equal(roleOf(element("button")), "button");
+  assert.equal(roleOf(element("a", { attributes: { href: "#x" } })), "link");
+  assert.equal(roleOf(element("a")), null, "an anchor without href is not a link");
+  assert.equal(roleOf(element("input", { attributes: { type: "checkbox" } })), "checkbox");
+  assert.equal(roleOf(element("input", { attributes: { type: "hidden" } })), null);
+  assert.equal(roleOf(element("div", { attributes: { role: "tab" } })), "tab");
+  assert.equal(roleOf(element("span")), null);
+
+  const ruleIds = (audit) => audit.violations.map((violation) => violation.rule);
+
+  // --- A control with no name ---------------------------------------------
+  const nameless = auditSnapshot(page([element("button")]));
+  assert.deepEqual(ruleIds(nameless), ["interactive-name"]);
+  assert.equal(nameless.violations[0].severity, "critical");
+  assert.match(nameless.violations[0].detail, /no accessible name/);
+  assert.equal(auditSnapshot(page([element("button", { text: "Save" })])).passed, true);
+  assert.equal(auditSnapshot(page([element("button", { attributes: { "aria-label": "Save" } })])).passed, true);
+  assert.equal(auditSnapshot(page([element("button", { attributes: { title: "Save" } })])).passed, true);
+  // A disabled control is not in anyone's way.
+  assert.equal(auditSnapshot(page([element("button", { disabled: true })])).passed, true);
+  // Neither is one that is not rendered.
+  assert.equal(auditSnapshot(page([element("button", { display: "none" })])).passed, true);
+
+  // --- aria-labelledby resolves, or is reported ---------------------------
+  nextIndex = 0;
+  const labelled = [element("button", { attributes: { "aria-labelledby": "heading" } }), element("h2", { attributes: { id: "heading" }, text: "Course outline", ownText: "Course outline" })];
+  assert.equal(auditSnapshot(page(labelled)).passed, true);
+  nextIndex = 0;
+  const dangling = auditSnapshot(page([element("button", { text: "Go", attributes: { "aria-controls": "nowhere" } })]));
+  assert.deepEqual(ruleIds(dangling), ["aria-reference"]);
+  assert.match(dangling.violations[0].detail, /points at "nowhere"/);
+
+  // --- Implicit labels are real labels ------------------------------------
+  nextIndex = 0;
+  const wrapped = [
+    element("label", { text: "Yes", ownText: "Yes", tabIndex: -1 }),
+    element("input", { parentIndex: 0, attributes: { type: "radio" }, width: 16, height: 16 }),
+  ];
+  assert.equal(auditSnapshot(page(wrapped)).passed, true, JSON.stringify(auditSnapshot(page(wrapped)).violations));
+  // ...and a bare control is not.
+  nextIndex = 0;
+  assert.deepEqual(ruleIds(auditSnapshot(page([element("input", { attributes: { type: "text" } })]))), ["interactive-name", "control-label"]);
+
+  // --- Tab order -----------------------------------------------------------
+  nextIndex = 0;
+  const positive = auditSnapshot(page([element("button", { text: "Go", tabIndex: 3 })]));
+  assert.deepEqual(ruleIds(positive), ["no-positive-tabindex"]);
+  // Focusable but hidden from assistive technology is a trap, not a saving.
+  nextIndex = 0;
+  const ghost = auditSnapshot(page([element("button", { text: "Go", attributes: { "aria-hidden": "true" } })]));
+  assert.ok(ruleIds(ghost).includes("focusable-aria-hidden"), JSON.stringify(ghost.violations));
+
+  // --- Tablists ------------------------------------------------------------
+  nextIndex = 0;
+  const goodTabs = [
+    element("div", { attributes: { role: "tablist" }, tabIndex: -1 }),
+    element("button", { parentIndex: 0, attributes: { role: "tab", "aria-selected": "true" }, text: "One", tabIndex: 0 }),
+    element("button", { parentIndex: 0, attributes: { role: "tab", "aria-selected": "false" }, text: "Two", tabIndex: -1 }),
+  ];
+  assert.equal(auditSnapshot(page(goodTabs)).passed, true, JSON.stringify(auditSnapshot(page(goodTabs)).violations));
+  // Every tab in the tab order is the thing roving tabindex exists to prevent.
+  nextIndex = 0;
+  const flatTabs = [
+    element("div", { attributes: { role: "tablist" }, tabIndex: -1 }),
+    element("button", { parentIndex: 0, attributes: { role: "tab", "aria-selected": "true" }, text: "One", tabIndex: 0 }),
+    element("button", { parentIndex: 0, attributes: { role: "tab", "aria-selected": "false" }, text: "Two", tabIndex: 0 }),
+  ];
+  assert.ok(ruleIds(auditSnapshot(page(flatTabs))).includes("tablist-roving"));
+  // A tab that does not say whether it is selected.
+  nextIndex = 0;
+  const silentTab = [
+    element("div", { attributes: { role: "tablist" }, tabIndex: -1 }),
+    element("button", { parentIndex: 0, attributes: { role: "tab" }, text: "One", tabIndex: 0 }),
+  ];
+  assert.ok(ruleIds(auditSnapshot(page(silentTab))).includes("tab-selected"));
+
+  // --- Dialogs -------------------------------------------------------------
+  nextIndex = 0;
+  const plainDialog = auditSnapshot(page([element("section", { attributes: { role: "dialog" }, text: "Body copy" })]));
+  assert.ok(ruleIds(plainDialog).includes("dialog-modal"));
+  assert.ok(ruleIds(plainDialog).includes("dialog-name"), "a dialog does not take its name from its own prose");
+  nextIndex = 0;
+  assert.equal(auditSnapshot(page([element("section", { attributes: { role: "dialog", "aria-modal": "true", "aria-label": "Assessment" } })])).passed, true);
+  nextIndex = 0;
+  assert.ok(ruleIds(auditSnapshot(page([element("section", { attributes: { role: "dialog", "aria-modal": "true" } })]))).includes("dialog-name"));
+
+  // --- Headings and landmarks ---------------------------------------------
+  nextIndex = 0;
+  const skipped = auditSnapshot(page([element("h1", { text: "A", ownText: "A" }), element("h3", { text: "B", ownText: "B" })]));
+  assert.deepEqual(ruleIds(skipped), ["heading-order"]);
+  assert.match(skipped.violations[0].detail, /h1 to h3/);
+  nextIndex = 0;
+  assert.equal(auditSnapshot(page([element("h1", { text: "A", ownText: "A" }), element("h2", { text: "B", ownText: "B" })])).passed, true);
+  nextIndex = 0;
+  const twoMains = auditSnapshot(page([element("main", { text: "one" }), element("main", { text: "two" })]));
+  assert.deepEqual(ruleIds(twoMains), ["landmark-unique"]);
+  // Named distinctly, two of the same landmark are allowed.
+  nextIndex = 0;
+  assert.equal(auditSnapshot(page([
+    element("main", { attributes: { "aria-label": "Lesson" } }),
+    element("main", { attributes: { "aria-label": "Tutor" } }),
+  ])).passed, true);
+
+  // A header inside a section is not a banner landmark, and treating it as one
+  // reported eight banners on a page with a single app bar.
+  nextIndex = 0;
+  const nestedHeaders = [
+    element("header", { attributes: { "aria-label": "Workspace" }, tabIndex: -1 }),
+    element("section", { tabIndex: -1 }),
+    element("header", { parentIndex: 1, text: "Illustrated lesson", tabIndex: -1 }),
+    element("section", { tabIndex: -1 }),
+    element("header", { parentIndex: 3, text: "Visual model", tabIndex: -1 }),
+  ];
+  assert.equal(auditSnapshot(page(nestedHeaders)).passed, true, JSON.stringify(auditSnapshot(page(nestedHeaders)).violations));
+  // Two top-level banners with the same name still are a problem.
+  nextIndex = 0;
+  assert.deepEqual(ruleIds(auditSnapshot(page([element("header"), element("header")]))), ["landmark-unique"]);
+
+  // --- Duplicate ids -------------------------------------------------------
+  nextIndex = 0;
+  const twins = auditSnapshot(page([element("div", { attributes: { id: "same" } }), element("div", { attributes: { id: "same" } })]));
+  assert.deepEqual(ruleIds(twins), ["duplicate-id"]);
+
+  // --- Images --------------------------------------------------------------
+  nextIndex = 0;
+  assert.deepEqual(ruleIds(auditSnapshot(page([element("img")]))), ["image-alt"]);
+  nextIndex = 0;
+  assert.equal(auditSnapshot(page([element("img", { attributes: { alt: "" } })])).passed, true, "an empty alt is a decision, not an omission");
+  nextIndex = 0;
+  assert.deepEqual(ruleIds(auditSnapshot(page([element("svg")]))), ["decorative-svg"]);
+
+  // --- Target size, with the specification's Inline exception -------------
+  nextIndex = 0;
+  assert.deepEqual(ruleIds(auditSnapshot(page([element("button", { text: "x", width: 18, height: 18 })]))), ["target-size"]);
+  nextIndex = 0;
+  const inline = [
+    element("p", { ownText: "Read the source at ", text: "Read the source at github", tabIndex: -1 }),
+    element("button", { parentIndex: 0, text: "github", width: 60, height: 13 }),
+  ];
+  assert.equal(auditSnapshot(page(inline)).passed, true, "a control inside a sentence is exempt");
+  // A checkbox is as large as the label that clicks it.
+  nextIndex = 0;
+  const roomy = [
+    element("label", { text: "Include source", ownText: "Include source", tabIndex: -1, width: 200, height: 28 }),
+    element("input", { parentIndex: 0, attributes: { type: "checkbox" }, width: 16, height: 16 }),
+  ];
+  assert.equal(auditSnapshot(page(roomy)).passed, true);
+
+  // --- Contrast, including composited translucency ------------------------
+  nextIndex = 0;
+  const faint = auditSnapshot(page([element("small", { ownText: "hint", text: "hint", color: "rgb(80, 80, 80)", backgroundColor: "rgb(11, 14, 20)", tabIndex: -1 })]));
+  assert.deepEqual(ruleIds(faint), ["contrast"]);
+  assert.match(faint.violations[0].detail, /Text contrast is [\d.]+:1/);
+  // A tint over a dark panel must be composited, not treated as the background.
+  // Reading the tint literally reported a 1:1 ratio on text that is perfectly
+  // legible, which is a false failure — and a false failure retires the audit.
+  nextIndex = 0;
+  const tinted = [
+    element("section", { backgroundColor: "rgb(11, 14, 20)", tabIndex: -1 }),
+    element("div", { parentIndex: 0, backgroundColor: "rgba(158, 230, 111, 0.035)", tabIndex: -1, ownText: "", text: "" }),
+    element("span", { parentIndex: 1, backgroundColor: "rgba(0, 0, 0, 0)", color: "rgb(220, 227, 235)", ownText: "Learn the system", text: "Learn the system", tabIndex: -1 }),
+  ];
+  assert.equal(auditSnapshot(page(tinted)).passed, true, JSON.stringify(auditSnapshot(page(tinted)).violations));
+
+  // --- Document-level checks ----------------------------------------------
+  nextIndex = 0;
+  const noLang = auditSnapshot(page([element("p", { ownText: "hi", text: "hi", tabIndex: -1 })], { lang: "" }));
+  assert.ok(ruleIds(noLang).includes("html-lang"));
+  nextIndex = 0;
+  assert.ok(ruleIds(auditSnapshot(page([element("p")], { title: "" }))).includes("document-title"));
+  // A page with a real amount of content and no main landmark has nothing to skip to.
+  nextIndex = 0;
+  const big = auditSnapshot(page(Array.from({ length: 40 }, () => element("div", { tabIndex: -1 }))));
+  assert.ok(ruleIds(big).includes("landmark-main"));
+
+  // --- Turning a rule off is possible, and loud ---------------------------
+  nextIndex = 0;
+  assert.equal(auditSnapshot(page([element("button")]), { skipRules: ["interactive-name"] }).passed, true);
+  assert.equal(A11Y_VERSION, 1);
+  assert.match(summarizeAudit(auditSnapshot(page([element("button", { text: "Fine" })]))), /no violations/);
+  assert.match(summarizeAudit(auditSnapshot(page([element("button")]))), /1 violation\(s\): 1 critical/);
+  // The collector is a plain function with no closure, so it can be handed to a
+  // browser as-is; the smoke tests depend on that.
+  assert.equal(typeof collectAccessibilitySnapshot, "function");
+  assert.equal(/\bimport\b|require\(/.test(collectAccessibilitySnapshot.toString()), false, "the collector must be self-contained");
 });

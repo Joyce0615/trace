@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { chromium } from "playwright";
+import { auditSnapshot, collectAccessibilitySnapshot, summarizeAudit } from "../electron/accessibility.mjs";
 
 const targetUrl = process.env.TRACE_URL ?? "http://127.0.0.1:5173";
 const artifactDirectory = path.resolve("artifacts", "qa");
@@ -37,11 +38,30 @@ const requestedScripts = [];
 page.on("pageerror", (error) => errors.push(error.message));
 page.on("console", (message) => { if (message.type() === "error") errors.push(message.text()); });
 page.on("request", (request) => { if (["script", "fetch", "xhr", "other"].includes(request.resourceType())) requestedScripts.push(request.url()); });
+/** Item 48: audit whatever is on screen, and fail with the violations named. */
+const a11yAudits = [];
+async function auditAccessibility(label) {
+  const audit = auditSnapshot(await page.evaluate(collectAccessibilitySnapshot));
+  a11yAudits.push({ label, summary: summarizeAudit(audit) });
+  assert.deepEqual(
+    audit.violations,
+    [],
+    `${label} has accessibility violations:\n${audit.violations.map((violation) => `  ${violation.severity} ${violation.rule} ${violation.selector} — ${violation.detail}`).join("\n")}`,
+  );
+  assert.ok(audit.rendered > 20, `${label} rendered only ${audit.rendered} elements`);
+  return audit;
+}
+
 const monacoRequests = () => requestedScripts.filter((url) => /editor\.api|editor\.main|monaco-editor/.test(url));
 const languageRequests = () => requestedScripts.filter((url) => /languages\/definitions|\/(python|typescript|cpp|rust|go)-/.test(url));
 
 try {
   await page.goto(targetUrl, { waitUntil: "networkidle" });
+  // Item 48: the welcome screen is audited before anything is clicked, so a
+  // regression in the very first thing a learner sees cannot hide behind a
+  // later view.
+  const welcomeAudit = await auditAccessibility("welcome screen");
+  assert.ok(welcomeAudit.interactive >= 8, String(welcomeAudit.interactive));
   await page.getByRole("button", { name: "Large text" }).click();
   assert.equal(await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--font-boost").trim()), "4px");
   await page.reload({ waitUntil: "networkidle" });
@@ -60,6 +80,17 @@ try {
   await page.getByRole("dialog", { name: "Adaptive skill assessment" }).waitFor();
   await page.screenshot({ path: path.join(artifactDirectory, "adaptive-diagnostic.png") });
 
+  // Item 48: the dialog is genuinely modal, not just visually on top.
+  await auditAccessibility("diagnostic dialog");
+  assert.equal(await page.locator('[role="dialog"]').getAttribute("aria-modal"), "true");
+  // Focus moves into it on open...
+  assert.equal(await page.evaluate(() => document.querySelector('[role="dialog"]')?.contains(document.activeElement)), true, "focus did not move into the dialog");
+  // ...and Tab cycles inside it rather than wandering into the page behind.
+  for (let step = 0; step < 40; step += 1) await page.keyboard.press("Tab");
+  assert.equal(await page.evaluate(() => document.querySelector('[role="dialog"]')?.contains(document.activeElement)), true, "Tab escaped the modal dialog");
+  for (let step = 0; step < 3; step += 1) await page.keyboard.press("Shift+Tab");
+  assert.equal(await page.evaluate(() => document.querySelector('[role="dialog"]')?.contains(document.activeElement)), true, "Shift+Tab escaped the modal dialog");
+
   const diagnosticQuestions = page.locator(".diagnostic-questions fieldset");
   for (let index = 0; index < await diagnosticQuestions.count(); index += 1) {
     await diagnosticQuestions.nth(index).locator('input[type="radio"]').first().check();
@@ -75,6 +106,42 @@ try {
   await page.locator(".skill-tree").waitFor();
   assert.equal(await page.locator(".skill-node.recommended").count(), 1);
   await page.getByText("YOUR NEXT MOVE").waitFor();
+
+  // Item 48: the workspace, its landmarks, and its tab strip.
+  await auditAccessibility("workspace");
+  // The four regions a reader navigates between must each announce what they are.
+  const landmarkNames = await page.locator('.app-bar, .course-sidebar, .code-workspace, .tutor-panel, .file-explorer').evaluateAll((nodes) => nodes.map((node) => node.getAttribute("aria-label")));
+  assert.equal(landmarkNames.length, 5, JSON.stringify(landmarkNames));
+  assert.ok(landmarkNames.every(Boolean), `an unnamed landmark: ${JSON.stringify(landmarkNames)}`);
+  assert.equal(new Set(landmarkNames).size, landmarkNames.length, "two landmarks share a name");
+  // Exactly one tab stop for the whole strip, and it is the selected tab.
+  const tabStrip = page.locator('.content-tabs[role="tablist"]');
+  await tabStrip.waitFor();
+  assert.equal(await tabStrip.locator('[role="tab"][tabindex="0"]').count(), 1);
+  assert.equal(await tabStrip.locator('[role="tab"][aria-selected="true"]').innerText(), "Lesson");
+  assert.equal(await tabStrip.locator('[role="tab"][tabindex="0"]').innerText(), "Lesson");
+  // Arrow keys move between views; Home and End jump to the ends.
+  await tabStrip.getByRole("tab", { name: "Lesson" }).focus();
+  await page.keyboard.press("ArrowRight");
+  await page.locator('[role="tab"][aria-selected="true"]').filter({ hasText: "Diagram" }).waitFor();
+  assert.equal(await page.evaluate(() => document.activeElement?.textContent?.trim()), "Diagram", "focus did not follow the selection");
+  await page.keyboard.press("End");
+  await page.locator('[role="tab"][aria-selected="true"]').filter({ hasText: "Notes" }).waitFor();
+  await page.keyboard.press("ArrowRight");
+  await page.locator('[role="tab"][aria-selected="true"]').filter({ hasText: "Lesson" }).waitFor();
+  assert.equal(await page.locator('[role="tab"][aria-selected="true"]').innerText(), "Lesson", "the strip does not wrap");
+  await page.keyboard.press("Home");
+  await page.locator('[role="tab"][aria-selected="true"]').filter({ hasText: "Lesson" }).waitFor();
+  // The skip link is the first thing in the document and moves focus to the work.
+  const skipLink = page.locator(".skip-link");
+  assert.equal(await skipLink.innerText(), "Skip to the lesson");
+  assert.equal(await page.evaluate(() => document.querySelector(".app-shell")?.firstElementChild?.className), "skip-link");
+  await skipLink.focus();
+  await page.keyboard.press("Enter");
+  assert.equal(await page.evaluate(() => document.activeElement?.id), "workspace-main");
+  // The view a keyboard user just switched to is announced.
+  assert.match(await page.locator('[role="status"][aria-live="polite"]').first().innerText(), /view$/);
+
   // Item 19: the editor core must not be fetched while the learner is still reading the lesson.
   await page.waitForTimeout(400);
   assert.deepEqual(monacoRequests(), [], `Monaco was fetched before the Code view: ${monacoRequests().join(", ")}`);
@@ -89,7 +156,7 @@ try {
   await page.getByRole("button", { name: "Open Quick Ask" }).waitFor();
   await page.screenshot({ path: path.join(artifactDirectory, "skill-tree.png") });
 
-  await page.locator(".content-tabs").getByRole("button", { name: "Diagram" }).click();
+  await page.locator(".content-tabs").getByRole("tab", { name: "Diagram" }).click();
   await page.getByText("Request-to-token architecture").waitFor();
   await page.screenshot({ path: path.join(artifactDirectory, "illustrated-lesson.png") });
   await page.getByRole("button", { name: /LLMEngine\.step/ }).click();
@@ -107,7 +174,7 @@ try {
   await page.getByText(/No language server for python/).waitFor();
 
   // Item 26: cross-file call chains with grounded, main-process-graded predictions.
-  await page.locator(".content-tabs").getByRole("button", { name: "Chains" }).click();
+  await page.locator(".content-tabs").getByRole("tab", { name: "Chains" }).click();
   await page.locator('.call-chain-panel[data-status="ready"]').waitFor();
   assert.equal(
     await page.locator(".chain-steps").getAttribute("data-summary"),
@@ -137,7 +204,7 @@ try {
   await page.getByText("nanovllm/engine/llm_engine.py", { exact: false }).first().waitFor();
 
   // Item 27: localization drill scores coverage separately from context efficiency.
-  await page.locator(".content-tabs").getByRole("button", { name: "Locate" }).click();
+  await page.locator(".content-tabs").getByRole("tab", { name: "Locate" }).click();
   await page.getByRole("button", { name: "Start localization exercise" }).click();
   const drill = page.locator(".localization-panel[data-exercise]");
   await drill.waitFor();
@@ -149,10 +216,10 @@ try {
   // Open one relevant and one irrelevant file; both count toward efficiency.
   await drill.locator(".localization-search input").fill("nanovllm/engine/llm_engine.py");
   await drill.locator(".localization-results button", { hasText: "Open" }).first().click();
-  await page.locator(".content-tabs").getByRole("button", { name: "Locate" }).click();
+  await page.locator(".content-tabs").getByRole("tab", { name: "Locate" }).click();
   await drill.locator(".localization-search input").fill("nanovllm/models/qwen3.py");
   await drill.locator(".localization-results button", { hasText: "Open" }).first().click();
-  await page.locator(".content-tabs").getByRole("button", { name: "Locate" }).click();
+  await page.locator(".content-tabs").getByRole("tab", { name: "Locate" }).click();
   assert.equal(await drill.locator(".localization-trail em").getAttribute("data-inspected"), "2");
   // Selecting only the definition file gives partial coverage and full precision.
   await drill.locator(".localization-trail label", { hasText: "nanovllm/engine/llm_engine.py" }).click();
@@ -235,7 +302,7 @@ try {
   await page.screenshot({ path: path.join(artifactDirectory, "activities.png") });
 
   // Item 41: analytics over the events this session actually produced.
-  await page.locator(".content-tabs").getByRole("button", { name: "Diagram" }).click();
+  await page.locator(".content-tabs").getByRole("tab", { name: "Diagram" }).click();
   const analytics = page.locator(".analytics-panel");
   await analytics.waitFor();
   await analytics.getByRole("button", { name: "Measure my learning" }).click();
@@ -314,7 +381,7 @@ try {
 
   // Item 47: a note the learner writes is persisted through the bridge and then
   // travels in the offline archive alongside the source its anchors point at.
-  await page.locator(".content-tabs").getByRole("button", { name: "Notes" }).click();
+  await page.locator(".content-tabs").getByRole("tab", { name: "Notes" }).click();
   const notesPane = page.locator(".lesson-notes");
   await notesPane.waitFor();
   const noteId = await notesPane.getAttribute("data-note-id");
@@ -322,13 +389,13 @@ try {
   await notesPane.locator("textarea").fill("The scheduler decides the batch; the runner executes it.");
   await page.waitForFunction(() => (window.traceWorkspace?.notes ?? []).some((note) => /scheduler decides the batch/.test(note.text)));
   // Switching to another view and back must not lose it: notes are App-owned.
-  await page.locator(".content-tabs").getByRole("button", { name: "Lesson" }).click();
-  await page.locator(".content-tabs").getByRole("button", { name: "Notes" }).click();
+  await page.locator(".content-tabs").getByRole("tab", { name: "Lesson" }).click();
+  await page.locator(".content-tabs").getByRole("tab", { name: "Notes" }).click();
   await notesPane.waitFor();
   assert.match(await notesPane.locator("textarea").inputValue(), /scheduler decides the batch/);
 
   // The archive lives with the other course-level panels.
-  await page.locator(".content-tabs").getByRole("button", { name: "Diagram" }).click();
+  await page.locator(".content-tabs").getByRole("tab", { name: "Diagram" }).click();
   const archivePanel = page.locator(".archive-panel");
   await archivePanel.waitFor();
   await archivePanel.getByRole("button", { name: "Export everything" }).click();
@@ -386,7 +453,7 @@ try {
   await page.screenshot({ path: path.join(artifactDirectory, "experiments.png") });
 
   // Item 28: RACE-style review grades three stages against three rubrics.
-  await page.locator(".content-tabs").getByRole("button", { name: "Review" }).click();
+  await page.locator(".content-tabs").getByRole("tab", { name: "Review" }).click();
   await page.getByRole("button", { name: "Start graded review" }).click();
   const review = page.locator(".review-panel[data-task]");
   await review.waitFor();
@@ -417,7 +484,7 @@ try {
   await page.screenshot({ path: path.join(artifactDirectory, "graded-review.png") });
 
   // Item 29: the browser demo cannot start an interpreter and says so honestly.
-  await page.locator(".content-tabs").getByRole("button", { name: "Chains" }).click();
+  await page.locator(".content-tabs").getByRole("tab", { name: "Chains" }).click();
   const tracePanel = page.locator(".execution-trace");
   await tracePanel.waitFor();
   assert.equal(await tracePanel.getAttribute("data-runtime"), "unavailable");
@@ -451,12 +518,12 @@ try {
   assert.equal(await explainPanel.locator(".explain-observed").count(), 0);
 
   // Item 30: module layers, boundaries, and the current symbol's callers/callees.
-  await page.locator(".content-tabs").getByRole("button", { name: "Code" }).click();
+  await page.locator(".content-tabs").getByRole("tab", { name: "Code" }).click();
   await page.locator(".explorer-search input").fill("engine/llm_engine.py");
   await page.locator(".file-row").first().click();
   await page.locator(".symbol-section button", { hasText: "step" }).first().click();
   await page.locator(".explorer-search input").fill("");
-  await page.locator(".content-tabs").getByRole("button", { name: "Diagram" }).click();
+  await page.locator(".content-tabs").getByRole("tab", { name: "Diagram" }).click();
   const architecture = page.locator('.architecture-panel[data-status="ready"]');
   await architecture.waitFor();
   assert.ok(Number(await architecture.getAttribute("data-layers")) >= 2, await architecture.getAttribute("data-layers"));
@@ -508,7 +575,7 @@ try {
   await page.getByText("README.md", { exact: false }).first().waitFor();
 
   // Item 33: hybrid search runs the same retrieval code as the desktop app.
-  await page.locator(".content-tabs").getByRole("button", { name: "Code" }).click();
+  await page.locator(".content-tabs").getByRole("tab", { name: "Code" }).click();
   await page.locator(".explorer-search input").fill("scheduler");
   const searchPanel = page.locator('.search-results[data-state="ready"]');
   await searchPanel.waitFor();
@@ -530,7 +597,7 @@ try {
   await page.locator(".explorer-search input").fill("");
 
   // Item 43: the same repository ranked differently for different goals.
-  await page.locator(".content-tabs").getByRole("button", { name: "Diagram" }).click();
+  await page.locator(".content-tabs").getByRole("tab", { name: "Diagram" }).click();
   const goals = page.locator(".goal-panel");
   await goals.waitFor();
   await goals.locator(".goal-target").first().waitFor();
@@ -560,11 +627,11 @@ try {
   // A target opens the real file.
   await goals.locator(".goal-target > button").first().click();
   await page.locator(".monaco-editor").waitFor({ timeout: 20_000 });
-  await page.locator(".content-tabs").getByRole("button", { name: "Diagram" }).click();
+  await page.locator(".content-tabs").getByRole("tab", { name: "Diagram" }).click();
   await page.screenshot({ path: path.join(artifactDirectory, "goals.png") });
 
   // Item 34: three quality scorecards, never averaged into one number.
-  await page.locator(".content-tabs").getByRole("button", { name: "Diagram" }).click();
+  await page.locator(".content-tabs").getByRole("tab", { name: "Diagram" }).click();
   const evaluation = page.locator(".evaluation-panel");
   await evaluation.waitFor();
   await evaluation.getByRole("button", { name: "Run evaluation" }).click();
@@ -686,16 +753,27 @@ try {
     assert.ok((region.top ?? -1) >= 0 && (region.bottom ?? Infinity) <= fit.viewport.height + 1, `${region.selector} clips vertically`);
   }
 
+  // Item 48: every view a learner can reach, audited, not just the first one.
+  for (const view of ["Diagram", "Code", "Chains", "Locate", "Review", "Notes", "Lesson"]) {
+    await page.locator(".content-tabs").getByRole("tab", { name: view }).click();
+    await page.locator(`[role="tab"][aria-selected="true"]`).filter({ hasText: view }).waitFor();
+    await page.waitForTimeout(900);
+    await auditAccessibility(`${view} view`);
+  }
+  await page.screenshot({ path: path.join(artifactDirectory, "accessibility.png") });
+
   await page.setViewportSize({ width: 1120, height: 720 });
   await page.waitForTimeout(250);
   const compactFit = await page.evaluate(() => ({ x: document.documentElement.scrollWidth > document.documentElement.clientWidth, y: document.documentElement.scrollHeight > document.documentElement.clientHeight, tutorBottom: document.querySelector(".tutor-panel")?.getBoundingClientRect().bottom, height: window.innerHeight }));
+  // Reflow to a compact viewport must not introduce new violations either.
+  await auditAccessibility("compact viewport");
   await page.screenshot({ path: path.join(artifactDirectory, "workspace-compact.png") });
   assert.equal(compactFit.x, false);
   assert.equal(compactFit.y, false);
   assert.ok((compactFit.tutorBottom ?? Infinity) <= compactFit.height + 1, JSON.stringify(compactFit));
 
   assert.deepEqual(errors, [], `Browser errors:\n${errors.join("\n")}`);
-  console.log(JSON.stringify({ ok: true, screenshots: artifactDirectory, fit, compactFit }, null, 2));
+  console.log(JSON.stringify({ ok: true, screenshots: artifactDirectory, fit, compactFit, accessibility: a11yAudits }, null, 2));
 } finally {
   await context.close();
   await browser.close();

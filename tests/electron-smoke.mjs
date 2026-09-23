@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { _electron as electron } from "playwright";
+import { auditSnapshot, collectAccessibilitySnapshot, summarizeAudit } from "../electron/accessibility.mjs";
 
 const repositoryPath = process.env.TRACE_ELECTRON_REPO ?? "/Users/user/GitHub/flashinfer";
 const artifactDirectory = path.resolve("artifacts", "qa");
@@ -1577,7 +1578,7 @@ try {
     return repository;
   });
   assert.ok(importSummary.length > 0);
-  await page.locator(".content-tabs").getByRole("button", { name: "Code" }).click();
+  await page.locator(".content-tabs").getByRole("tab", { name: "Code" }).click();
   await page.locator(".monaco-editor").waitFor({ timeout: 30_000 });
   await page.locator(".explorer-search input").fill("flashinfer/decode.py");
   await page.locator(".file-row").first().click();
@@ -1660,6 +1661,44 @@ try {
   await page.getByText("YOUR NEXT MOVE").waitFor();
   await page.getByRole("button", { name: "Take checkpoint" }).waitFor();
 
+  // Item 48: the real workspace, over a real 2,196-file repository, audited in
+  // the desktop shell rather than only in the browser demo.
+  const accessibilityAudits = [];
+  const auditAccessibility = async (label) => {
+    const audit = auditSnapshot(await page.evaluate(collectAccessibilitySnapshot));
+    accessibilityAudits.push({ label, summary: summarizeAudit(audit), rendered: audit.rendered, interactive: audit.interactive });
+    assert.deepEqual(
+      audit.violations,
+      [],
+      `${label} has accessibility violations:\n${audit.violations.map((violation) => `  ${violation.severity} ${violation.rule} ${violation.selector} — ${violation.detail}`).join("\n")}`,
+    );
+    return audit;
+  };
+  const workspaceAudit = await auditAccessibility("workspace");
+  assert.ok(workspaceAudit.rendered > 200, String(workspaceAudit.rendered));
+  assert.ok(workspaceAudit.interactive > 40, String(workspaceAudit.interactive));
+  for (const view of ["Diagram", "Code", "Chains", "Locate", "Review", "Notes", "Lesson"]) {
+    await page.locator(".content-tabs").getByRole("tab", { name: view }).click();
+    await page.locator('[role="tab"][aria-selected="true"]').filter({ hasText: view }).waitFor();
+    await page.waitForTimeout(900);
+    await auditAccessibility(`${view} view`);
+  }
+  // Keyboard navigation works against the real index, not only the fixture.
+  const tabStrip = page.locator('.content-tabs[role="tablist"]');
+  assert.equal(await tabStrip.locator('[role="tab"][tabindex="0"]').count(), 1, "the tab strip must expose exactly one tab stop");
+  await tabStrip.getByRole("tab", { name: "Lesson" }).focus();
+  await page.keyboard.press("ArrowRight");
+  await page.locator('[role="tab"][aria-selected="true"]').filter({ hasText: "Diagram" }).waitFor();
+  await page.keyboard.press("ArrowLeft");
+  await page.locator('[role="tab"][aria-selected="true"]').filter({ hasText: "Lesson" }).waitFor();
+  // The skip link is first in the document and lands on the work.
+  assert.equal(await page.evaluate(() => document.querySelector(".app-shell")?.firstElementChild?.className), "skip-link");
+  await page.locator(".skip-link").focus();
+  await page.keyboard.press("Enter");
+  assert.equal(await page.evaluate(() => document.activeElement?.id), "workspace-main");
+  // Nothing anywhere in the shell steals the tab order with a positive tabindex.
+  assert.equal(await page.evaluate(() => document.querySelectorAll('[tabindex]:not([tabindex="0"]):not([tabindex="-1"])').length), 0);
+
   const overflow = await page.evaluate(() => ({
     x: document.documentElement.scrollWidth > document.documentElement.clientWidth,
     y: document.documentElement.scrollHeight > document.documentElement.clientHeight,
@@ -1685,6 +1724,7 @@ try {
     diagnosis: { skills: diagnosis.skills.length, assessed: diagnosis.summary.assessed, meanConfidence: diagnosis.summary.meanConfidence, brier: diagnosis.summary.meanBrier, overconfident: diagnosis.summary.overconfidentSkills, misconceptions: diagnosis.summary.misconceptionCounts },
     signing: { algorithm: signingAudit.identity.algorithm, keyId: `${signingAudit.identity.keyId.slice(0, 12)}…`, packageSealed: signingAudit.asIs.signature.verified, anchorsSealed: signingAudit.asIs.anchorSignature.verified, tamperReason: signingAudit.doctoredCheck.signature.reason, tamperedImport: signingAudit.doctoredImport.imported, trustBefore: signingAudit.beforeTrust.signature.trust, trustAfter: signingAudit.afterTrust.signature.trust },
     migration: migrationReport,
+    accessibility: accessibilityAudits,
     archive: archiveReport,
     coursePackage: { format: coursePackage.format, commit: (coursePackage.provenance.commit ?? "").slice(0, 8), anchors: coursePackage.integrity.anchorCount, license: coursePackage.license.id, policy: coursePackage.license.policy, embeddedFiles: packageAudit.requested.integrity.excerptCount, roundTrip: packageAudit.roundTrip.verification.verdict, foreign: packageAudit.foreign.verification.verdict },
     goals: Object.fromEntries(goalIds.map((goal) => [goal, { top: rankings[goal][0], targets: rankings[goal].length, topReasons: goalAudit.plans[goal].targets[0].reasons.map((reason) => reason.detail) }])),
