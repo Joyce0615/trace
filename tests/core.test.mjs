@@ -22,6 +22,7 @@ import { GIT_HISTORY_VERSION, busFactor, detectRenames, historyLessons, historyS
 import { MISCONCEPTIONS, MISCONCEPTION_VERSION, buildProbe, calibrateSkill, detectMisconceptions, diagnoseLearner, gradeProbe } from "../electron/misconception.mjs";
 import { SIGNING_ALGORITHM, SIGNING_VERSION, anchorPayload, assessmentPayload, canonicalize, createKeyPair, digestOf, keyIdFor, loadOrCreateKeyPair, loadTrustedKeys, packagePayload, publicIdentity, responsePayload, setKeyTrust, signPackage, signPayload, verifyPackageSignature, verifyPayload } from "../electron/signing.mjs";
 import { COURSE_PACKAGE_FORMAT, COURSE_PACKAGE_VERSION, anchorManifest, detectLicense, importCourse, packageCourse, verifyPackage } from "../electron/course-package.mjs";
+import { DEFAULT_WINDOW, VIRTUALIZATION_VERSION, buildHeightIndex, cullGraph, describeCulling, indexAt, scrollToIndex, variableWindowFor, windowFor } from "../electron/virtualization.mjs";
 import { CONTRAST_LEVELS, CONTRAST_TARGETS, GRAPH_CATEGORIES, GRAPH_PALETTES, THEMES, THEME_VERSION, colorDistance, contrast as contrastOf, deriveColor, hexToRgb, luminance, luminanceForContrast, normalizeDisplaySettings, paletteFor, paletteSeparation, parseHex, rgbToHex, simulateVision, withLuminance } from "../electron/theme.mjs";
 import { A11Y_VERSION, auditSnapshot, collectAccessibilitySnapshot, contrastRatio, isLargeText, relativeLuminance, roleOf, summarizeAudit } from "../electron/accessibility.mjs";
 import { ARCHIVE_FORMAT, ARCHIVE_VERSION, buildArchive, canonicalJson, digestOfText, excerptAround, importArchive, mergeNotes, mergeProgress, verifyArchive } from "../electron/offline-archive.mjs";
@@ -5332,4 +5333,117 @@ test("the stylesheet is fully tokenized and every theme block is complete", asyn
   for (const category of GRAPH_CATEGORIES) {
     assert.ok(css.includes(`--cat-${category.id}:`), `no variable for ${category.id}`);
   }
+});
+
+test("windowing keeps the whole collection reachable while bounding the DOM", () => {
+  // --- The scrollbar must tell the truth ----------------------------------
+  const top = windowFor({ total: 2196, itemHeight: 26, scrollTop: 0, viewportHeight: 420 });
+  assert.equal(top.totalHeight, 2196 * 26, "the container is as tall as the whole list, not the rendered part");
+  assert.equal(top.start, 0);
+  assert.ok(top.count >= Math.ceil(420 / 26), `${top.count} rows for a ${Math.ceil(420 / 26)}-row viewport`);
+  assert.equal(top.offsetBefore, 0);
+  assert.equal(top.offsetBefore + top.count * 26 + top.offsetAfter, top.totalHeight, "the offsets and the rows must add up to the full height");
+
+  // --- Scrolling reaches the end ------------------------------------------
+  const bottom = windowFor({ total: 2196, itemHeight: 26, scrollTop: 2196 * 26, viewportHeight: 420 });
+  assert.equal(bottom.end, 2196, "the last item must be reachable");
+  assert.equal(bottom.offsetAfter, 0);
+  assert.equal(bottom.offsetBefore + bottom.count * 26, bottom.totalHeight);
+  // A scroll position past the end is clamped rather than producing an empty window.
+  const past = windowFor({ total: 2196, itemHeight: 26, scrollTop: 9_000_000, viewportHeight: 420 });
+  assert.deepEqual([past.start, past.end], [bottom.start, bottom.end]);
+  assert.equal(windowFor({ total: 2196, itemHeight: 26, scrollTop: -500, viewportHeight: 420 }).start, 0);
+
+  // --- Every item is reachable by *some* scroll position ------------------
+  // The property that matters: scrolling through the list must be able to show
+  // each of the 2,196 files, which is exactly what the old `.slice(0, 180)` broke.
+  const seen = new Set();
+  for (let scrollTop = 0; scrollTop <= 2196 * 26; scrollTop += 200) {
+    const view = windowFor({ total: 2196, itemHeight: 26, scrollTop, viewportHeight: 420 });
+    for (let index = view.start; index < view.end; index += 1) seen.add(index);
+  }
+  assert.equal(seen.size, 2196, `only ${seen.size} of 2196 rows were ever reachable`);
+
+  // --- The DOM stays bounded ----------------------------------------------
+  const wide = windowFor({ total: 100_000, itemHeight: 26, scrollTop: 500_000, viewportHeight: 40_000 });
+  assert.ok(wide.count <= DEFAULT_WINDOW.maxRendered, `${wide.count} rows rendered`);
+  assert.equal(wide.clamped, true, "hitting the ceiling is reported, not silent");
+  assert.equal(windowFor({ total: 40, itemHeight: 26, scrollTop: 0, viewportHeight: 420 }).clamped, false);
+  // A short list renders whole, with no padding either side.
+  const short = windowFor({ total: 5, itemHeight: 26, scrollTop: 0, viewportHeight: 420 });
+  assert.deepEqual([short.start, short.end, short.offsetBefore, short.offsetAfter], [0, 5, 0, 0]);
+  assert.deepEqual(windowFor({ total: 0, itemHeight: 26, viewportHeight: 420 }), { start: 0, end: 0, count: 0, offsetBefore: 0, offsetAfter: 0, totalHeight: 0, clamped: false });
+  assert.deepEqual(windowFor({}), { start: 0, end: 0, count: 0, offsetBefore: 0, offsetAfter: 0, totalHeight: 0, clamped: false });
+
+  // --- Overscan renders beyond the viewport, so scrolling does not flash ---
+  const middle = windowFor({ total: 1000, itemHeight: 20, scrollTop: 4000, viewportHeight: 200, overscan: 5 });
+  assert.equal(middle.start, 200 - 5);
+  assert.ok(middle.end >= 200 + 10 + 5);
+  assert.equal(windowFor({ total: 1000, itemHeight: 20, scrollTop: 4000, viewportHeight: 200, overscan: 0 }).start, 200);
+
+  // --- Variable heights ----------------------------------------------------
+  const heights = [40, 120, 30, 200, 60, 60, 400];
+  const offsets = buildHeightIndex(heights);
+  assert.deepEqual(offsets, [0, 40, 160, 190, 390, 450, 510, 910]);
+  assert.equal(indexAt(offsets, 0), 0);
+  assert.equal(indexAt(offsets, 39), 0);
+  assert.equal(indexAt(offsets, 40), 1, "the boundary belongs to the row that starts there");
+  assert.equal(indexAt(offsets, 159), 1);
+  assert.equal(indexAt(offsets, 500), 5);
+  assert.equal(indexAt(offsets, 100_000), heights.length - 1, "past the end clamps to the last row");
+  const variable = variableWindowFor({ heights, scrollTop: 200, viewportHeight: 250, overscan: 0 });
+  assert.equal(variable.totalHeight, 910);
+  assert.deepEqual([variable.start, variable.end], [3, 6]);
+  assert.equal(variable.offsetBefore, 190);
+  assert.equal(variable.offsetBefore + heights.slice(variable.start, variable.end).reduce((sum, value) => sum + value, 0) + variable.offsetAfter, 910);
+  // A single enormous block does not make the window empty.
+  assert.equal(variableWindowFor({ heights: [5000], scrollTop: 0, viewportHeight: 300 }).count, 1);
+  assert.equal(variableWindowFor({ heights: [], viewportHeight: 300 }).totalHeight, 0);
+
+  // --- Keyboard scrolling moves only when it has to -----------------------
+  assert.equal(scrollToIndex({ index: 5, itemHeight: 26, scrollTop: 0, viewportHeight: 420, total: 100 }), 0, "an already-visible row does not scroll");
+  assert.equal(scrollToIndex({ index: 0, itemHeight: 26, scrollTop: 500, viewportHeight: 420, total: 100 }), 0);
+  assert.equal(scrollToIndex({ index: 40, itemHeight: 26, scrollTop: 0, viewportHeight: 420, total: 100 }), 41 * 26 - 420);
+  assert.equal(scrollToIndex({ index: 900, itemHeight: 26, scrollTop: 0, viewportHeight: 420, total: 100 }), 100 * 26 - 420, "an index past the end clamps");
+
+  // --- Graph culling -------------------------------------------------------
+  const nodes = Array.from({ length: 500 }, (_, index) => ({ id: `n${index}`, x: (index % 25) * 100, y: Math.floor(index / 25) * 100, width: 80, height: 40, importance: index }));
+  const edges = nodes.slice(1).map((node, index) => ({ from: nodes[index].id, to: node.id }));
+  const everything = cullGraph({ nodes, edges, budget: 1000 });
+  assert.equal(everything.complete, true);
+  assert.equal(everything.nodes.length, 500);
+  assert.match(describeCulling(everything), /Showing all 500 nodes/);
+  // A viewport culls what is outside it, and keeps what merely overlaps.
+  const viewport = { left: 0, right: 300, top: 0, bottom: 150 };
+  const windowed = cullGraph({ nodes, edges, viewport, budget: 1000 });
+  assert.ok(windowed.nodes.every((node) => node.x <= 300 && node.y <= 150), JSON.stringify(windowed.nodes.slice(0, 3)));
+  assert.ok(windowed.nodes.some((node) => node.x === 300), "a node touching the edge is still visible");
+  assert.equal(windowed.culledByViewport, 500 - windowed.nodes.length);
+  assert.equal(windowed.complete, false);
+  // Over budget, the most important survive — and it is the graph's ranking,
+  // not the order the nodes happened to arrive in.
+  const dense = cullGraph({ nodes, edges, budget: 10 });
+  assert.equal(dense.nodes.length, 10);
+  assert.deepEqual(dense.nodes.map((node) => node.importance), [499, 498, 497, 496, 495, 494, 493, 492, 491, 490]);
+  assert.equal(dense.culledByBudget, 490);
+  assert.match(describeCulling(dense), /Showing 10 of 500 nodes — 490 below the density budget/);
+  // An edge is only drawn when both ends are, or it points at nothing.
+  assert.ok(dense.edges.every((edge) => dense.nodes.some((node) => node.id === edge.from) && dense.nodes.some((node) => node.id === edge.to)));
+  assert.equal(dense.hiddenEdges, edges.length - dense.edges.length);
+  assert.deepEqual(cullGraph({}).nodes, []);
+  assert.equal(cullGraph({}).complete, true);
+  assert.equal(VIRTUALIZATION_VERSION, 1);
+});
+
+test("no list in the renderer silently truncates what a learner can reach", async () => {
+  // The defect this item exists to fix: a `.slice(0, N)` on a collection the
+  // learner navigates is not a performance trade-off, it is content they cannot
+  // get to. This checks the two places it mattered stayed fixed.
+  const app = await readFile(path.resolve("src", "App.tsx"), "utf8");
+  assert.equal(/\.slice\(0, 180\)/.test(app), false, "the file tree truncates again");
+  assert.equal(/Refine search to see more files/.test(app), false, "the truncation notice is back");
+  assert.match(app, /<VirtualList/, "the file tree is not windowed");
+  const exercises = await readFile(path.resolve("src", "exercises.tsx"), "utf8");
+  assert.match(exercises, /cullGraph\(/, "the architecture view is not culled");
+  assert.equal(/layer\.modules\.slice\(0, 8\)/.test(exercises), false, "the layer grid truncates again");
 });

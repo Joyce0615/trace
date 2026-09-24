@@ -1684,6 +1684,68 @@ try {
     await auditAccessibility(`${view} view`);
   }
 
+  // Item 50: the file tree over a 2,196-file repository. Before this item it
+  // rendered the first 180 files and told the learner to refine their search,
+  // which meant 2,016 files could not be opened at all.
+  await page.locator(".content-tabs").getByRole("tab", { name: "Code" }).click();
+  await page.waitForTimeout(400);
+  const fileList = page.locator(".file-list");
+  await fileList.waitFor();
+  const indexedFileCount = await page.evaluate(() => window.traceWorkspace.repository.files.length);
+  assert.equal(Number(await fileList.getAttribute("data-virtual-total")), indexedFileCount, "the tree must hold every indexed file");
+  assert.ok(indexedFileCount > 1000, String(indexedFileCount));
+  const renderedRows = () => page.locator(".file-list .file-row").count();
+  const firstRendered = await renderedRows();
+  assert.ok(firstRendered < 60, `${firstRendered} rows are in the DOM for ${indexedFileCount} files`);
+  assert.equal(firstRendered, Number(await fileList.getAttribute("data-virtual-rendered")));
+  // The scrollbar is honest: the container is as tall as the whole list.
+  const scrollGeometry = await fileList.evaluate((node) => ({ scrollHeight: node.scrollHeight, clientHeight: node.clientHeight }));
+  assert.ok(scrollGeometry.scrollHeight >= indexedFileCount * 20, JSON.stringify(scrollGeometry));
+  assert.ok(scrollGeometry.scrollHeight > scrollGeometry.clientHeight * 10);
+  // Scrolling to the end really reaches the last file, and the DOM stays bounded.
+  const firstPaths = await page.locator(".file-list .file-row").evaluateAll((nodes) => nodes.map((node) => node.title));
+  await fileList.evaluate((node) => { node.scrollTop = node.scrollHeight; });
+  await page.waitForTimeout(400);
+  const lastPaths = await page.locator(".file-list .file-row").evaluateAll((nodes) => nodes.map((node) => node.title));
+  const reachedLastFile = Number(await fileList.getAttribute("data-virtual-end")) === indexedFileCount;
+  assert.equal(reachedLastFile, true, "scrolling to the bottom must reach the last file");
+  assert.ok(await renderedRows() < 60, `${await renderedRows()} rows after scrolling to the end`);
+  assert.equal(firstPaths.some((filePath) => lastPaths.includes(filePath)), false, "the window did not move");
+  // A file 1,500 rows down — unreachable before this item — can be opened.
+  const deepFile = await page.evaluate(() => window.traceWorkspace.repository.files[1500]?.path);
+  await page.locator(".explorer-search input").fill(deepFile.split("/").at(-1));
+  await page.waitForTimeout(500);
+  await page.locator(`.file-list .file-row[title="${deepFile}"]`).first().click();
+  await page.waitForTimeout(700);
+  assert.match(await page.locator(".breadcrumb").innerText(), new RegExp(deepFile.split("/").at(-1).replace(/\./g, "\\.")));
+  await page.locator(".explorer-search input").fill("");
+  await page.waitForTimeout(400);
+  const virtualReport = {
+    files: indexedFileCount,
+    renderedRows: firstRendered,
+    scrollHeight: scrollGeometry.scrollHeight,
+    reachedLastFile,
+    openedDeepFile: deepFile,
+  };
+
+  // Item 50: the architecture view culls by a density budget and says so,
+  // rather than dropping modules quietly.
+  await page.locator(".content-tabs").getByRole("tab", { name: "Diagram" }).click();
+  await page.locator(".architecture-panel").waitFor();
+  await page.waitForTimeout(700);
+  const architecturePanel = page.locator(".architecture-panel");
+  const shownModules = Number(await architecturePanel.getAttribute("data-shown"));
+  const totalModules = Number(await architecturePanel.getAttribute("data-total"));
+  assert.ok(totalModules > 0, String(totalModules));
+  assert.ok(shownModules <= totalModules);
+  assert.equal(await architecturePanel.locator(".module-card").count() <= shownModules, true);
+  assert.ok(shownModules < totalModules, `the density budget was never reached: ${shownModules}/${totalModules}`);
+  assert.match(await architecturePanel.locator(".culling-note").innerText(), /Showing \d+ of \d+ nodes/);
+  // What was dropped is the *least* busy, not the last alphabetically.
+  const shownFanout = await architecturePanel.locator(".module-card small").evaluateAll((nodes) => nodes.map((node) => node.textContent ?? ""));
+  assert.ok(shownFanout.length > 0);
+  Object.assign(virtualReport, { modules: totalModules, modulesShown: shownModules });
+
   // Item 49: the derived themes hold up over the real repository, not only over
   // the fixture — the same palette, a hundred times more markup.
   const displaySettings = page.locator(".app-bar .display-settings");
@@ -1742,6 +1804,8 @@ try {
   // Keyboard navigation works against the real index, not only the fixture.
   const tabStrip = page.locator('.content-tabs[role="tablist"]');
   assert.equal(await tabStrip.locator('[role="tab"][tabindex="0"]').count(), 1, "the tab strip must expose exactly one tab stop");
+  await tabStrip.getByRole("tab", { name: "Lesson" }).click();
+  await page.locator('[role="tab"][aria-selected="true"]').filter({ hasText: "Lesson" }).waitFor();
   await tabStrip.getByRole("tab", { name: "Lesson" }).focus();
   await page.keyboard.press("ArrowRight");
   await page.locator('[role="tab"][aria-selected="true"]').filter({ hasText: "Diagram" }).waitFor();
@@ -1782,6 +1846,7 @@ try {
     migration: migrationReport,
     accessibility: accessibilityAudits,
     display: themeReport,
+    virtualization: virtualReport,
     archive: archiveReport,
     coursePackage: { format: coursePackage.format, commit: (coursePackage.provenance.commit ?? "").slice(0, 8), anchors: coursePackage.integrity.anchorCount, license: coursePackage.license.id, policy: coursePackage.license.policy, embeddedFiles: packageAudit.requested.integrity.excerptCount, roundTrip: packageAudit.roundTrip.verification.verdict, foreign: packageAudit.foreign.verification.verdict },
     goals: Object.fromEntries(goalIds.map((goal) => [goal, { top: rankings[goal][0], targets: rankings[goal].length, topReasons: goalAudit.plans[goal].targets[0].reasons.map((reason) => reason.detail) }])),

@@ -1,7 +1,7 @@
 import type { OnMount } from "@monaco-editor/react";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { emptyActivityState, emptyAnalyticsState, emptyExperimentState, emptyGoalState, emptyMigrationState, emptyArchiveState, emptySharingState, emptyArchitectureState, emptyChainState, emptyDiagnosisState, emptyEvaluationState, emptyEvidenceState, emptyHistoryState, emptyLocalizationState, emptyExecutableQuizState, emptyExplanationState, emptyReviewState, emptyScheduleState, emptyTraceState, type ActivityState, type AnalyticsState, type ArchitectureState, type ExperimentState, type GoalState, type MigrationState, type ArchiveState, type SharingState, type ChainState, type DiagnosisState, type EvaluationState, type EvidenceState, type ExecutableQuizState, type ExplanationState, type HistoryState, type LocalizationState, type ReviewState, type ScheduleState, type TraceState } from "./exercise-state";
-import { Icon, bridge, readableError, repositoryRef } from "./shell";
+import { Icon, VirtualList, bridge, readableError, repositoryRef } from "./shell";
 import { addEvidence, completeDiagnostic, personalizeSkillGraph, skillForLesson } from "./learning";
 import type { AgentState, ContextMode, ContextPack, SearchResponse, ContextScope, Course, IndexProgress, KnowledgeGraphSummary, LearnerNote, LearnerProfile, LinkClassification, LearnerState, LearningMemory, Lesson, LessonContentBlock, PracticeReport, PracticeSession, Repository, RepoFile, SkillGraph, SkillNode, SymbolResolution } from "./types";
 
@@ -101,6 +101,13 @@ function Logo() {
 }
 
 const fontBoosts: Record<FontScale, number> = { compact: 0, comfortable: 2, large: 4 };
+
+// Item 50. Row heights are fixed so the window is arithmetic rather than a
+// measurement pass; the CSS below pins them to the same numbers.
+const FILE_ROW_HEIGHT = 26;
+const SEARCH_ROW_HEIGHT = 64;
+/** Below this a list is cheaper to render whole than to window. */
+const SEARCH_VIRTUAL_THRESHOLD = 12;
 
 /** The lesson views, in the order the tab strip presents them (item 48). */
 const WORKSPACE_TABS: Array<{ mode: WorkspaceMode; label: string; icon: string }> = [
@@ -409,23 +416,35 @@ function SearchResults({ query, results, busy, onOpen }: { query: string; result
       HYBRID SEARCH <small>{results.results.length} results · {Object.entries(results.strategies).map(([name, count]) => `${name} ${count}`).join(" · ")}</small>
     </div>
     {results.results.length === 0 && <p className="search-empty">Nothing matched “{results.query}”.</p>}
-    {results.results.map((result) => (
-      <button
-        key={`${result.path}-${result.symbol ?? ""}-${result.line ?? 0}`}
-        className="search-result"
-        data-path={result.path}
-        data-strategies={Object.keys(result.strategies).join(",")}
-        onClick={() => onOpen(result.path, result.line ?? result.snippet?.line ?? 1)}
-      >
-        <span className="search-result-head">
-          {result.symbol ? <strong>{result.symbol}</strong> : <strong>{result.path.split("/").at(-1)}</strong>}
-          <small>{result.path}{result.line ? `:${result.line}` : ""}</small>
-        </span>
-        {result.snippet && <code>{result.snippet.text}</code>}
-        <span className="search-strategies">{Object.keys(result.strategies).map((name) => <em key={name} data-strategy={name}>{name}</em>)}</span>
-      </button>
-    ))}
+    {results.results.length > SEARCH_VIRTUAL_THRESHOLD
+      ? <VirtualList
+        className="search-result-list"
+        items={results.results}
+        itemHeight={SEARCH_ROW_HEIGHT}
+        height={Math.min(360, results.results.length * SEARCH_ROW_HEIGHT)}
+        label={`${results.results.length} search results`}
+        keyFor={(result) => `${result.path}-${result.symbol ?? ""}-${result.line ?? 0}`}
+        renderItem={(result) => <SearchResultRow result={result} onOpen={onOpen} />}
+      />
+      : results.results.map((result) => <SearchResultRow key={`${result.path}-${result.symbol ?? ""}-${result.line ?? 0}`} result={result} onOpen={onOpen} />)}
   </div>;
+}
+
+/** One search hit; shared by the plain list and the windowed one. */
+function SearchResultRow({ result, onOpen }: { result: SearchResponse["results"][number]; onOpen: (path: string, line: number) => void }) {
+  return <button
+    className="search-result"
+    data-path={result.path}
+    data-strategies={Object.keys(result.strategies).join(",")}
+    onClick={() => onOpen(result.path, result.line ?? result.snippet?.line ?? 1)}
+  >
+    <span className="search-result-head">
+      {result.symbol ? <strong>{result.symbol}</strong> : <strong>{result.path.split("/").at(-1)}</strong>}
+      <small>{result.path}{result.line ? `:${result.line}` : ""}</small>
+    </span>
+    {result.snippet && <code>{result.snippet.text}</code>}
+    <span className="search-strategies">{Object.keys(result.strategies).map((name) => <em key={name} data-strategy={name}>{name}</em>)}</span>
+  </button>;
 }
 
 function FileExplorer({ repository, lesson, currentFile, query, onQuery, searchResults, searchBusy, onOpen, resolution, resolutionBusy, onResolve }: {
@@ -460,7 +479,11 @@ function FileExplorer({ repository, lesson, currentFile, query, onQuery, searchR
         }
         return (right.importance ?? 0) - (left.importance ?? 0) || left.path.localeCompare(right.path);
       })
-      .slice(0, 180);
+    ;
+    // No `.slice()`. The list used to stop at 180 files and tell the learner to
+    // "refine search to see more", which is not a performance trade-off, it is
+    // 2,016 files of a real repository they cannot open. The whole tree is kept
+    // and the window decides what exists in the DOM.
   }, [focusPaths, query, repository.files]);
   const activeSymbols = repository.symbols.filter((symbol) => symbol.path === currentFile?.path);
   const activeImports = useMemo(
@@ -475,16 +498,24 @@ function FileExplorer({ repository, lesson, currentFile, query, onQuery, searchR
       <div className="explorer-scroll">
         <SearchResults query={query} results={searchResults} busy={searchBusy} onOpen={(filePath, targetLine) => { const file = repository.files.find((item) => item.path === filePath); if (file) onOpen(file, targetLine); }} />
         <div className="tree-root"><Icon name="folder" size={14} /><strong>{repository.name}</strong></div>
-        {visibleFiles.map((file) => (
-          <button className={`file-row ${currentFile?.path === file.path ? "active" : ""}`} key={file.path} onClick={() => onOpen(file)} title={file.path}>
-            <span className={`language-dot lang-${file.language}`}>{languageLabel(file.language)}</span>
-            <span className="file-path">
-              {file.directory && <i>{file.directory}/</i>}
-              <strong>{file.name}</strong>
-            </span>
-          </button>
-        ))}
-        {visibleFiles.length === 180 && <div className="more-files">Refine search to see more files</div>}
+        <VirtualList
+          className="file-list"
+          items={visibleFiles}
+          itemHeight={FILE_ROW_HEIGHT}
+          height={Math.min(420, Math.max(FILE_ROW_HEIGHT * 3, visibleFiles.length * FILE_ROW_HEIGHT))}
+          role="tree"
+          label={`${visibleFiles.length} files in ${repository.name}`}
+          keyFor={(file) => file.path}
+          renderItem={(file) => (
+            <button className={`file-row ${currentFile?.path === file.path ? "active" : ""}`} onClick={() => onOpen(file)} title={file.path}>
+              <span className={`language-dot lang-${file.language}`}>{languageLabel(file.language)}</span>
+              <span className="file-path">
+                {file.directory && <i>{file.directory}/</i>}
+                <strong>{file.name}</strong>
+              </span>
+            </button>
+          )}
+        />
         {activeSymbols.length > 0 && (
           <div className="symbol-section">
             <div className="symbol-heading">SYMBOLS <small>{activeSymbols.length}</small></div>

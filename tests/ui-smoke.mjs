@@ -753,6 +753,35 @@ try {
     assert.ok((region.top ?? -1) >= 0 && (region.bottom ?? Infinity) <= fit.viewport.height + 1, `${region.selector} clips vertically`);
   }
 
+  // Item 50: the file tree is windowed. The fixture is small, so the property
+  // proved here is the one the arithmetic promises — the container is as tall as
+  // the whole list and every file is in it — while the Electron run proves the
+  // bound over a 2,196-file repository.
+  const fileList = page.locator(".file-list");
+  await fileList.waitFor();
+  const fixtureFileCount = await page.evaluate(() => window.traceWorkspace.repository.files.length);
+  assert.equal(Number(await fileList.getAttribute("data-virtual-total")), fixtureFileCount);
+  assert.equal(await page.locator(".file-list .file-row").count(), Number(await fileList.getAttribute("data-virtual-rendered")));
+  assert.equal(await fileList.evaluate((node) => node.scrollHeight), fixtureFileCount * 26, "the scroll height must cover every file");
+  // The old truncation notice is gone, and so is the cap that made it necessary.
+  assert.equal(await page.locator(".more-files").count(), 0);
+
+  // A long list is windowed rather than rendered whole, and the whole of it
+  // stays reachable by scrolling.
+  const windowed = await page.evaluate(async () => {
+    const virtualization = await import("/electron/virtualization.mjs");
+    const seen = new Set();
+    let maxRendered = 0;
+    for (let scrollTop = 0; scrollTop <= 5_000 * 26; scrollTop += 260) {
+      const view = virtualization.windowFor({ total: 5_000, itemHeight: 26, scrollTop, viewportHeight: 420 });
+      maxRendered = Math.max(maxRendered, view.count);
+      for (let index = view.start; index < view.end; index += 1) seen.add(index);
+    }
+    return { reachable: seen.size, maxRendered };
+  });
+  assert.equal(windowed.reachable, 5_000, `only ${windowed.reachable} of 5000 rows were reachable`);
+  assert.ok(windowed.maxRendered <= 200, String(windowed.maxRendered));
+
   // Item 49: every theme and contrast level is audited, because a palette that
   // is only checked in the dark theme is a palette that is only correct there.
   const displaySettings = page.locator(".display-settings").first();

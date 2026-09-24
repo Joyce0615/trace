@@ -1,5 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
-import { Icon, bridge, readableError, repositoryRef, useLoadOnce } from "./shell";
+import { Icon, VirtualList, bridge, readableError, repositoryRef, useLoadOnce } from "./shell";
+import { cullGraph, describeCulling } from "../electron/virtualization.mjs";
+
+/**
+ * How many module cards the architecture view draws before it starts culling.
+ * Chosen for reading rather than for rendering cost: past about forty cards a
+ * layer diagram stops being a diagram and becomes a list, and the busiest
+ * modules are the ones worth the space.
+ */
+const MODULE_BUDGET = 40;
 import type { ContrastGrade, Course, LearnerGoal, LearnerNote, LearnerState, Lesson, PredictionExercise, PredictionOutcome, Repository, ReviewGradeId, SkillGraph, TeachBackGrade } from "./types";
 import type { ActivityState, AnalyticsState, ArchitectureState, ArchiveState, ExperimentState, GoalState, MigrationState, SharingState, ChainState, DiagnosisState, EvaluationState, EvidenceState, ExecutableQuizState, ExplanationState, HistoryState, LocalizationState, ReviewState, ScheduleState, TraceState } from "./exercise-state";
 
@@ -203,7 +212,17 @@ export function ArchitecturePanel({ repository, currentFile, symbol, state, onSt
   }
 
   const modulesById = new Map(architecture.modules.map((entry) => [entry.id, entry]));
-  return <section className="architecture-panel" data-status="ready" data-layers={architecture.stats.layerCount} data-cycles={architecture.stats.cycleCount}>
+  // Item 50: the layer grid used to `.slice(0, 8)` each layer, which drops
+  // modules without saying so. Culling by a density budget keeps the busiest
+  // modules — the graph's own ranking, not the first eight alphabetically — and
+  // reports what it left out.
+  const culled = cullGraph({
+    nodes: architecture.modules.map((entry) => ({ ...entry, importance: entry.fanIn + entry.fanOut + entry.files })),
+    edges: architecture.edges,
+    budget: MODULE_BUDGET,
+  });
+  const shown = new Set(culled.nodes.map((entry) => entry.id));
+  return <section className="architecture-panel" data-status="ready" data-layers={architecture.stats.layerCount} data-cycles={architecture.stats.cycleCount} data-shown={culled.nodes.length} data-total={culled.total}>
     <div className="architecture-head">
       <span>ARCHITECTURE</span>
       <strong>{architecture.stats.moduleCount} modules · {architecture.stats.layerCount} layers · {architecture.stats.edgeCount} module imports</strong>
@@ -212,7 +231,7 @@ export function ArchitecturePanel({ repository, currentFile, symbol, state, onSt
     <div className="layer-grid">
       {architecture.layers.map((layer) => <div className="layer-column" key={layer.layer} data-layer={layer.layer}>
         <header>Layer {layer.layer}<em>{layer.modules.length}</em></header>
-        {layer.modules.slice(0, 8).map((id) => {
+        {layer.modules.filter((id) => shown.has(id)).map((id) => {
           const entry = modulesById.get(id);
           return <button
             key={id}
@@ -227,6 +246,7 @@ export function ArchitecturePanel({ repository, currentFile, symbol, state, onSt
         })}
       </div>)}
     </div>
+    {!culled.complete && <p className="culling-note" data-culled={culled.culledByBudget}>{describeCulling(culled)}</p>}
     {activeModule && <div className="module-detail" data-module={activeModule}>
       <strong>{activeModule}</strong>
       <div className="module-edges">

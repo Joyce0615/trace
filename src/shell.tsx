@@ -1,5 +1,6 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
+import { windowFor } from "../electron/virtualization.mjs";
 import type { Repository, TraceBridge } from "./types";
 
 /**
@@ -82,6 +83,62 @@ export function useLoadOnce(key: string, ready: boolean, start: () => void) {
     started.current = key;
     start();
   });
+}
+
+/**
+ * A windowed list (item 50).
+ *
+ * The container keeps the *full* height so the scrollbar means what it appears
+ * to mean, and only the visible slice exists in the DOM. `data-virtual-*`
+ * attributes report the total, the rendered count, and the range, so a test can
+ * check the invariant that matters — the whole collection is reachable and the
+ * DOM stays bounded — without reaching into React.
+ */
+export function VirtualList<Item>({ items, itemHeight, height, className, role, label, renderItem, keyFor, overscan, maxRendered, onScrollTopChange }: {
+  items: Item[];
+  itemHeight: number;
+  height: number;
+  className?: string;
+  role?: string;
+  label?: string;
+  renderItem: (item: Item, index: number) => ReactNode;
+  keyFor: (item: Item, index: number) => string;
+  overscan?: number;
+  maxRendered?: number;
+  onScrollTopChange?: (scrollTop: number) => void;
+}) {
+  const [scrollTop, setScrollTop] = useState(0);
+  const [window, setWindow] = useState(() => windowFor({ total: items.length, itemHeight, scrollTop: 0, viewportHeight: height, overscan, maxRendered }));
+  useEffect(() => {
+    setWindow(windowFor({ total: items.length, itemHeight, scrollTop, viewportHeight: height, overscan, maxRendered }));
+  }, [height, itemHeight, items.length, maxRendered, overscan, scrollTop]);
+
+  return <div
+    className={`virtual-list ${className ?? ""}`.trim()}
+    role={role}
+    aria-label={label}
+    style={{ height, overflowY: "auto" }}
+    data-virtual-total={items.length}
+    data-virtual-rendered={window.count}
+    data-virtual-start={window.start}
+    data-virtual-end={window.end}
+    onScroll={(event) => {
+      const next = (event.target as HTMLDivElement).scrollTop;
+      setScrollTop(next);
+      onScrollTopChange?.(next);
+    }}
+  >
+    <div style={{ height: window.totalHeight, position: "relative" }}>
+      <div style={{ transform: `translateY(${window.offsetBefore}px)` }}>
+        {items.slice(window.start, window.end).map((item, offset) => <div
+          key={keyFor(item, window.start + offset)}
+          className="virtual-row"
+          style={{ height: itemHeight }}
+          data-index={window.start + offset}
+        >{renderItem(item, window.start + offset)}</div>)}
+      </div>
+    </div>
+  </div>;
 }
 
 export function Icon({ name, size = 16 }: { name: string; size?: number }) {

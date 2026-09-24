@@ -179,6 +179,19 @@ ${visionBlocks}
 .display-settings { display: flex; align-items: center; gap: 6px; }
 .display-settings label { display: flex; align-items: center; gap: 4px; color: var(--muted); font-size: calc(8px + var(--font-boost)); text-transform: uppercase; letter-spacing: .08em; }
 .display-settings select { min-height: 24px; padding: 2px 6px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); color: var(--text); font-size: calc(9px + var(--font-boost)); }
+
+/*
+ * Item 50: windowed lists. The row heights here are the same numbers the window
+ * arithmetic uses, so the scrollbar and the rendered offsets agree. If one is
+ * changed the other must be, which is why they are named in both places.
+ */
+.virtual-list { overflow-y: auto; overscroll-behavior: contain; }
+.virtual-row { display: block; }
+.file-list .virtual-row { height: 26px; }
+.file-list .file-row { height: 26px; width: 100%; }
+.search-result-list .virtual-row { height: 64px; }
+.search-result-list .search-result { height: 64px; width: 100%; overflow: hidden; }
+.culling-note { padding: 4px 0; color: var(--muted); font-size: calc(8px + var(--font-boost)); }
 `;
 
   fs.writeFileSync("src/styles.css", `${header}\n${css}\n${footer}`);
