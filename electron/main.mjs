@@ -1,11 +1,13 @@
 import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { askAgent, detectAgents, generateCourseWithAgent } from "./agents.mjs";
 import { generateStarterCourse, normalizeAgentCourse } from "./course.mjs";
 import { loadCourse, saveCourse } from "./course-store.mjs";
 import { DEFAULT_INDEX_LIMITS, IndexCancelledError, analyzeContent, inspectRepository, languageFor, readRepositoryFile } from "./repository.mjs";
-import { createPracticeSession, getPracticeSessionPath, inspectPracticeSession, removePracticeSession } from "./practice.mjs";
+import { createPracticeSession, getPracticeSessionPath, inspectPracticeSession, reconcilePracticeSessions, releaseOrphanedWorktree, removePracticeSession } from "./practice.mjs";
+import { inspectDurable, sweepInterruptedWrites } from "./durable-store.mjs";
 import { answerFromLocalIndex, buildContextPack, loadCachedResponse, responseCacheKey, saveCachedResponse } from "./context-engine.mjs";
 import { loadLearnerState, saveLearnerState } from "./learning-store.mjs";
 import { buildSkillGraph, reconcileLearnerState } from "./skill-graph.mjs";
@@ -85,6 +87,17 @@ function experimentDirectory() {
 function signingDirectory() {
   return path.join(app.getPath("userData"), "signing");
 }
+
+function practiceDirectory() {
+  return path.join(app.getPath("userData"), "practice");
+}
+
+/**
+ * What the last shutdown left behind (item 51). Computed once at launch and
+ * handed to the renderer on request, because a recovery the learner is not told
+ * about is indistinguishable from data loss.
+ */
+let recoveryReport = null;
 
 function notesDirectory() {
   return path.join(app.getPath("userData"), "notes");
@@ -1079,7 +1092,7 @@ const ipcHandlers = {
   "practice:create": async (_event, request) => createPracticeSession(
     openedRepository(request.repository),
     request.lesson,
-    path.join(app.getPath("userData"), "practice"),
+    practiceDirectory(),
   ),
 
   "practice:inspect": (_event, sessionId) => inspectPracticeSession(sessionId),
@@ -1091,6 +1104,19 @@ const ipcHandlers = {
   },
 
   "practice:remove": (_event, request) => removePracticeSession(request.sessionId, Boolean(request.discardChanges)),
+
+  "recovery:report": async (_event, request) => {
+    const repository = request?.repository ? openedRepository(request.repository) : null;
+    const learning = repository ? await inspectDurable(path.join(learningDirectory(), `${createHash("sha256").update(repository.id).digest("hex").slice(0, 24)}.json`)) : null;
+    return { ...(recoveryReport ?? { ready: false }), learning };
+  },
+
+  "practice:release": async (_event, request) => {
+    const repository = openedRepository(request.repository);
+    // Only bookkeeping is released; the directory's contents are left alone,
+    // because an orphaned worktree may hold the only copy of somebody's work.
+    return releaseOrphanedWorktree(repository.rootPath, request.worktreePath);
+  },
 };
 
 // Item 40: the outbound guard. Every response is audited for structural and
@@ -1101,7 +1127,24 @@ export const registeredIpcChannels = registerValidatedHandlers(ipcMain, ipcHandl
   onResponse: (channel, result) => guardResponse(channel, result),
 });
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  // Before anything opens: clear temporary files left by an interrupted write,
+  // and work out which practice worktrees the last run left behind.
+  const [sweptLearning, sweptNotes, sweptPractice, practice] = await Promise.all([
+    sweepInterruptedWrites(learningDirectory()),
+    sweepInterruptedWrites(notesDirectory()),
+    sweepInterruptedWrites(practiceDirectory()),
+    reconcilePracticeSessions(practiceDirectory()),
+  ]);
+  recoveryReport = {
+    ready: true,
+    at: new Date().toISOString(),
+    interruptedWrites: [...sweptLearning.swept, ...sweptNotes.swept, ...sweptPractice.swept],
+    practice,
+    // A clean launch says so, so "no notice" never has to be interpreted.
+    clean: practice.orphaned.length === 0 && practice.stale.length === 0 && !practice.recovered
+      && sweptLearning.swept.length === 0 && sweptNotes.swept.length === 0 && sweptPractice.swept.length === 0,
+  };
   createWindow();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { readDurable, writeDurable } from "./durable-store.mjs";
 import { redactValue } from "./secret-scanner.mjs";
 
 function statePath(directory, repositoryId) {
@@ -8,21 +8,25 @@ function statePath(directory, repositoryId) {
   return path.join(directory, `${key}.json`);
 }
 
+/**
+ * Read the learner's state, recovering the previous generation if the current
+ * file cannot be trusted (item 51). Returns the state; `loadLearnerStateReport`
+ * is for callers that need to tell the learner what happened.
+ */
 export async function loadLearnerState(directory, repositoryId) {
-  try {
-    return JSON.parse(await readFile(statePath(directory, repositoryId), "utf8"));
-  } catch {
-    return null;
-  }
+  return (await loadLearnerStateReport(directory, repositoryId)).value;
+}
+
+export async function loadLearnerStateReport(directory, repositoryId) {
+  // `acceptLegacy` matters once: a state file written before durable saves is a
+  // valid file, and treating an upgrade as a corruption would throw away
+  // everyone's mastery on the day they updated.
+  return readDurable(statePath(directory, repositoryId), { acceptLegacy: true });
 }
 
 export async function saveLearnerState(directory, state) {
   if (!state?.repositoryId || !state?.mastery) throw new Error("Invalid learner state.");
-  await mkdir(directory, { recursive: true });
-  const destination = statePath(directory, state.repositoryId);
-  const temporary = `${destination}.${process.pid}.tmp`;
   // Learner notes and saved agent answers can quote source, so persisted state is redacted.
-  await writeFile(temporary, JSON.stringify(redactValue({ ...state, updatedAt: new Date().toISOString() }), null, 2));
-  await rename(temporary, destination);
+  await writeDurable(statePath(directory, state.repositoryId), redactValue({ ...state, updatedAt: new Date().toISOString() }));
   return true;
 }

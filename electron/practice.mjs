@@ -1,9 +1,28 @@
 import { randomUUID } from "node:crypto";
-import { access, mkdir, realpath } from "node:fs/promises";
+import { access, mkdir, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { readDurable, writeDurable } from "./durable-store.mjs";
 
+/**
+ * Practice sessions used to live only in this Map, which meant a crash lost the
+ * *record* of a session while leaving its worktree on disk: the app could no
+ * longer see it, could no longer clean it up, and the learner's unfinished work
+ * sat in a directory nothing would ever mention again. Sessions are now written
+ * durably as they are created and removed, and `reconcilePracticeSessions`
+ * compares the record against the disk on launch (item 51).
+ */
 const sessions = new Map();
+let sessionFile = null;
+
+function sessionsPath(practiceDirectory) {
+  return path.join(practiceDirectory, "sessions.json");
+}
+
+async function persistSessions() {
+  if (!sessionFile) return;
+  await writeDurable(sessionFile, { sessions: [...sessions.values()] });
+}
 
 function run(command, args, options = {}) {
   const { cwd, timeoutMs = 120_000, allowFailure = false } = options;
@@ -56,7 +75,69 @@ export async function createPracticeSession(repository, lesson, practiceDirector
     createdAt: new Date().toISOString(),
   };
   sessions.set(id, session);
+  sessionFile = sessionsPath(practiceDirectory);
+  await persistSessions();
   return session;
+}
+
+/**
+ * Reconcile the recorded sessions against what is actually on disk.
+ *
+ * Three outcomes and each needs a different answer: a session whose worktree is
+ * still there is *restored* so the learner can carry on; a session whose
+ * worktree is gone is *stale* and dropped from the record; and a worktree with
+ * no session is *orphaned* — almost certainly a crash between creating the
+ * worktree and writing the record — and is reported rather than deleted,
+ * because it may hold work nobody else knows about.
+ */
+export async function reconcilePracticeSessions(practiceDirectory) {
+  sessionFile = sessionsPath(practiceDirectory);
+  const read = await readDurable(sessionFile, { fallback: { sessions: [] } });
+  const recorded = Array.isArray(read.value?.sessions) ? read.value.sessions : [];
+
+  const restored = [];
+  const stale = [];
+  for (const session of recorded) {
+    try {
+      await access(session.worktreePath);
+      sessions.set(session.id, session);
+      restored.push(session);
+    } catch {
+      // The record outlived its worktree. Dropping it from memory as well as
+      // from the file matters: the first attempt wrote the map back out and
+      // carried the dead session into every subsequent launch.
+      sessions.delete(session.id);
+      stale.push(session);
+    }
+  }
+
+  let entries = [];
+  try {
+    entries = await readdir(practiceDirectory, { withFileTypes: true });
+  } catch {
+    entries = [];
+  }
+  const known = new Set(restored.map((session) => path.resolve(session.worktreePath)));
+  const orphaned = entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => path.join(practiceDirectory, entry.name))
+    .filter((candidate) => !known.has(path.resolve(candidate)));
+
+  if (stale.length) await persistSessions();
+  return {
+    restored: restored.map((session) => ({ id: session.id, worktreePath: session.worktreePath, lessonId: session.lessonId, createdAt: session.createdAt })),
+    stale: stale.map((session) => ({ id: session.id, worktreePath: session.worktreePath })),
+    orphaned,
+    source: read.source,
+    recovered: read.recovered,
+    problems: read.problems,
+  };
+}
+
+/** Forget an orphaned worktree's git bookkeeping without touching its contents. */
+export async function releaseOrphanedWorktree(repositoryRoot, worktreePath) {
+  await run("git", ["-C", repositoryRoot, "worktree", "prune"], { allowFailure: true });
+  return { released: worktreePath };
 }
 
 function getSession(id) {
@@ -95,5 +176,6 @@ export async function removePracticeSession(id, discardChanges = false) {
   await run("git", ["-C", session.repositoryRoot, "worktree", "remove", ...(discardChanges ? ["--force"] : []), "--", session.worktreePath], { timeoutMs: 120_000 });
   await run("git", ["-C", session.repositoryRoot, "worktree", "prune"]);
   sessions.delete(id);
+  await persistSessions();
   return { removed: true, requiresConfirmation: false };
 }

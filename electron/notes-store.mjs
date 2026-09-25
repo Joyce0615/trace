@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { readDurable, writeDurable } from "./durable-store.mjs";
 import { NOTES_VERSION, boundNotes } from "./notes.mjs";
 import { redactValue } from "./secret-scanner.mjs";
 
@@ -26,12 +26,8 @@ function notesPath(directory, repositoryId) {
 }
 
 export async function loadNotes(directory, repositoryId) {
-  try {
-    const parsed = JSON.parse(await readFile(notesPath(directory, repositoryId), "utf8"));
-    return Array.isArray(parsed?.notes) ? parsed.notes : [];
-  } catch {
-    return [];
-  }
+  const read = await readDurable(notesPath(directory, repositoryId), { acceptLegacy: true });
+  return Array.isArray(read.value?.notes) ? read.value.notes : [];
 }
 
 /**
@@ -42,11 +38,7 @@ export async function loadNotes(directory, repositoryId) {
  */
 export async function saveNotes(directory, repositoryId, notes) {
   if (!repositoryId) throw new Error("Notes need a repository.");
-  await mkdir(directory, { recursive: true });
   const bounded = boundNotes(notes);
-  const destination = notesPath(directory, repositoryId);
-  const temporary = `${destination}.${process.pid}.tmp`;
-  await writeFile(temporary, JSON.stringify(redactValue({ version: NOTES_VERSION, repositoryId, notes: bounded, updatedAt: new Date().toISOString() }), null, 2));
-  await rename(temporary, destination);
+  await writeDurable(notesPath(directory, repositoryId), redactValue({ version: NOTES_VERSION, repositoryId, notes: bounded, updatedAt: new Date().toISOString() }));
   return bounded;
 }

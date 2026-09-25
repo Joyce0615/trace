@@ -959,6 +959,29 @@ export interface MigrationResult {
   note?: string;
 }
 
+/** Item 51: what the last shutdown left behind. */
+export interface RecoveryReport {
+  ready: boolean;
+  at?: string;
+  clean?: boolean;
+  interruptedWrites?: string[];
+  practice?: {
+    restored: Array<{ id: string; worktreePath: string; lessonId: string; createdAt: string }>;
+    stale: Array<{ id: string; worktreePath: string }>;
+    orphaned: string[];
+    source: string;
+    recovered: boolean;
+    problems: string[];
+  };
+  learning?: {
+    current: { savedAt: string; checksum: string } | null;
+    currentProblem: string | null;
+    backup: { savedAt: string; checksum: string } | null;
+    backupProblem: string | null;
+    recoverable: boolean;
+  } | null;
+}
+
 /** Item 47: a learner-written note, attached to a lesson and optionally to source. */
 export interface LearnerNote {
   id: string;
@@ -1542,6 +1565,8 @@ export interface TraceBridge {
   importCourse(request: { repository: RepositoryRef; package: CoursePackage; force?: boolean }): Promise<CourseImportResult>;
   migrateCourse(request: { repository: RepositoryRef; course: Course; fromCommit?: string | null; apply?: boolean; accept?: "auto" | "all" | "none"; acceptIds?: string[]; retireMissing?: boolean }): Promise<MigrationResult>;
   revertCourseMigration(request: { repository: RepositoryRef; course: Course; migrationId?: string | null }): Promise<{ course: Course; reverted: boolean; reason?: string; migrationId?: string; restored?: number }>;
+  recoveryReport(request?: { repository?: RepositoryRef | null }): Promise<RecoveryReport>;
+  releaseOrphanedWorktree(request: { repository: RepositoryRef; worktreePath: string }): Promise<{ released: string }>;
   listNotes(request: { repository: RepositoryRef }): Promise<{ notes: LearnerNote[] }>;
   saveNote(request: { repository: RepositoryRef; id: string; lessonId?: string | null; anchor?: CodeAnchor | null; text: string }): Promise<{ notes: LearnerNote[]; removed: boolean; note: LearnerNote | null }>;
   exportArchive(request: { repository: RepositoryRef; course: Course; skillGraph?: SkillGraph | null; learnerState?: LearnerState | null; includeExcerpts?: boolean }): Promise<OfflineArchive>;

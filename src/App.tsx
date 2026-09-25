@@ -3,7 +3,7 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type
 import { emptyActivityState, emptyAnalyticsState, emptyExperimentState, emptyGoalState, emptyMigrationState, emptyArchiveState, emptySharingState, emptyArchitectureState, emptyChainState, emptyDiagnosisState, emptyEvaluationState, emptyEvidenceState, emptyHistoryState, emptyLocalizationState, emptyExecutableQuizState, emptyExplanationState, emptyReviewState, emptyScheduleState, emptyTraceState, type ActivityState, type AnalyticsState, type ArchitectureState, type ExperimentState, type GoalState, type MigrationState, type ArchiveState, type SharingState, type ChainState, type DiagnosisState, type EvaluationState, type EvidenceState, type ExecutableQuizState, type ExplanationState, type HistoryState, type LocalizationState, type ReviewState, type ScheduleState, type TraceState } from "./exercise-state";
 import { Icon, VirtualList, bridge, readableError, repositoryRef } from "./shell";
 import { addEvidence, completeDiagnostic, personalizeSkillGraph, skillForLesson } from "./learning";
-import type { AgentState, ContextMode, ContextPack, SearchResponse, ContextScope, Course, IndexProgress, KnowledgeGraphSummary, LearnerNote, LearnerProfile, LinkClassification, LearnerState, LearningMemory, Lesson, LessonContentBlock, PracticeReport, PracticeSession, Repository, RepoFile, SkillGraph, SkillNode, SymbolResolution } from "./types";
+import type { AgentState, ContextMode, ContextPack, SearchResponse, ContextScope, Course, IndexProgress, KnowledgeGraphSummary, LearnerNote, LearnerProfile, RecoveryReport, LinkClassification, LearnerState, LearningMemory, Lesson, LessonContentBlock, PracticeReport, PracticeSession, Repository, RepoFile, SkillGraph, SkillNode, SymbolResolution } from "./types";
 
 type TutorMode = "learn" | "ask" | "quiz" | "practice";
 type WorkspaceMode = "lesson" | "diagram" | "code" | "chains" | "locate" | "review" | "notes";
@@ -1221,6 +1221,17 @@ export default function App() {
       .catch(() => undefined);
   }, [repository]);
 
+  // Item 51: a recovery that nobody is told about is indistinguishable from data
+  // loss, so what the last shutdown left behind is fetched once and shown.
+  const [recovery, setRecovery] = useState<RecoveryReport | null>(null);
+  const [recoveryDismissed, setRecoveryDismissed] = useState(false);
+  useEffect(() => {
+    if (!repository) return;
+    void bridge.recoveryReport({ repository: repositoryRef(repository) })
+      .then(setRecovery)
+      .catch(() => setRecovery(null));
+  }, [repository]);
+
   // Read-only inspection surface for automated smoke tests and support diagnostics.
   useEffect(() => {
     window.traceWorkspace = repository ? { repository, course, skillGraph, learnerState, knowledgeGraph, notes } : undefined;
@@ -1529,6 +1540,19 @@ export default function App() {
         <CodeWorkspace repository={repository} lesson={selectedLesson} currentFile={currentFile} content={content} line={line} workspaceMode={workspaceMode} fontBoost={fontBoosts[fontScale]} trail={inspectionTrail} chainState={chainState} onChainState={updateChainState} localizationState={localizationState} onLocalizationState={updateLocalizationState} reviewState={reviewState} onReviewState={updateReviewState} traceState={traceState} onTraceState={updateTraceState} architectureState={architectureState} onArchitectureState={updateArchitectureState} historyState={historyState} onHistoryState={updateHistoryState} onHistoryLesson={selectLesson} evidenceState={evidenceState} onEvidenceState={updateEvidenceState} skillGraph={skillGraph} course={course} evaluationState={evaluationState} onEvaluationState={updateEvaluationState} learnerState={learnerState} onLearnerState={setLearnerState} diagnosisState={diagnosisState} onDiagnosisState={updateDiagnosisState} scheduleState={scheduleState} onScheduleState={updateScheduleState} executableQuizState={executableQuizState} onExecutableQuizState={updateExecutableQuizState} explanationState={explanationState} onExplanationState={updateExplanationState} activityState={activityState} onActivityState={updateActivityState} analyticsState={analyticsState} onAnalyticsState={updateAnalyticsState} experimentState={experimentState} onExperimentState={updateExperimentState} goalState={goalState} onGoalState={updateGoalState} sharingState={sharingState} onSharingState={updateSharingState} migrationState={migrationState} onMigrationState={updateMigrationState} archiveState={archiveState} onArchiveState={updateArchiveState} notesById={notesById} notesList={notes} onNote={saveNote} onNotes={setNotes} onCourse={setCourse} onOpen={openFile} onSelection={setSelection} onWorkspaceMode={changeWorkspaceMode} resolution={resolution} resolutionBusy={resolutionBusy} onResolve={resolveAtCursor} />
         <TutorPanel repository={repository} lesson={selectedLesson} skill={activeSkill} nextSkill={nextSkill} learnerState={learnerState} provider={provider} agents={agents} mode={mode} messages={messages} askMessages={askMessages} busy={agentBusy} currentFile={currentFile} selection={selection} guideStage={guideStage} onGuideStage={updateGuideStage} onWorkspaceMode={changeWorkspaceMode} onNextSkill={selectSkill} onProvider={setProvider} onMode={setMode} onAsk={ask} onSaveMemory={saveMemory} onQuizEvidence={() => updateEvidence("quiz", 0.55, `Submitted quiz answer for ${selectedLesson.title}`)} onDone={() => toggleComplete(selectedLesson)} complete={completed.has(selectedLesson.id)} practiceSession={practiceSession} practiceReport={practiceReport} practiceBusy={practiceBusy} onCreatePractice={createPractice} onInspectPractice={inspectPractice} onOpenPractice={() => { if (practiceSession) void bridge.openPractice(practiceSession.id); }} onRemovePractice={removePractice} />
       </div>
+      {recovery?.ready && !recovery.clean && !recoveryDismissed && <div className="recovery-banner" role="status" data-orphaned={recovery.practice?.orphaned.length ?? 0} data-interrupted={recovery.interruptedWrites?.length ?? 0} data-recovered={String(Boolean(recovery.practice?.recovered))}>
+        <Icon name="target" size={14} />
+        <div>
+          <strong>Recovered from an unclean shutdown</strong>
+          <small>
+            {(recovery.interruptedWrites?.length ?? 0) > 0 && `${recovery.interruptedWrites?.length} unfinished save(s) cleared. `}
+            {(recovery.practice?.restored.length ?? 0) > 0 && `${recovery.practice?.restored.length} practice session(s) restored. `}
+            {(recovery.practice?.orphaned.length ?? 0) > 0 && `${recovery.practice?.orphaned.length} practice worktree(s) were left behind and have not been touched. `}
+            {recovery.practice?.problems.join(" ")}
+          </small>
+        </div>
+        <button className="ghost" onClick={() => setRecoveryDismissed(true)}>Dismiss</button>
+      </div>}
       {diagnosticOpen && <DiagnosticOverlay graph={skillGraph} onComplete={finishDiagnostic} onSkip={() => finishDiagnostic()} />}
     </div>
   );

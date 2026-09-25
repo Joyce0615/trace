@@ -8,7 +8,7 @@ import test from "node:test";
 import { promisify } from "node:util";
 import { generateStarterCourse, normalizeAgentCourse } from "../electron/course.mjs";
 import { loadCourse, saveCourse } from "../electron/course-store.mjs";
-import { createPracticeSession, inspectPracticeSession, removePracticeSession } from "../electron/practice.mjs";
+import { createPracticeSession, inspectPracticeSession, reconcilePracticeSessions, removePracticeSession } from "../electron/practice.mjs";
 import { DEFAULT_INDEX_LIMITS, IndexCancelledError, analysisCacheStats, analyzeContent, analyzeFile, fileImportance, inspectRepository, languageFamily, languageFor, readRepositoryFile, resetAnalysisCache } from "../electron/repository.mjs";
 import { buildKnowledgeGraph, loadKnowledgeGraph, neighborhood, saveKnowledgeGraph } from "../electron/knowledge-graph.mjs";
 import { RemoteSourceError, cloneArguments, cloneDestination, cloneEnvironment, looksRemote, parseRemoteSource, summarizeSubmodules, verifyExistingClone } from "../electron/clone-guard.mjs";
@@ -50,7 +50,8 @@ import { CALL_CHAIN_VERSION, buildCallChainExercises, buildCallChains, extractRe
 import { detectLanguageServers, resolveImportsStatically, resolveSymbol, serverForLanguage, shutdownLanguageServers } from "../electron/language-server.mjs";
 import { answerFromLocalIndex, buildContextPack, loadCachedResponse, saveCachedResponse } from "../electron/context-engine.mjs";
 import { buildSkillGraph, createLearnerState, reconcileLearnerState } from "../electron/skill-graph.mjs";
-import { loadLearnerState, saveLearnerState } from "../electron/learning-store.mjs";
+import { loadLearnerState, loadLearnerStateReport, saveLearnerState } from "../electron/learning-store.mjs";
+import { DURABLE_VERSION, inspectDurable, readDurable, sweepInterruptedWrites, writeDurable } from "../electron/durable-store.mjs";
 
 const execFileAsync = promisify(execFile);
 const round4 = (value) => Number(Number(value).toFixed(4));
@@ -777,7 +778,7 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
     "learning:diagnose", "learning:probe", "learning:schedule", "learning:review",
     "quiz:build", "quiz:grade", "explain:task", "explain:grade",
     "activity:build", "activity:grade", "hint:next", "analytics:report",
-    "course:package", "course:import", "course:verify-signature", "course:migrate", "course:revert-migration", "notes:list", "notes:save", "archive:export", "archive:import",
+    "course:package", "course:import", "course:verify-signature", "course:migrate", "course:revert-migration", "notes:list", "notes:save", "archive:export", "archive:import", "recovery:report", "practice:release",
     "signing:identity", "signing:trust", "goals:plan", "experiment:state", "experiment:consent", "experiment:forget", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
@@ -5446,4 +5447,181 @@ test("no list in the renderer silently truncates what a learner can reach", asyn
   const exercises = await readFile(path.resolve("src", "exercises.tsx"), "utf8");
   assert.match(exercises, /cullGraph\(/, "the architecture view is not culled");
   assert.equal(/layer\.modules\.slice\(0, 8\)/.test(exercises), false, "the layer grid truncates again");
+});
+
+test("saves survive being interrupted, and a corrupt save falls back instead of vanishing", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-durable-"));
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  const target = path.join(workspace, "state", "learner.json");
+
+  // --- A normal write ------------------------------------------------------
+  const first = await writeDurable(target, { mastery: { a: 0.4 } }, { now: "2026-04-01T00:00:00.000Z" });
+  assert.ok(first.bytes > 0);
+  assert.equal(first.backedUp, false, "the first write has nothing to back up");
+  assert.equal(first.flushed, true, "the file must be flushed before the rename");
+  const read = await readDurable(target);
+  assert.deepEqual(read.value, { mastery: { a: 0.4 } });
+  assert.equal(read.source, "current");
+  assert.equal(read.recovered, false);
+  assert.deepEqual(read.problems, []);
+  assert.equal(read.savedAt, "2026-04-01T00:00:00.000Z");
+
+  // --- The second write keeps the first ------------------------------------
+  const second = await writeDurable(target, { mastery: { a: 0.9 } }, { now: "2026-04-02T00:00:00.000Z" });
+  assert.equal(second.backedUp, true);
+  assert.deepEqual((await readDurable(target)).value, { mastery: { a: 0.9 } });
+  assert.deepEqual(JSON.parse(await readFile(`${target}.bak`, "utf8")).payload, { mastery: { a: 0.4 } });
+
+  // --- A crash mid-write: the current file is half a JSON document --------
+  // This is what a power cut actually leaves behind, and it is why parsing
+  // alone is not enough: the previous generation is still there and correct.
+  const torn = (await readFile(target, "utf8")).slice(0, 40);
+  await writeFile(target, torn);
+  const recovered = await readDurable(target);
+  assert.deepEqual(recovered.value, { mastery: { a: 0.4 } }, "the previous save was not recovered");
+  assert.equal(recovered.source, "backup");
+  assert.equal(recovered.recovered, true);
+  assert.ok(recovered.problems.some((problem) => /unusable \(unparsable\)/.test(problem)), JSON.stringify(recovered.problems));
+  assert.ok(recovered.problems.some((problem) => /anything from the last session was lost/.test(problem)),
+    "a silent recovery is indistinguishable from data loss");
+
+  // --- A file that parses but is not what was written ---------------------
+  const doctored = JSON.parse(await readFile(`${target}.bak`, "utf8"));
+  doctored.payload = { mastery: { a: 1 } };
+  await writeFile(target, JSON.stringify(doctored));
+  const mismatch = await readDurable(target);
+  assert.equal(mismatch.source, "backup", "a valid-looking file with the wrong checksum must not be trusted");
+  assert.ok(mismatch.problems.some((problem) => /checksum-mismatch/.test(problem)));
+  // The checksum covers the payload, so a re-serialized but unchanged file is fine.
+  const reserialized = JSON.parse(await readFile(`${target}.bak`, "utf8"));
+  await writeFile(target, JSON.stringify(reserialized, null, 4));
+  assert.equal((await readDurable(target)).source, "current", "reformatting the file must not break it");
+
+  // --- Both gone: honest failure, not a crash ------------------------------
+  await writeFile(target, "{ broken");
+  await writeFile(`${target}.bak`, "also broken");
+  const hopeless = await readDurable(target, { fallback: { mastery: {} } });
+  assert.deepEqual(hopeless.value, { mastery: {} });
+  assert.equal(hopeless.source, "none");
+  assert.equal(hopeless.problems.length, 2, JSON.stringify(hopeless.problems));
+  assert.deepEqual((await readDurable(path.join(workspace, "nothing-here.json"))).problems, [], "a store that was never written is not a problem");
+
+  // --- An upgrade is not a corruption -------------------------------------
+  const legacy = path.join(workspace, "legacy.json");
+  await writeFile(legacy, JSON.stringify({ repositoryId: "r1", mastery: { b: 0.3 } }));
+  assert.equal((await readDurable(legacy)).source, "none", "a bare file is not adopted by default");
+  const adopted = await readDurable(legacy, { acceptLegacy: true });
+  assert.equal(adopted.source, "legacy");
+  assert.deepEqual(adopted.value, { repositoryId: "r1", mastery: { b: 0.3 } });
+  assert.ok(adopted.problems.some((problem) => /before durable saves/.test(problem)), JSON.stringify(adopted.problems));
+
+  // --- A newer format is refused rather than misread ----------------------
+  const future = path.join(workspace, "future.json");
+  await writeFile(future, JSON.stringify({ format: "trace-durable-v1", version: 99, checksum: "x", payload: { a: 1 } }));
+  assert.equal((await readDurable(future)).source, "none");
+
+  // --- Interrupted writes leave temp files, which are swept ---------------
+  const stateDirectory = path.dirname(target);
+  await writeFile(path.join(stateDirectory, "learner.json.999.tmp"), "half a write");
+  await writeFile(path.join(stateDirectory, "keep-me.json"), "{}");
+  const swept = await sweepInterruptedWrites(stateDirectory);
+  assert.deepEqual(swept.swept, ["learner.json.999.tmp"]);
+  assert.ok(swept.bytes > 0);
+  await access(path.join(stateDirectory, "keep-me.json"));
+  assert.deepEqual((await sweepInterruptedWrites(path.join(workspace, "not-a-directory"))).swept, []);
+
+  // --- Inspection tells a caller what it has ------------------------------
+  // Written twice, so both generations are good before one is damaged.
+  await writeDurable(target, { mastery: { c: 0.4 } });
+  await writeDurable(target, { mastery: { c: 0.5 } });
+  const health = await inspectDurable(target);
+  assert.ok(health.current?.savedAt);
+  assert.equal(health.currentProblem, null);
+  assert.equal(health.recoverable, true);
+  await writeFile(target, "torn again");
+  const damaged = await inspectDurable(target);
+  assert.equal(damaged.current, null);
+  assert.equal(damaged.currentProblem, "unparsable");
+  assert.equal(damaged.recoverable, true, "the backup is still there");
+
+  // --- The real stores go through it --------------------------------------
+  const learningDirectory = path.join(workspace, "learning");
+  await saveLearnerState(learningDirectory, { repositoryId: "repo-1", mastery: { skill: { skillId: "skill", mastery: 0.5, evidence: [] } }, memory: [] });
+  await saveLearnerState(learningDirectory, { repositoryId: "repo-1", mastery: { skill: { skillId: "skill", mastery: 0.8, evidence: [] } }, memory: [] });
+  const statePath = path.join(learningDirectory, createHash("sha256").update("repo-1").digest("hex").slice(0, 24) + ".json");
+  await writeFile(statePath, "{ interrupted");
+  const restored = await loadLearnerStateReport(learningDirectory, "repo-1");
+  assert.equal(restored.recovered, true);
+  assert.equal(restored.value.mastery.skill.mastery, 0.5, "the previous save is what survives");
+  assert.equal((await loadLearnerState(learningDirectory, "repo-1")).repositoryId, "repo-1");
+  // Notes take the same path.
+  const notesDirectory = path.join(workspace, "notes");
+  await saveNotes(notesDirectory, "repo-1", [{ id: "n1", text: "first", createdAt: null, updatedAt: null }]);
+  await saveNotes(notesDirectory, "repo-1", [{ id: "n1", text: "second", createdAt: null, updatedAt: null }]);
+  await writeFile(path.join(notesDirectory, createHash("sha256").update("repo-1").digest("hex").slice(0, 24) + ".json"), "torn");
+  assert.deepEqual((await loadNotes(notesDirectory, "repo-1")).map((note) => note.text), ["first"]);
+  assert.equal(DURABLE_VERSION, 1);
+});
+
+test("a crash leaves practice worktrees on disk, and the next launch finds them", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-recover-"));
+  const rootPath = path.join(workspace, "repo");
+  const practiceDirectory = path.join(workspace, "practice");
+  context.after(async () => {
+    await execFileAsync("git", ["-C", rootPath, "worktree", "prune"], { cwd: rootPath }).catch(() => undefined);
+    await rm(workspace, { recursive: true, force: true });
+  });
+  await mkdir(path.join(rootPath, "app"), { recursive: true });
+  await writeFile(path.join(rootPath, "app", "main.py"), "def main():\n    return 1\n");
+  await execFileAsync("git", ["init", "-q"], { cwd: rootPath });
+  await execFileAsync("git", ["config", "user.email", "a@b.c"], { cwd: rootPath });
+  await execFileAsync("git", ["config", "user.name", "Tester"], { cwd: rootPath });
+  await execFileAsync("git", ["add", "-A"], { cwd: rootPath });
+  await execFileAsync("git", ["commit", "-qm", "first"], { cwd: rootPath });
+
+  const repository = { id: "recover-1", name: "repo", rootPath };
+  const session = await createPracticeSession(repository, { id: "lesson-1", title: "Lesson" }, practiceDirectory);
+  await access(session.worktreePath);
+  // The session record is on disk as soon as the worktree is, which is the
+  // whole point: before this item it lived only in memory.
+  const sessionFile = path.join(practiceDirectory, "sessions.json");
+  await access(sessionFile);
+
+  // --- The next launch restores it ----------------------------------------
+  const restored = await reconcilePracticeSessions(practiceDirectory);
+  assert.equal(restored.restored.length, 1);
+  assert.equal(restored.restored[0].id, session.id);
+  assert.equal(restored.restored[0].lessonId, "lesson-1");
+  assert.deepEqual(restored.stale, []);
+  assert.deepEqual(restored.orphaned, [], "a restored session is not also an orphan");
+  // ...and the restored session is usable, not merely listed.
+  assert.equal((await inspectPracticeSession(session.id)).clean, true);
+
+  // --- A worktree with no record is reported, and left alone --------------
+  // This is exactly what a crash between `worktree add` and the save produces.
+  const orphanPath = path.join(practiceDirectory, "repo-orphaned");
+  await execFileAsync("git", ["-C", rootPath, "worktree", "add", "--detach", "--", orphanPath, "HEAD"]);
+  await writeFile(path.join(orphanPath, "unsaved.txt"), "work nobody else knows about\n");
+  const withOrphan = await reconcilePracticeSessions(practiceDirectory);
+  assert.equal(withOrphan.orphaned.length, 1, JSON.stringify(withOrphan.orphaned));
+  assert.match(withOrphan.orphaned[0], /repo-orphaned$/);
+  assert.equal(await readFile(path.join(orphanPath, "unsaved.txt"), "utf8"), "work nobody else knows about\n",
+    "an orphaned worktree must not be touched; it may hold the only copy of somebody's work");
+
+  // --- A record whose worktree is gone is dropped -------------------------
+  await execFileAsync("git", ["-C", rootPath, "worktree", "remove", "--force", "--", session.worktreePath]);
+  const afterRemoval = await reconcilePracticeSessions(practiceDirectory);
+  assert.deepEqual(afterRemoval.restored, []);
+  assert.equal(afterRemoval.stale.length, 1);
+  assert.equal(afterRemoval.stale[0].id, session.id);
+  // The stale record is not carried forward into the launch after that.
+  assert.deepEqual((await reconcilePracticeSessions(practiceDirectory)).stale, []);
+
+  // --- A destroyed session record is not a destroyed launch ---------------
+  await writeFile(path.join(practiceDirectory, "sessions.json"), "{ torn");
+  const damaged = await reconcilePracticeSessions(practiceDirectory);
+  assert.ok(Array.isArray(damaged.restored));
+  assert.ok(damaged.orphaned.length >= 1, "the worktrees on disk are still found");
+  assert.ok(damaged.problems.length >= 1 || damaged.source !== "current", JSON.stringify(damaged));
+  assert.deepEqual((await reconcilePracticeSessions(path.join(workspace, "never-used"))).orphaned, []);
 });

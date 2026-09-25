@@ -757,6 +757,14 @@ export const browserBridge: TraceBridge = {
     const migration = await import("../electron/course-migration.mjs");
     return migration.revertMigration(request.course, request.migrationId ?? null);
   },
+  async recoveryReport() {
+    // The browser has no user-data directory to recover, and says so rather
+    // than reporting a clean launch it did not verify.
+    return { ready: false, clean: true, interruptedWrites: [], practice: undefined, learning: null };
+  },
+  async releaseOrphanedWorktree(request) {
+    return { released: request.worktreePath };
+  },
   async listNotes() {
     return { notes: demoNotes };
   },

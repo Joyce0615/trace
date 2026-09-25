@@ -357,6 +357,8 @@ export const IPC_SCHEMAS = {
     course: s.opaque(),
     migrationId: s.string({ maxLength: 160, optional: true, nullable: true }),
   }),
+  "recovery:report": s.object({ repository: s.object({ id: s.string({ maxLength: 64 }), rootPath: s.string({ maxLength: 4_096 }) }, { optional: true, nullable: true }) }),
+  "practice:release": s.object({ repository: repositoryReference, worktreePath: s.string({ maxLength: 4_096 }) }),
   "notes:list": s.object({ repository: repositoryReference }),
   "notes:save": s.object({
     repository: repositoryReference,

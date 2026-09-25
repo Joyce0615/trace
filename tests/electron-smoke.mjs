@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { _electron as electron } from "playwright";
@@ -1861,5 +1861,81 @@ try {
   }, null, 2));
 } finally {
   await electronApp.close();
+}
+
+/*
+ * Item 51: a real second launch over the same user-data directory, after the
+ * saved learner state has been damaged the way an interrupted write damages it.
+ * There is no way to prove crash recovery without actually restarting.
+ */
+const recoveryReport = { checked: false };
+try {
+  const learningDirectory = path.join(userDataDirectory, "learning");
+  const practiceDirectory = path.join(userDataDirectory, "practice");
+  const saved = (await readdir(learningDirectory).catch(() => [])).filter((entry) => entry.endsWith(".json"));
+  assert.equal(saved.length >= 1, true, "the first run saved no learner state, so there is nothing to recover");
+  const statePath = path.join(learningDirectory, saved[0]);
+  const before = JSON.parse(await readFile(statePath, "utf8"));
+  assert.equal(before.format, "trace-durable-v1");
+  await access(`${statePath}.bak`);
+  const backupBefore = JSON.parse(await readFile(`${statePath}.bak`, "utf8"));
+
+  // Truncate the current save, exactly as a power cut mid-write would, and
+  // leave a stray temp file behind as an interrupted write does.
+  await writeFile(statePath, (await readFile(statePath, "utf8")).slice(0, 60));
+  await writeFile(path.join(learningDirectory, "interrupted.4242.tmp"), "half a save");
+  // And leave a practice worktree with no session record, as a crash between
+  // creating the worktree and saving the record does.
+  await mkdir(path.join(practiceDirectory, "flashinfer-orphan"), { recursive: true });
+  await writeFile(path.join(practiceDirectory, "flashinfer-orphan", "unsaved.txt"), "work nobody else knows about\n");
+
+  const relaunched = await electron.launch({
+    args: [".", `--user-data-dir=${userDataDirectory}`],
+    cwd: process.cwd(),
+    env: { ...process.env, VITE_DEV_SERVER_URL: "" },
+  });
+  try {
+    const page = await relaunched.firstWindow();
+    await page.getByRole("button", { name: /Explore nano-vllm|Start learning/ }).first().waitFor({ timeout: 60_000 });
+    const report = await page.evaluate(() => window.trace.recoveryReport({}));
+    assert.equal(report.ready, true, "the recovery report was not built at launch");
+    assert.equal(report.clean, false, "an unclean shutdown was reported as clean");
+    // The interrupted write was swept rather than left to be read next time.
+    assert.ok(report.interruptedWrites.includes("interrupted.4242.tmp"), JSON.stringify(report.interruptedWrites));
+    await assert.rejects(() => access(path.join(learningDirectory, "interrupted.4242.tmp")));
+    // The orphaned worktree was found and *not* touched.
+    assert.equal(report.practice.orphaned.length, 1, JSON.stringify(report.practice.orphaned));
+    assert.match(report.practice.orphaned[0], /flashinfer-orphan$/);
+    assert.equal(await readFile(path.join(practiceDirectory, "flashinfer-orphan", "unsaved.txt"), "utf8"), "work nobody else knows about\n");
+    // The damaged learner state falls back to the previous generation, and the
+    // app is usable rather than merely launchable: the repository opens and the
+    // recovered mastery is the backup's, not an empty slate.
+    const reopened = await page.evaluate((source) => window.trace.openRepository({ source }), repositoryPath);
+    assert.ok(reopened.repository.files.length > 1000, String(reopened.repository.files.length));
+    const health = await page.evaluate((reference) => window.trace.recoveryReport({ repository: reference }),
+      { id: reopened.repository.id, rootPath: reopened.repository.rootPath });
+    assert.equal(health.ready, true);
+    // The store now reads cleanly again, from whichever generation survived.
+    assert.equal(health.learning.recoverable, true, JSON.stringify(health.learning));
+    const backupSkills = Object.keys(backupBefore.payload?.mastery ?? {});
+    assert.ok(backupSkills.length > 0, "the backup generation held no mastery, so recovery proves nothing");
+    assert.deepEqual(
+      Object.keys(reopened.learnerState.mastery).sort(),
+      backupSkills.sort(),
+      "the recovered learner state does not match the generation that survived",
+    );
+    Object.assign(recoveryReport, {
+      checked: true,
+      interruptedWrites: report.interruptedWrites,
+      orphanedWorktrees: report.practice.orphaned.length,
+      staleSessions: report.practice.stale.length,
+      backupSavedAt: backupBefore.savedAt,
+      damagedBytes: 60,
+    });
+  } finally {
+    await relaunched.close();
+  }
+  console.log(JSON.stringify({ ok: true, recovery: recoveryReport }, null, 2));
+} finally {
   await rm(userDataDirectory, { recursive: true, force: true });
 }

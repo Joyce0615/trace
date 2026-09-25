@@ -43,6 +43,8 @@ contextBridge.exposeInMainWorld("trace", {
   importCourse: (request) => ipcRenderer.invoke("course:import", request),
   migrateCourse: (request) => ipcRenderer.invoke("course:migrate", request),
   revertCourseMigration: (request) => ipcRenderer.invoke("course:revert-migration", request),
+  recoveryReport: (request) => ipcRenderer.invoke("recovery:report", request ?? {}),
+  releaseOrphanedWorktree: (request) => ipcRenderer.invoke("practice:release", request),
   listNotes: (request) => ipcRenderer.invoke("notes:list", request),
   saveNote: (request) => ipcRenderer.invoke("notes:save", request),
   exportArchive: (request) => ipcRenderer.invoke("archive:export", request),

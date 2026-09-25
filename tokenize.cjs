@@ -192,6 +192,12 @@ ${visionBlocks}
 .search-result-list .virtual-row { height: 64px; }
 .search-result-list .search-result { height: 64px; width: 100%; overflow: hidden; }
 .culling-note { padding: 4px 0; color: var(--muted); font-size: calc(8px + var(--font-boost)); }
+
+/* Item 51: the unclean-shutdown notice. */
+.recovery-banner { position: absolute; left: 50%; bottom: 18px; transform: translateX(-50%); z-index: 60; display: flex; align-items: center; gap: 10px; max-width: 720px; padding: 10px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-2); box-shadow: 0 10px 30px rgba(0, 0, 0, .45); }
+.recovery-banner strong { display: block; color: var(--text); font-size: calc(11px + var(--font-boost)); }
+.recovery-banner small { display: block; color: var(--muted); font-size: calc(9px + var(--font-boost)); line-height: 1.5; }
+.recovery-banner .ghost { margin-left: auto; min-height: 24px; padding: 4px 10px; border: 1px solid var(--line); border-radius: 7px; background: none; color: var(--muted); font-size: calc(9px + var(--font-boost)); cursor: pointer; }
 `;
 
   fs.writeFileSync("src/styles.css", `${header}\n${css}\n${footer}`);
