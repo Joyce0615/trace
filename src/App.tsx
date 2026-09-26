@@ -3,7 +3,7 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type
 import { emptyActivityState, emptyAnalyticsState, emptyExperimentState, emptyGoalState, emptyMigrationState, emptyArchiveState, emptySharingState, emptyArchitectureState, emptyChainState, emptyDiagnosisState, emptyEvaluationState, emptyEvidenceState, emptyHistoryState, emptyLocalizationState, emptyExecutableQuizState, emptyExplanationState, emptyReviewState, emptyScheduleState, emptyTraceState, type ActivityState, type AnalyticsState, type ArchitectureState, type ExperimentState, type GoalState, type MigrationState, type ArchiveState, type SharingState, type ChainState, type DiagnosisState, type EvaluationState, type EvidenceState, type ExecutableQuizState, type ExplanationState, type HistoryState, type LocalizationState, type ReviewState, type ScheduleState, type TraceState } from "./exercise-state";
 import { Icon, VirtualList, bridge, readableError, repositoryRef } from "./shell";
 import { addEvidence, completeDiagnostic, personalizeSkillGraph, skillForLesson } from "./learning";
-import type { AgentState, ContextMode, ContextPack, SearchResponse, ContextScope, Course, IndexProgress, KnowledgeGraphSummary, LearnerNote, LearnerProfile, RecoveryReport, LinkClassification, LearnerState, LearningMemory, Lesson, LessonContentBlock, PracticeReport, PracticeSession, Repository, RepoFile, SkillGraph, SkillNode, SymbolResolution } from "./types";
+import type { AgentState, ContextMode, ContextPack, SearchResponse, ContextScope, Course, IndexProgress, DeepLinkResult, KnowledgeGraphSummary, LearnerNote, LearnerProfile, RecoveryReport, LinkClassification, LearnerState, LearningMemory, Lesson, LessonContentBlock, PracticeReport, PracticeSession, Repository, RepoFile, SkillGraph, SkillNode, SymbolResolution } from "./types";
 
 type TutorMode = "learn" | "ask" | "quiz" | "practice";
 type WorkspaceMode = "lesson" | "diagram" | "code" | "chains" | "locate" | "review" | "notes";
@@ -1232,10 +1232,33 @@ export default function App() {
       .catch(() => setRecovery(null));
   }, [repository]);
 
+  // Item 52: a deep link arrives as an *intent*; the renderer decides what to do
+  // with it. The main process never navigates on its own, and a link that could
+  // not be honoured is shown rather than silently dropped.
+  const [deepLink, setDeepLink] = useState<DeepLinkResult | null>(null);
+  useEffect(() => {
+    const unsubscribe = bridge.onDeepLink?.((payload) => setDeepLink(payload));
+    return () => { if (typeof unsubscribe === "function") unsubscribe(); };
+  }, []);
+  useEffect(() => {
+    const intent = deepLink?.intent;
+    if (!intent || !repository || intent.repository.id !== repository.id) return;
+    if (intent.lesson) {
+      const target = flattenLessons(course ?? { modules: [] } as unknown as Course).find((item) => item.id === intent.lesson);
+      if (target) void selectLesson(target);
+    }
+    if (intent.file) {
+      const file = repository.files.find((item) => item.path === intent.file);
+      if (file) void openFile(file, intent.line ?? 1);
+    }
+    if (intent.view) changeWorkspaceMode(intent.view as WorkspaceMode);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deepLink]);
+
   // Read-only inspection surface for automated smoke tests and support diagnostics.
   useEffect(() => {
-    window.traceWorkspace = repository ? { repository, course, skillGraph, learnerState, knowledgeGraph, notes } : undefined;
-  }, [course, knowledgeGraph, learnerState, notes, repository, skillGraph]);
+    window.traceWorkspace = repository ? { repository, course, skillGraph, learnerState, knowledgeGraph, notes, deepLink } : undefined;
+  }, [course, deepLink, knowledgeGraph, learnerState, notes, repository, skillGraph]);
 
   const updateChainState = useCallback((update: Partial<ChainState>) => setChainState((previous) => ({ ...previous, ...update })), []);
   const updateLocalizationState = useCallback((update: Partial<LocalizationState>) => setLocalizationState((previous) => ({ ...previous, ...update })), []);

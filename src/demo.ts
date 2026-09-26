@@ -757,6 +757,24 @@ export const browserBridge: TraceBridge = {
     const migration = await import("../electron/course-migration.mjs");
     return migration.revertMigration(request.course, request.migrationId ?? null);
   },
+  async newWindow() {
+    // A browser tab cannot open an app window, and says so rather than
+    // pretending it did.
+    return { windowId: 0, windows: 1 };
+  },
+  async windowState() {
+    return { windows: 1, byWindow: [], indexed: [nanoRepository.id], caches: [] };
+  },
+  async openDeepLink(url) {
+    const links = await import("../electron/deep-link.mjs");
+    return { url, ...links.parseDeepLink(url, { openRepositories: [{ id: nanoRepository.id, rootPath: nanoRepository.rootPath }] }) };
+  },
+  async lastDeepLink() {
+    return null;
+  },
+  onDeepLink() {
+    return () => undefined;
+  },
   async recoveryReport() {
     // The browser has no user-data directory to recover, and says so rather
     // than reporting a clean launch it did not verify.

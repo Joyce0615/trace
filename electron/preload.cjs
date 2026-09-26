@@ -43,6 +43,15 @@ contextBridge.exposeInMainWorld("trace", {
   importCourse: (request) => ipcRenderer.invoke("course:import", request),
   migrateCourse: (request) => ipcRenderer.invoke("course:migrate", request),
   revertCourseMigration: (request) => ipcRenderer.invoke("course:revert-migration", request),
+  newWindow: () => ipcRenderer.invoke("window:new", {}),
+  windowState: () => ipcRenderer.invoke("window:state", {}),
+  openDeepLink: (url) => ipcRenderer.invoke("deep-link:open", { url }),
+  lastDeepLink: () => ipcRenderer.invoke("deep-link:last", {}),
+  onDeepLink: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("deep-link:navigate", listener);
+    return () => ipcRenderer.removeListener("deep-link:navigate", listener);
+  },
   recoveryReport: (request) => ipcRenderer.invoke("recovery:report", request ?? {}),
   releaseOrphanedWorktree: (request) => ipcRenderer.invoke("practice:release", request),
   listNotes: (request) => ipcRenderer.invoke("notes:list", request),

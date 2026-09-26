@@ -30,17 +30,20 @@ const missingDesktopBridge = new Proxy({}, {
  */
 const lazyBrowserBridge = new Proxy({}, {
   get(_target, method) {
-    // `onIndexProgress` is the one member that is *not* a promise: it subscribes
-    // and returns an unsubscribe function, which `useEffect` calls as cleanup.
-    // Wrapping it like the rest handed React a promise as a destructor and
-    // crashed the start screen with "destroy is not a function".
-    if (method === "onIndexProgress") {
-      return (callback: (progress: unknown) => void) => {
+    // Subscriptions are not promises: they return an unsubscribe function, which
+    // `useEffect` calls as its cleanup. Wrapping one like the rest hands React a
+    // promise as a destructor and crashes the whole screen with "destroy is not
+    // a function" — which happened twice, for `onIndexProgress` and then again
+    // for `onDeepLink`, so the rule is now the shape of the name rather than a
+    // list of exceptions to keep in sync.
+    if (typeof method === "string" && /^on[A-Z]/.test(method)) {
+      return (callback: (payload: unknown) => void) => {
         let unsubscribe: (() => void) | null = null;
         let cancelled = false;
         void import("./demo").then(({ browserBridge }) => {
           if (cancelled) return;
-          unsubscribe = browserBridge.onIndexProgress(callback as never) as unknown as () => void;
+          const subscribe = (browserBridge as unknown as Record<string, (handler: unknown) => unknown>)[method];
+          if (typeof subscribe === "function") unsubscribe = subscribe(callback) as unknown as () => void;
         });
         return () => { cancelled = true; unsubscribe?.(); };
       };

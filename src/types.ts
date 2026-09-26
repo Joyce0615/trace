@@ -959,6 +959,30 @@ export interface MigrationResult {
   note?: string;
 }
 
+/** Item 52: a parsed `trace://` link, valid or refused with a reason. */
+export interface DeepLinkResult {
+  url: string;
+  at?: string;
+  valid: boolean;
+  reason: string | null;
+  detail: string | null;
+  intent: {
+    action: string;
+    repository: { id: string; rootPath: string };
+    file: string | null;
+    line: number | null;
+    lesson: string | null;
+    view: string | null;
+  } | null;
+}
+
+export interface WindowState {
+  windows: number;
+  byWindow: Array<{ windowId: number; repositoryId: string }>;
+  indexed: string[];
+  caches: Array<{ name: string; entries: number }>;
+}
+
 /** Item 51: what the last shutdown left behind. */
 export interface RecoveryReport {
   ready: boolean;
@@ -1565,6 +1589,11 @@ export interface TraceBridge {
   importCourse(request: { repository: RepositoryRef; package: CoursePackage; force?: boolean }): Promise<CourseImportResult>;
   migrateCourse(request: { repository: RepositoryRef; course: Course; fromCommit?: string | null; apply?: boolean; accept?: "auto" | "all" | "none"; acceptIds?: string[]; retireMissing?: boolean }): Promise<MigrationResult>;
   revertCourseMigration(request: { repository: RepositoryRef; course: Course; migrationId?: string | null }): Promise<{ course: Course; reverted: boolean; reason?: string; migrationId?: string; restored?: number }>;
+  newWindow(): Promise<{ windowId: number; windows: number }>;
+  windowState(): Promise<WindowState>;
+  openDeepLink(url: string): Promise<DeepLinkResult>;
+  lastDeepLink(): Promise<DeepLinkResult | null>;
+  onDeepLink(callback: (payload: DeepLinkResult) => void): () => void;
   recoveryReport(request?: { repository?: RepositoryRef | null }): Promise<RecoveryReport>;
   releaseOrphanedWorktree(request: { repository: RepositoryRef; worktreePath: string }): Promise<{ released: string }>;
   listNotes(request: { repository: RepositoryRef }): Promise<{ notes: LearnerNote[] }>;
@@ -1620,6 +1649,7 @@ export interface TraceWorkspaceSnapshot {
   learnerState: LearnerState | null;
   knowledgeGraph: KnowledgeGraphSummary | null;
   notes?: LearnerNote[];
+  deepLink?: DeepLinkResult | null;
 }
 
 declare global {

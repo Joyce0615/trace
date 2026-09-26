@@ -8,6 +8,7 @@ import { loadCourse, saveCourse } from "./course-store.mjs";
 import { DEFAULT_INDEX_LIMITS, IndexCancelledError, analyzeContent, inspectRepository, languageFor, readRepositoryFile } from "./repository.mjs";
 import { createPracticeSession, getPracticeSessionPath, inspectPracticeSession, reconcilePracticeSessions, releaseOrphanedWorktree, removePracticeSession } from "./practice.mjs";
 import { inspectDurable, sweepInterruptedWrites } from "./durable-store.mjs";
+import { DEEP_LINK_SCHEME, deepLinkFromArgv, parseDeepLink } from "./deep-link.mjs";
 import { answerFromLocalIndex, buildContextPack, loadCachedResponse, responseCacheKey, saveCachedResponse } from "./context-engine.mjs";
 import { loadLearnerState, saveLearnerState } from "./learning-store.mjs";
 import { buildSkillGraph, reconcileLearnerState } from "./skill-graph.mjs";
@@ -44,17 +45,62 @@ import { forgetEverything, loadExperimentState, recordObservation, setConsent } 
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const openedRepositories = new Map();
+
+/**
+ * Everything keyed by repository id (item 52).
+ *
+ * Listing them in one place is the point: a per-repository cache that nobody
+ * remembers to clear is how one repository's exercises, hints, and search index
+ * end up answering questions about another. `forgetRepository` walks this list,
+ * so adding a cache without adding it here is a visible omission rather than an
+ * invisible leak.
+ */
+const REPOSITORY_CACHES = [];
+
+function repositoryCache(name) {
+  const store = new Map();
+  REPOSITORY_CACHES.push({ name, store });
+  return store;
+}
+
+/**
+ * Drop everything cached for a repository.
+ *
+ * Called when the last window holding it goes away, and when a repository is
+ * re-indexed at a new version, because a call chain or a search index built
+ * against the old tree is wrong rather than stale.
+ */
+function forgetRepository(repositoryId, { keepIndex = false } = {}) {
+  const dropped = [];
+  for (const { name, store } of REPOSITORY_CACHES) {
+    let removed = 0;
+    for (const key of [...store.keys()]) {
+      // Composite keys start with the repository id; plain ones are the id.
+      if (key === repositoryId || String(key).startsWith(`${repositoryId}|`)) {
+        store.delete(key);
+        removed += 1;
+      }
+    }
+    if (removed) dropped.push(`${name}:${removed}`);
+  }
+  if (!keepIndex) {
+    openedRepositories.delete(repositoryId);
+    knowledgeGraphs.delete(repositoryId);
+  }
+  return dropped;
+}
+
 const knowledgeGraphs = new Map();
 const indexingRequests = new Map();
-const callChainSets = new Map();
-const localizationExercises = new Map();
-const raceTasks = new Map();
-const searchIndexes = new Map();
-const learnerProbes = new Map();
-const executableQuizzes = new Map();
-const explanationTasks = new Map();
-const activitySets = new Map();
-const scaffolds = new Map();
+const callChainSets = repositoryCache("callChainSets");
+const localizationExercises = repositoryCache("localizationExercises");
+const raceTasks = repositoryCache("raceTasks");
+const searchIndexes = repositoryCache("searchIndexes");
+const learnerProbes = repositoryCache("learnerProbes");
+const executableQuizzes = repositoryCache("executableQuizzes");
+const explanationTasks = repositoryCache("explanationTasks");
+const activitySets = repositoryCache("activitySets");
+const scaffolds = repositoryCache("scaffolds");
 
 /** One key per active hint ladder, so a rung can only be served for a live task. */
 function scaffoldKey(repositoryId, kind, taskId) {
@@ -64,10 +110,10 @@ function scaffoldKey(repositoryId, kind, taskId) {
 // How many hint rungs the learner has taken per task, so a graded attempt can
 // record what it cost. The main process owns this: a renderer that could report
 // its own hint usage could also report none.
-const hintsTaken = new Map();
+const hintsTaken = repositoryCache("hintsTaken");
 
 // Files the learner has opened, which is what makes an activity "near" transfer.
-const inspectedPaths = new Map();
+const inspectedPaths = repositoryCache("inspectedPaths");
 
 /**
  * Bounds on a migration. Reconstructing a previous version means reading blobs
@@ -163,6 +209,31 @@ function summarizeGraph(graph) {
   };
 }
 
+/**
+ * Windows, and what each one is looking at (item 52).
+ *
+ * Two windows on the same repository share one index — re-indexing FlashInfer
+ * per window would cost eight seconds and a hundred megabytes for nothing — so
+ * the caches are keyed by repository rather than by window, and a repository is
+ * only forgotten when the *last* window holding it goes away. Getting that
+ * backwards either leaks memory forever or pulls the index out from under a
+ * window that is still using it.
+ */
+const windowRepositories = new Map();
+
+function claimRepository(webContents, repositoryId) {
+  windowRepositories.set(webContents.id, repositoryId);
+}
+
+function releaseWindow(webContentsId) {
+  const repositoryId = windowRepositories.get(webContentsId);
+  windowRepositories.delete(webContentsId);
+  if (!repositoryId) return null;
+  const stillOpen = [...windowRepositories.values()].includes(repositoryId);
+  if (stillOpen) return null;
+  return { repositoryId, dropped: forgetRepository(repositoryId) };
+}
+
 function createWindow() {
   const window = new BrowserWindow({
     width: 1580,
@@ -194,10 +265,43 @@ function createWindow() {
 
   window.webContents.on("will-attach-webview", (event) => event.preventDefault());
 
+  window.webContents.on("destroyed", () => {
+    // The renderer is gone; whatever it was holding may now be released.
+    releaseWindow(window.webContents.id);
+  });
+
   const developmentUrl = process.env.VITE_DEV_SERVER_URL;
   if (developmentUrl) window.loadURL(developmentUrl);
   else window.loadFile(path.join(currentDirectory, "..", "dist", "index.html"));
+  return window;
 }
+
+/**
+ * Route a `trace://` link to a window.
+ *
+ * The link is parsed against the repositories that are actually open and then
+ * *sent to the renderer as an intent* — the main process never navigates on its
+ * own. A link that cannot be honoured is reported to the focused window so the
+ * learner sees why, rather than watching nothing happen.
+ */
+function routeDeepLink(url, sender = null) {
+  const result = parseDeepLink(url, { openRepositories: [...openedRepositories.values()].map((repository) => ({ id: repository.id, rootPath: repository.rootPath })) });
+  lastDeepLink = { url, at: new Date().toISOString(), ...result };
+  // A link the renderer asked us to open belongs to *that* renderer; only a
+  // link handed over by the operating system has to guess at a window.
+  const target = (sender && BrowserWindow.fromWebContents(sender))
+    ?? BrowserWindow.getFocusedWindow()
+    ?? BrowserWindow.getAllWindows()[0]
+    ?? null;
+  if (target && !target.webContents.isDestroyed()) {
+    target.webContents.send("deep-link:navigate", lastDeepLink);
+    if (target.isMinimized()) target.restore();
+    target.focus();
+  }
+  return lastDeepLink;
+}
+
+let lastDeepLink = null;
 
 let lastLinkDecision = null;
 
@@ -281,7 +385,20 @@ const ipcHandlers = {
     } finally {
       indexingRequests.delete(requestId);
     }
+    // Re-indexing at a new version invalidates everything derived from the old
+    // one: a call chain or a search index built against the previous tree is
+    // wrong, not merely stale.
+    const previous = openedRepositories.get(repository.id);
+    if (previous && previous.versionId !== repository.versionId) forgetRepository(repository.id, { keepIndex: true });
     openedRepositories.set(repository.id, repository);
+    const switchedFrom = windowRepositories.get(event.sender.id) ?? null;
+    if (switchedFrom && switchedFrom !== repository.id) {
+      // This window moved to a different repository; the one it left goes only
+      // if no other window still has it.
+      windowRepositories.delete(event.sender.id);
+      if (![...windowRepositories.values()].includes(switchedFrom)) forgetRepository(switchedFrom);
+    }
+    claimRepository(event.sender, repository.id);
     const course = await loadCourse(courseDirectory, repository, request.profile)
       ?? generateStarterCourse(repository, request.profile);
     const skillGraph = buildSkillGraph(repository, course);
@@ -1105,6 +1222,24 @@ const ipcHandlers = {
 
   "practice:remove": (_event, request) => removePracticeSession(request.sessionId, Boolean(request.discardChanges)),
 
+  "window:new": async (_event) => {
+    const created = createWindow();
+    return { windowId: created.webContents.id, windows: BrowserWindow.getAllWindows().length };
+  },
+
+  "window:state": async (_event) => ({
+    windows: BrowserWindow.getAllWindows().length,
+    // What each window is looking at, and which repositories are therefore
+    // still worth keeping indexed.
+    byWindow: [...windowRepositories.entries()].map(([windowId, repositoryId]) => ({ windowId, repositoryId })),
+    indexed: [...openedRepositories.keys()],
+    caches: REPOSITORY_CACHES.map(({ name, store }) => ({ name, entries: store.size })),
+  }),
+
+  "deep-link:open": async (event, request) => routeDeepLink(request.url, event.sender),
+
+  "deep-link:last": async () => lastDeepLink,
+
   "recovery:report": async (_event, request) => {
     const repository = request?.repository ? openedRepository(request.repository) : null;
     const learning = repository ? await inspectDurable(path.join(learningDirectory(), `${createHash("sha256").update(repository.id).digest("hex").slice(0, 24)}.json`)) : null;
@@ -1127,6 +1262,32 @@ export const registeredIpcChannels = registerValidatedHandlers(ipcMain, ipcHandl
   onResponse: (channel, result) => guardResponse(channel, result),
 });
 
+/*
+ * One instance owns the protocol. A second launch — which is what a `trace://`
+ * click produces on Windows and Linux — hands its link to the first and exits,
+ * rather than starting a second copy of the app with its own index of the same
+ * repository.
+ */
+const hasInstanceLock = app.requestSingleInstanceLock();
+if (!hasInstanceLock) {
+  app.quit();
+} else {
+  app.on("second-instance", (_event, argv) => {
+    const link = deepLinkFromArgv(argv);
+    if (link) routeDeepLink(link);
+    else {
+      const existing = BrowserWindow.getAllWindows()[0];
+      if (existing) { if (existing.isMinimized()) existing.restore(); existing.focus(); }
+    }
+  });
+}
+
+// macOS delivers the link as an event instead of an argument.
+app.on("open-url", (event, url) => {
+  event.preventDefault();
+  routeDeepLink(url);
+});
+
 app.whenReady().then(async () => {
   // Before anything opens: clear temporary files left by an interrupted write,
   // and work out which practice worktrees the last run left behind.
@@ -1145,7 +1306,15 @@ app.whenReady().then(async () => {
     clean: practice.orphaned.length === 0 && practice.stale.length === 0 && !practice.recovered
       && sweptLearning.swept.length === 0 && sweptNotes.swept.length === 0 && sweptPractice.swept.length === 0,
   };
+  // Registering the scheme is what makes `trace://` links reach this app at all.
+  // It is skipped under the test harness, which must not change the machine.
+  if (!process.env.TRACE_NO_PROTOCOL_REGISTRATION) {
+    if (process.defaultApp && process.argv.length >= 2) app.setAsDefaultProtocolClient(DEEP_LINK_SCHEME, process.execPath, [path.resolve(process.argv[1])]);
+    else app.setAsDefaultProtocolClient(DEEP_LINK_SCHEME);
+  }
   createWindow();
+  const startupLink = deepLinkFromArgv(process.argv);
+  if (startupLink) routeDeepLink(startupLink);
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });

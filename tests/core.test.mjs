@@ -22,6 +22,7 @@ import { GIT_HISTORY_VERSION, busFactor, detectRenames, historyLessons, historyS
 import { MISCONCEPTIONS, MISCONCEPTION_VERSION, buildProbe, calibrateSkill, detectMisconceptions, diagnoseLearner, gradeProbe } from "../electron/misconception.mjs";
 import { SIGNING_ALGORITHM, SIGNING_VERSION, anchorPayload, assessmentPayload, canonicalize, createKeyPair, digestOf, keyIdFor, loadOrCreateKeyPair, loadTrustedKeys, packagePayload, publicIdentity, responsePayload, setKeyTrust, signPackage, signPayload, verifyPackageSignature, verifyPayload } from "../electron/signing.mjs";
 import { COURSE_PACKAGE_FORMAT, COURSE_PACKAGE_VERSION, anchorManifest, detectLicense, importCourse, packageCourse, verifyPackage } from "../electron/course-package.mjs";
+import { DEEP_LINK_SCHEME, DEEP_LINK_VERSION, deepLinkFromArgv, formatDeepLink, isSafeRelativePath, parseDeepLink } from "../electron/deep-link.mjs";
 import { DEFAULT_WINDOW, VIRTUALIZATION_VERSION, buildHeightIndex, cullGraph, describeCulling, indexAt, scrollToIndex, variableWindowFor, windowFor } from "../electron/virtualization.mjs";
 import { CONTRAST_LEVELS, CONTRAST_TARGETS, GRAPH_CATEGORIES, GRAPH_PALETTES, THEMES, THEME_VERSION, colorDistance, contrast as contrastOf, deriveColor, hexToRgb, luminance, luminanceForContrast, normalizeDisplaySettings, paletteFor, paletteSeparation, parseHex, rgbToHex, simulateVision, withLuminance } from "../electron/theme.mjs";
 import { A11Y_VERSION, auditSnapshot, collectAccessibilitySnapshot, contrastRatio, isLargeText, relativeLuminance, roleOf, summarizeAudit } from "../electron/accessibility.mjs";
@@ -778,7 +779,7 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
     "learning:diagnose", "learning:probe", "learning:schedule", "learning:review",
     "quiz:build", "quiz:grade", "explain:task", "explain:grade",
     "activity:build", "activity:grade", "hint:next", "analytics:report",
-    "course:package", "course:import", "course:verify-signature", "course:migrate", "course:revert-migration", "notes:list", "notes:save", "archive:export", "archive:import", "recovery:report", "practice:release",
+    "course:package", "course:import", "course:verify-signature", "course:migrate", "course:revert-migration", "notes:list", "notes:save", "archive:export", "archive:import", "recovery:report", "practice:release", "window:new", "window:state", "deep-link:open", "deep-link:last",
     "signing:identity", "signing:trust", "goals:plan", "experiment:state", "experiment:consent", "experiment:forget", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
@@ -5624,4 +5625,101 @@ test("a crash leaves practice worktrees on disk, and the next launch finds them"
   assert.ok(damaged.orphaned.length >= 1, "the worktrees on disk are still found");
   assert.ok(damaged.problems.length >= 1 || damaged.source !== "current", JSON.stringify(damaged));
   assert.deepEqual((await reconcilePracticeSessions(path.join(workspace, "never-used"))).orphaned, []);
+});
+
+test("a deep link is parsed as untrusted input and can only ask for what is already open", () => {
+  const open = [{ id: "repo-1", rootPath: "/Users/tester/GitHub/flashinfer" }];
+  const parse = (url) => parseDeepLink(url, { openRepositories: open });
+
+  // --- The link that works -------------------------------------------------
+  const good = parse("trace://open?repo=/Users/tester/GitHub/flashinfer&file=flashinfer/utils.py&line=42");
+  assert.equal(good.valid, true, good.detail);
+  assert.deepEqual(good.intent, {
+    action: "open",
+    repository: { id: "repo-1", rootPath: "/Users/tester/GitHub/flashinfer" },
+    file: "flashinfer/utils.py",
+    line: 42,
+    lesson: null,
+    view: "code",
+  });
+  // A repository may also be named by its id, and the scheme-relative form works.
+  assert.equal(parse("trace://open?repo=repo-1").valid, true);
+  assert.equal(parse("trace:/open?repo=repo-1").valid, true);
+  assert.equal(parse("trace://lesson?repo=repo-1&lesson=engine-map").intent.lesson, "engine-map");
+  assert.equal(parse("trace://file?repo=repo-1&file=a/b.py").intent.view, "code");
+  assert.equal(parse("trace://open?repo=repo-1&view=diagram").intent.view, "diagram");
+
+  // --- A link cannot reach outside the repository -------------------------
+  // This is the rule that matters most: the link comes from the operating
+  // system, not from the person at the keyboard.
+  for (const attack of ["../../etc/passwd", "/etc/passwd", "\\\\server\\share", "C:/Windows/system.ini", "a/../../b", "a//b"]) {
+    const refused = parse(`trace://open?repo=repo-1&file=${encodeURIComponent(attack)}`);
+    assert.equal(refused.valid, false, `${attack} was accepted`);
+    assert.equal(refused.reason, "unsafe-path", `${attack}: ${refused.reason}`);
+  }
+  assert.equal(isSafeRelativePath("a/b/c.py"), true);
+  assert.equal(isSafeRelativePath("a/../b"), false);
+  assert.equal(isSafeRelativePath(""), false);
+  assert.equal(isSafeRelativePath("a\0b"), false);
+  assert.equal(isSafeRelativePath(null), false);
+
+  // --- A link cannot cause a repository to be opened ----------------------
+  const foreign = parse("trace://open?repo=/somewhere/else");
+  assert.equal(foreign.valid, false);
+  assert.equal(foreign.reason, "unknown-repository");
+  assert.match(foreign.detail, /a link cannot open one for you/);
+  assert.equal(parseDeepLink("trace://open?repo=repo-1", { openRepositories: [] }).reason, "unknown-repository",
+    "with nothing open, every link is refused rather than queued");
+
+  // --- Other schemes and shapes are refused -------------------------------
+  assert.equal(parse("javascript:alert(1)").reason, "wrong-scheme");
+  assert.equal(parse("file:///etc/passwd").reason, "wrong-scheme");
+  assert.equal(parse("https://example.com/trace://open").reason, "wrong-scheme");
+  assert.equal(parse("not a url").reason, "unparsable");
+  assert.equal(parse("").reason, "empty");
+  assert.equal(parse(`trace://open?repo=repo-1&file=${"a".repeat(3_000)}`).reason, "too-long");
+  assert.equal(parse("trace://destroy?repo=repo-1").reason, "unknown-action");
+  assert.equal(parse("trace://").reason, "unknown-action");
+
+  // --- An unknown parameter is refused, not ignored -----------------------
+  // Dropping it would mean acting on a link written for a different build.
+  const extra = parse("trace://open?repo=repo-1&exec=rm+-rf");
+  assert.equal(extra.valid, false);
+  assert.equal(extra.reason, "unknown-parameter");
+  assert.match(extra.detail, /“exec” is not a parameter of open/);
+  assert.equal(parse("trace://lesson?repo=repo-1").reason, "missing-parameter");
+  assert.equal(parse("trace://file?repo=repo-1").reason, "missing-parameter");
+  assert.equal(parse("trace://open?repo=repo-1&repo=repo-1").reason, "duplicate-parameter");
+
+  // --- Values are validated, not coerced ----------------------------------
+  assert.equal(parse("trace://open?repo=repo-1&line=abc").reason, "bad-line");
+  assert.equal(parse("trace://open?repo=repo-1&line=-4").reason, "bad-line");
+  assert.equal(parse("trace://open?repo=repo-1&line=99999999999").reason, "bad-line");
+  assert.equal(parse("trace://open?repo=repo-1&line=0").intent.line, 1, "line zero means the first line");
+  assert.equal(parse("trace://open?repo=repo-1&view=console").reason, "unknown-view");
+  assert.equal(parse("trace://lesson?repo=repo-1&lesson=<script>").reason, "bad-lesson");
+  assert.equal(parse("trace://lesson?repo=repo-1&lesson=engine-map.1:2").valid, true);
+
+  // --- Every refusal explains itself --------------------------------------
+  for (const url of ["", "not a url", "javascript:x", "trace://destroy?repo=repo-1", "trace://open?repo=nope", "trace://open?repo=repo-1&x=1"]) {
+    const refused = parse(url);
+    assert.equal(refused.valid, false);
+    assert.ok(refused.detail && refused.detail.length > 5, `${url} was refused without a reason`);
+    assert.equal(refused.intent, null);
+  }
+
+  // --- Round trip ----------------------------------------------------------
+  const formatted = formatDeepLink({ action: "open", repository: { rootPath: "/Users/tester/GitHub/flashinfer" }, file: "a/b.py", line: 7, view: "code" });
+  assert.match(formatted, /^trace:\/\/open\?/);
+  const round = parse(formatted);
+  assert.equal(round.valid, true, round.detail);
+  assert.deepEqual([round.intent.file, round.intent.line, round.intent.view], ["a/b.py", 7, "code"]);
+
+  // --- Command-line delivery ----------------------------------------------
+  assert.equal(deepLinkFromArgv(["/path/electron", ".", "trace://open?repo=repo-1"]), "trace://open?repo=repo-1");
+  assert.equal(deepLinkFromArgv(["/path/electron", "."]), null);
+  assert.equal(deepLinkFromArgv(["--user-data-dir=/tmp/x", "https://example.com"]), null);
+  assert.equal(deepLinkFromArgv(), null);
+  assert.equal(DEEP_LINK_VERSION, 1);
+  assert.equal(DEEP_LINK_SCHEME, "trace");
 });

@@ -1684,6 +1684,100 @@ try {
     await auditAccessibility(`${view} view`);
   }
 
+  // Item 52: two windows, a deep link, and a repository switch — the three
+  // lifecycle transitions that quietly break when state is cached per process
+  // but reasoned about per window.
+  const beforeSecondWindow = await page.evaluate(() => window.trace.windowState());
+  assert.equal(beforeSecondWindow.windows, 1);
+  assert.equal(beforeSecondWindow.byWindow.length, 1);
+  assert.deepEqual(beforeSecondWindow.indexed, [beforeSecondWindow.byWindow[0].repositoryId]);
+  const opened = await page.evaluate(() => window.trace.newWindow());
+  assert.equal(opened.windows, 2);
+  // `windows()` is a snapshot; a freshly created window may not be in it yet.
+  const secondWindow = await electronApp.waitForEvent("window", { timeout: 30_000 }).catch(() => electronApp.windows().find((candidate) => candidate !== page));
+  assert.ok(secondWindow && secondWindow !== page, "the second window never appeared");
+  await secondWindow.waitForLoadState("domcontentloaded");
+  await secondWindow.getByRole("button", { name: /Explore nano-vllm/ }).waitFor({ timeout: 60_000 });
+  // Two windows share one index rather than re-indexing 2,196 files each.
+  const twoWindows = await page.evaluate(() => window.trace.windowState());
+  assert.equal(twoWindows.windows, 2);
+  assert.equal(twoWindows.indexed.length, 1, "the second window re-indexed the repository");
+  // The first window is untouched by the second's existence.
+  assert.equal(await page.evaluate(() => Boolean(window.traceWorkspace?.repository)), true);
+
+  // A deep link is delivered as an intent and acted on by the renderer.
+  const workspaceBefore = await page.evaluate(() => ({ id: window.traceWorkspace.repository.id, rootPath: window.traceWorkspace.repository.rootPath }));
+  const linkTarget = await page.evaluate(() => window.traceWorkspace.repository.files.find((file) => file.path.endsWith(".py"))?.path);
+  const link = `trace://open?repo=${encodeURIComponent(workspaceBefore.rootPath)}&file=${encodeURIComponent(linkTarget)}&line=12&view=code`;
+  const routed = await page.evaluate((url) => window.trace.openDeepLink(url), link);
+  assert.equal(routed.valid, true, routed.detail);
+  assert.equal(routed.intent.file, linkTarget);
+  assert.equal(routed.intent.line, 12);
+  await page.waitForFunction((expected) => window.traceWorkspace?.deepLink?.intent?.file === expected, linkTarget, { timeout: 20_000 });
+  await page.waitForTimeout(1_200);
+  assert.match(await page.locator(".breadcrumb").innerText(), new RegExp(linkTarget.split("/").at(-1).replace(/\./g, "\\.")));
+  assert.equal(await page.locator('[role="tab"][aria-selected="true"]').innerText(), "Code", "the link did not switch to the view it asked for");
+  // A hostile link is refused with a reason, and changes nothing.
+  const hostile = await page.evaluate((rootPath) => window.trace.openDeepLink(`trace://open?repo=${encodeURIComponent(rootPath)}&file=../../../../etc/passwd`), workspaceBefore.rootPath);
+  assert.equal(hostile.valid, false);
+  assert.equal(hostile.reason, "unsafe-path");
+  const unknownRepository = await page.evaluate(() => window.trace.openDeepLink("trace://open?repo=/not/open"));
+  assert.equal(unknownRepository.reason, "unknown-repository");
+  assert.equal((await page.evaluate(() => window.trace.lastDeepLink())).reason, "unknown-repository", "the last decision is inspectable");
+
+  // Switching a window to another repository releases the first only when no
+  // window still holds it — and derived caches never carry across. The switch
+  // is done in the second window so the first keeps the repository the rest of
+  // this run depends on, which is itself the property being tested.
+  const makeRepository = async (name, body) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), `trace-${name}-`));
+    await mkdir(path.join(root, "app"), { recursive: true });
+    await writeFile(path.join(root, "app", `${name}.py`), body);
+    return root;
+  };
+  const firstSwitch = await makeRepository("switch-a", "def alpha():\n    return 1\n");
+  const secondSwitch = await makeRepository("switch-b", "def beta():\n    return 2\n");
+  const cachesBefore = await page.evaluate(() => window.trace.windowState());
+  const populated = cachesBefore.caches.filter((cache) => cache.entries > 0).map((cache) => cache.name);
+  assert.ok(populated.length >= 3, `nothing was cached, so the switch would prove nothing: ${JSON.stringify(cachesBefore.caches)}`);
+
+  const alpha = await secondWindow.evaluate((source) => window.trace.openRepository({ source }), firstSwitch);
+  const afterSwitch = await page.evaluate(() => window.trace.windowState());
+  assert.equal(afterSwitch.indexed.length, 2, "both repositories should be indexed while both windows hold one");
+  assert.equal(afterSwitch.byWindow.length, 2);
+  assert.equal(new Set(afterSwitch.byWindow.map((entry) => entry.repositoryId)).size, 2);
+  assert.ok(afterSwitch.indexed.includes(workspaceBefore.id), "the first window's repository must survive the second window's switch");
+
+  // The second window moves on again; nothing else holds the first temporary
+  // repository, so it and everything derived from it are dropped.
+  await secondWindow.evaluate((source) => window.trace.openRepository({ source }), secondSwitch);
+  const afterSecondSwitch = await page.evaluate(() => window.trace.windowState());
+  assert.equal(afterSecondSwitch.indexed.includes(alpha.repository.id), false, "the repository the window left was not forgotten");
+  assert.equal(afterSecondSwitch.indexed.length, 2);
+  assert.ok(afterSecondSwitch.indexed.includes(workspaceBefore.id));
+
+  // Closing the second window releases what only it was holding, and touches
+  // nothing the first window still needs.
+  await secondWindow.close();
+  await page.waitForTimeout(700);
+  const afterClose = await page.evaluate(() => window.trace.windowState());
+  assert.equal(afterClose.windows, 1);
+  assert.deepEqual(afterClose.indexed, [workspaceBefore.id], `closing a window disturbed the survivor: ${JSON.stringify(afterClose.indexed)}`);
+  assert.equal(afterClose.byWindow.length, 1);
+  assert.equal(await page.evaluate(() => Boolean(window.traceWorkspace?.repository)), true, "the surviving window lost its workspace");
+  const lifecycleReport = {
+    windowsOpened: opened.windows,
+    sharedIndexAcrossWindows: twoWindows.indexed.length === 1,
+    deepLinkFile: routed.intent.file,
+    deepLinkRefusals: [hostile.reason, unknownRepository.reason],
+    cachesBefore: populated,
+    indexedWhileBothOpen: afterSwitch.indexed.length,
+    forgotOnSwitch: !afterSecondSwitch.indexed.includes(alpha.repository.id),
+    indexedAfterClose: afterClose.indexed.length,
+  };
+  await rm(firstSwitch, { recursive: true, force: true });
+  await rm(secondSwitch, { recursive: true, force: true });
+
   // Item 50: the file tree over a 2,196-file repository. Before this item it
   // rendered the first 180 files and told the learner to refine their search,
   // which meant 2,016 files could not be opened at all.
@@ -1847,6 +1941,7 @@ try {
     accessibility: accessibilityAudits,
     display: themeReport,
     virtualization: virtualReport,
+    lifecycle: lifecycleReport,
     archive: archiveReport,
     coursePackage: { format: coursePackage.format, commit: (coursePackage.provenance.commit ?? "").slice(0, 8), anchors: coursePackage.integrity.anchorCount, license: coursePackage.license.id, policy: coursePackage.license.policy, embeddedFiles: packageAudit.requested.integrity.excerptCount, roundTrip: packageAudit.roundTrip.verification.verdict, foreign: packageAudit.foreign.verification.verdict },
     goals: Object.fromEntries(goalIds.map((goal) => [goal, { top: rankings[goal][0], targets: rankings[goal].length, topReasons: goalAudit.plans[goal].targets[0].reasons.map((reason) => reason.detail) }])),

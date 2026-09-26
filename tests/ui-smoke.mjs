@@ -753,6 +753,26 @@ try {
     assert.ok((region.top ?? -1) >= 0 && (region.bottom ?? Infinity) <= fit.viewport.height + 1, `${region.selector} clips vertically`);
   }
 
+  // Item 52: the browser refuses exactly the links the desktop app refuses,
+  // because both run the same parser.
+  const linkVerdicts = await page.evaluate(async () => {
+    const shell = await import("/src/shell.tsx");
+    const cases = [
+      "trace://open?repo=featured-nano-vllm&file=nanovllm/engine/scheduler.py&line=22",
+      "trace://open?repo=featured-nano-vllm&file=../../../etc/passwd",
+      "trace://open?repo=/somewhere/else",
+      "javascript:alert(1)",
+      "trace://open?repo=featured-nano-vllm&exec=rm",
+    ];
+    const results = [];
+    for (const url of cases) results.push(await shell.bridge.openDeepLink(url));
+    return results;
+  });
+  assert.equal(linkVerdicts[0].valid, true, linkVerdicts[0].detail);
+  assert.equal(linkVerdicts[0].intent.line, 22);
+  assert.deepEqual(linkVerdicts.slice(1).map((verdict) => verdict.reason), ["unsafe-path", "unknown-repository", "wrong-scheme", "unknown-parameter"]);
+  assert.ok(linkVerdicts.slice(1).every((verdict) => verdict.detail && verdict.intent === null));
+
   // Item 50: the file tree is windowed. The fixture is small, so the property
   // proved here is the one the arithmetic promises — the container is as tall as
   // the whole list and every file is in it — while the Electron run proves the
