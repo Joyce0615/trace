@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Icon, VirtualList, bridge, readableError, repositoryRef, useLoadOnce } from "./shell";
+import { Icon, bridge, readableError, repositoryRef, useLoadOnce } from "./shell";
 import { cullGraph, describeCulling } from "../electron/virtualization.mjs";
 
 /**
@@ -866,12 +866,11 @@ export function MigrationPanel({ repository, course, state, onState, onCourse, o
  * archive that is only anchors is not offline, and saying "exported" without
  * saying that would be a lie the learner discovers on a plane.
  */
-export function ArchivePanel({ repository, course, skillGraph, learnerState, notes, state, onState, onLearnerState, onNotes }: {
+export function ArchivePanel({ repository, course, skillGraph, learnerState, state, onState, onLearnerState, onNotes }: {
   repository: Repository;
   course: Course | null;
   skillGraph: SkillGraph | null;
   learnerState: LearnerState | null;
-  notes: LearnerNote[];
   state: ArchiveState;
   onState: (update: Partial<ArchiveState>) => void;
   onLearnerState: (state: LearnerState) => void;

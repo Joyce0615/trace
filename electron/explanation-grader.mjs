@@ -128,7 +128,7 @@ export function checkCitations(text, repository) {
  * executed in, the values they returned, and whether anything raised. It never
  * leaves the main process before the learner has answered.
  */
-export function buildExplanationTask(repository, summary, options = {}) {
+export function buildExplanationTask(repository, summary) {
   // Importing a module executes its body, which the tracer records as
   // `<module>`, and comprehensions and lambdas get synthetic names too. None of
   // those are things a learner can be asked to name, so they are not part of

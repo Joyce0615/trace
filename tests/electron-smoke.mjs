@@ -1440,7 +1440,14 @@ try {
   // Transfer distinguishes the file that was read from the one that was not.
   assert.ok(analytics.transfer.studiedFiles > 0, String(analytics.transfer.studiedFiles));
   assert.ok(analytics.transfer.activities >= 4, String(analytics.transfer.activities));
-  assert.ok(analytics.transfer.near.samples + analytics.transfer.far.samples === analytics.transfer.activities - analytics.transfer.byKind.reduce((sum, entry) => sum, 0) || true);
+  // Near and far partition the *anchored* activities. An exercise with no file
+  // to compare against is neither, and must not be counted as either — which is
+  // why the two never add up to more than the total.
+  assert.ok(
+    analytics.transfer.near.samples + analytics.transfer.far.samples <= analytics.transfer.activities,
+    JSON.stringify({ near: analytics.transfer.near.samples, far: analytics.transfer.far.samples, activities: analytics.transfer.activities }),
+  );
+  assert.ok(analytics.transfer.far.samples >= 1, "no activity landed on unstudied ground, so the split proves nothing");
   assert.ok(analytics.transfer.near.samples >= 1, `the file read before answering should count as near: ${JSON.stringify(analytics.transfer.near)}`);
   // Hint dependence sees the rungs taken above, with the penalty they carried.
   assert.ok(analytics.hints.attempts >= 4, String(analytics.hints.attempts));

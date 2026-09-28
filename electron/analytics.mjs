@@ -255,7 +255,7 @@ export function timeOnTaskAnalytics(events, options = {}) {
  * The trend matters more than the level: needing hints on a hard new area is
  * fine, still needing them on the same material after several attempts is not.
  */
-export function hintAnalytics(events, options = {}) {
+export function hintAnalytics(events) {
   const ordered = normalizeEvents(events);
   const attempts = ordered.filter((event) => GRADED_KINDS.has(event.kind));
   const hinted = attempts.filter((event) => (event.hints ?? 0) > 0);

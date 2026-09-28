@@ -56,7 +56,7 @@ function section(kind, title, reason, content, priority, source, cached = false)
 }
 
 export function answerFromLocalIndex(repository, question) {
-  const lookup = question.match(/(?:where is|where's|definition of|defined)\s+[`'“\"]?([A-Za-z_$][\w$]*)/i);
+  const lookup = question.match(/(?:where is|where's|definition of|defined)\s+[`'“"]?([A-Za-z_$][\w$]*)/i);
   if (lookup) {
     const matches = repository.symbols.filter((symbol) => symbol.name.toLowerCase() === lookup[1].toLowerCase()).slice(0, 5);
     if (matches.length) {

@@ -140,6 +140,10 @@ export function scrollToIndex({ index, itemHeight, scrollTop = 0, viewportHeight
   const clampedIndex = Math.max(0, Math.min(index, Math.max(0, (total ?? 0) - 1)));
   const rowTop = clampedIndex * height;
   const rowBottom = rowTop + height;
+  // A row taller than the viewport cannot be shown whole. Found by the property
+  // test: scrolling its *bottom* into view hides the top, which is the half
+  // somebody reading it needs first.
+  if (height >= viewportHeight) return rowTop;
   if (rowTop < scrollTop) return rowTop;
   if (rowBottom > scrollTop + viewportHeight) return rowBottom - viewportHeight;
   return scrollTop;

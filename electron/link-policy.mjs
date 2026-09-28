@@ -54,6 +54,8 @@ export function classifyExternalLink(candidate, options = {}) {
 
   if (!raw) return { decision: "block", reason: "empty-url", url: null, host: null };
   if (raw.length > MAX_LINK_LENGTH) return { decision: "block", reason: "url-too-long", url: null, host: null };
+  // Matching control characters is the point of this check.
+  // eslint-disable-next-line no-control-regex
   if (/[\u0000-\u001f\u007f]/.test(raw)) return { decision: "block", reason: "control-characters", url: null, host: null };
 
   const scheme = raw.slice(0, raw.indexOf(":") + 1).toLowerCase();

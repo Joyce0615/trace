@@ -459,10 +459,6 @@ export async function analyzeFile(rootPath, file) {
   return result;
 }
 
-async function extractSymbols(rootPath, file) {
-  return (await analyzeFile(rootPath, file)).symbols;
-}
-
 export async function inspectRepository(input, repositoriesDirectory, options = {}) {
   const limits = resolveLimits(options.limits);
   const signal = options.signal ?? null;

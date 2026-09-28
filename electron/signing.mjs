@@ -142,7 +142,9 @@ export function verifyPayload(subject, payload, signature, options = {}) {
  * content — is covered, so changing any of it breaks the seal.
  */
 export function packagePayload(packaged) {
-  const { signature, anchorSignature, ...rest } = packaged ?? {};
+  // Both seals are attached after the payload is built, so neither can be
+  // inside the bytes it certifies.
+  const { signature: _signature, anchorSignature: _anchorSignature, ...rest } = packaged ?? {};
   return rest;
 }
 

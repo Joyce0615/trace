@@ -348,7 +348,6 @@ function CourseSidebar({ course, skillGraph, knowledgeGraph, learnerState, activ
   canEnhance: boolean;
 }) {
   const [view, setView] = useState<"tree" | "outline">("tree");
-  const lessons = flattenLessons(course);
   const mastered = skillGraph.nodes.filter((node) => learnerState.mastery[node.id]?.status === "mastered").length;
   const percent = Math.round((mastered / Math.max(1, skillGraph.nodes.length)) * 100);
 
@@ -577,7 +576,7 @@ function LessonCanvas({ lesson, diagramOnly, onAnchor }: { lesson: Lesson; diagr
   </div>;
 }
 
-function CodeWorkspace({ repository, lesson, currentFile, content, line, workspaceMode, fontBoost, trail, chainState, onChainState, localizationState, onLocalizationState, reviewState, onReviewState, traceState, onTraceState, architectureState, onArchitectureState, historyState, onHistoryState, onHistoryLesson, evidenceState, onEvidenceState, skillGraph, course, evaluationState, onEvaluationState, learnerState, onLearnerState, diagnosisState, onDiagnosisState, scheduleState, onScheduleState, executableQuizState, onExecutableQuizState, explanationState, onExplanationState, activityState, onActivityState, analyticsState, onAnalyticsState, experimentState, onExperimentState, goalState, onGoalState, sharingState, onSharingState, migrationState, onMigrationState, archiveState, onArchiveState, notesById, notesList, onNote, onNotes, onCourse, onOpen, onSelection, onWorkspaceMode, resolution, resolutionBusy, onResolve }: {
+function CodeWorkspace({ repository, lesson, currentFile, content, line, workspaceMode, fontBoost, trail, chainState, onChainState, localizationState, onLocalizationState, reviewState, onReviewState, traceState, onTraceState, architectureState, onArchitectureState, historyState, onHistoryState, onHistoryLesson, evidenceState, onEvidenceState, skillGraph, course, evaluationState, onEvaluationState, learnerState, onLearnerState, diagnosisState, onDiagnosisState, scheduleState, onScheduleState, executableQuizState, onExecutableQuizState, explanationState, onExplanationState, activityState, onActivityState, analyticsState, onAnalyticsState, experimentState, onExperimentState, goalState, onGoalState, sharingState, onSharingState, migrationState, onMigrationState, archiveState, onArchiveState, notesById, onNote, onNotes, onCourse, onOpen, onSelection, onWorkspaceMode, resolution, resolutionBusy, onResolve }: {
   repository: Repository;
   lesson: Lesson;
   currentFile: RepoFile | null;
@@ -630,7 +629,6 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
   archiveState: ArchiveState;
   onArchiveState: (update: Partial<ArchiveState>) => void;
   notesById: Record<string, string>;
-  notesList: LearnerNote[];
   onNote: (noteId: string, lessonId: string, text: string) => void;
   onNotes: (notes: LearnerNote[]) => void;
   onCourse: (course: Course) => void;
@@ -647,10 +645,13 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
   // Hybrid search runs in the main process; short queries stay a local filter.
   useEffect(() => {
     const trimmed = query.trim();
-    if (trimmed.length < 3) { setSearchResults(null); return; }
     let active = true;
-    setSearchBusy(true);
+    // Both branches go through the timer, so the effect body itself never sets
+    // state: a short query clears the results on the same tick a long one would
+    // have started a search, which also debounces the clear.
     const timer = window.setTimeout(() => {
+      if (trimmed.length < 3) { if (active) { setSearchResults(null); setSearchBusy(false); } return; }
+      setSearchBusy(true);
       void bridge.search({ repository: repositoryRef(repository), query: trimmed, limit: 8 })
         .then((response) => { if (active) setSearchResults(response); })
         .catch(() => { if (active) setSearchResults(null); })
@@ -848,7 +849,6 @@ function CodeWorkspace({ repository, lesson, currentFile, content, line, workspa
             course={course}
             skillGraph={skillGraph}
             learnerState={learnerState}
-            notes={notesList}
             state={archiveState}
             onState={onArchiveState}
             onLearnerState={onLearnerState}
@@ -972,10 +972,9 @@ function LearningGuide({ stage, nextSkill, onStage, onWorkspaceMode, onMode, onD
   </details>;
 }
 
-function TutorPanel({ repository, lesson, skill, nextSkill, learnerState, provider, agents, mode, messages, askMessages, busy, currentFile, selection, guideStage, onGuideStage, onWorkspaceMode, onNextSkill, onProvider, onMode, onAsk, onSaveMemory, onQuizEvidence, onDone, complete, practiceSession, practiceReport, practiceBusy, onCreatePractice, onInspectPractice, onOpenPractice, onRemovePractice }: {
+function TutorPanel({ repository, lesson, nextSkill, learnerState, provider, agents, mode, messages, askMessages, busy, currentFile, selection, guideStage, onGuideStage, onWorkspaceMode, onNextSkill, onProvider, onMode, onAsk, onSaveMemory, onQuizEvidence, onDone, complete, practiceSession, practiceReport, practiceBusy, onCreatePractice, onInspectPractice, onOpenPractice, onRemovePractice }: {
   repository: Repository;
   lesson: Lesson;
-  skill?: SkillNode;
   nextSkill?: SkillNode;
   learnerState: LearnerState;
   provider: "codex" | "claude";
@@ -1015,9 +1014,14 @@ function TutorPanel({ repository, lesson, skill, nextSkill, learnerState, provid
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
   }, [activeMessages, busy]);
-  useEffect(() => {
+  // The hint is per lesson, so it resets when the lesson does. Keyed on the
+  // lesson id during render rather than in an effect, which would show the
+  // previous lesson's revealed hint for one frame.
+  const [hintLesson, setHintLesson] = useState(lesson.id);
+  if (hintLesson !== lesson.id) {
+    setHintLesson(lesson.id);
     setShowHint(false);
-  }, [lesson.id]);
+  }
   const submit = (event: FormEvent) => {
     event.preventDefault();
     if (!question.trim() || busy) return;
@@ -1560,8 +1564,8 @@ export default function App() {
       </header>
       <div className="workspace-grid" id="workspace-main" tabIndex={-1}>
         <CourseSidebar course={course} skillGraph={skillGraph} knowledgeGraph={knowledgeGraph} learnerState={learnerState} activeSkill={activeSkill} selectedLesson={selectedLesson} completed={completed} onSelect={selectLesson} onSelectSkill={selectSkill} onFamiliar={(node) => setLearnerState(addEvidence(learnerState, skillGraph, node.id, { kind: "self-report", strength: 0.62, detail: `Marked familiar: ${node.title}` }))} onChallenge={(node) => { const lesson = flattenLessons(course).find((item) => item.id === node.lessonId); if (lesson) void selectLesson(lesson).then(() => setMode("quiz")); }} onToggleComplete={toggleComplete} onEnhance={enhanceCourse} enhancing={courseBusy} enhanceElapsed={courseElapsed} provider={provider} canEnhance={agents[provider].available} />
-        <CodeWorkspace repository={repository} lesson={selectedLesson} currentFile={currentFile} content={content} line={line} workspaceMode={workspaceMode} fontBoost={fontBoosts[fontScale]} trail={inspectionTrail} chainState={chainState} onChainState={updateChainState} localizationState={localizationState} onLocalizationState={updateLocalizationState} reviewState={reviewState} onReviewState={updateReviewState} traceState={traceState} onTraceState={updateTraceState} architectureState={architectureState} onArchitectureState={updateArchitectureState} historyState={historyState} onHistoryState={updateHistoryState} onHistoryLesson={selectLesson} evidenceState={evidenceState} onEvidenceState={updateEvidenceState} skillGraph={skillGraph} course={course} evaluationState={evaluationState} onEvaluationState={updateEvaluationState} learnerState={learnerState} onLearnerState={setLearnerState} diagnosisState={diagnosisState} onDiagnosisState={updateDiagnosisState} scheduleState={scheduleState} onScheduleState={updateScheduleState} executableQuizState={executableQuizState} onExecutableQuizState={updateExecutableQuizState} explanationState={explanationState} onExplanationState={updateExplanationState} activityState={activityState} onActivityState={updateActivityState} analyticsState={analyticsState} onAnalyticsState={updateAnalyticsState} experimentState={experimentState} onExperimentState={updateExperimentState} goalState={goalState} onGoalState={updateGoalState} sharingState={sharingState} onSharingState={updateSharingState} migrationState={migrationState} onMigrationState={updateMigrationState} archiveState={archiveState} onArchiveState={updateArchiveState} notesById={notesById} notesList={notes} onNote={saveNote} onNotes={setNotes} onCourse={setCourse} onOpen={openFile} onSelection={setSelection} onWorkspaceMode={changeWorkspaceMode} resolution={resolution} resolutionBusy={resolutionBusy} onResolve={resolveAtCursor} />
-        <TutorPanel repository={repository} lesson={selectedLesson} skill={activeSkill} nextSkill={nextSkill} learnerState={learnerState} provider={provider} agents={agents} mode={mode} messages={messages} askMessages={askMessages} busy={agentBusy} currentFile={currentFile} selection={selection} guideStage={guideStage} onGuideStage={updateGuideStage} onWorkspaceMode={changeWorkspaceMode} onNextSkill={selectSkill} onProvider={setProvider} onMode={setMode} onAsk={ask} onSaveMemory={saveMemory} onQuizEvidence={() => updateEvidence("quiz", 0.55, `Submitted quiz answer for ${selectedLesson.title}`)} onDone={() => toggleComplete(selectedLesson)} complete={completed.has(selectedLesson.id)} practiceSession={practiceSession} practiceReport={practiceReport} practiceBusy={practiceBusy} onCreatePractice={createPractice} onInspectPractice={inspectPractice} onOpenPractice={() => { if (practiceSession) void bridge.openPractice(practiceSession.id); }} onRemovePractice={removePractice} />
+        <CodeWorkspace repository={repository} lesson={selectedLesson} currentFile={currentFile} content={content} line={line} workspaceMode={workspaceMode} fontBoost={fontBoosts[fontScale]} trail={inspectionTrail} chainState={chainState} onChainState={updateChainState} localizationState={localizationState} onLocalizationState={updateLocalizationState} reviewState={reviewState} onReviewState={updateReviewState} traceState={traceState} onTraceState={updateTraceState} architectureState={architectureState} onArchitectureState={updateArchitectureState} historyState={historyState} onHistoryState={updateHistoryState} onHistoryLesson={selectLesson} evidenceState={evidenceState} onEvidenceState={updateEvidenceState} skillGraph={skillGraph} course={course} evaluationState={evaluationState} onEvaluationState={updateEvaluationState} learnerState={learnerState} onLearnerState={setLearnerState} diagnosisState={diagnosisState} onDiagnosisState={updateDiagnosisState} scheduleState={scheduleState} onScheduleState={updateScheduleState} executableQuizState={executableQuizState} onExecutableQuizState={updateExecutableQuizState} explanationState={explanationState} onExplanationState={updateExplanationState} activityState={activityState} onActivityState={updateActivityState} analyticsState={analyticsState} onAnalyticsState={updateAnalyticsState} experimentState={experimentState} onExperimentState={updateExperimentState} goalState={goalState} onGoalState={updateGoalState} sharingState={sharingState} onSharingState={updateSharingState} migrationState={migrationState} onMigrationState={updateMigrationState} archiveState={archiveState} onArchiveState={updateArchiveState} notesById={notesById} onNote={saveNote} onNotes={setNotes} onCourse={setCourse} onOpen={openFile} onSelection={setSelection} onWorkspaceMode={changeWorkspaceMode} resolution={resolution} resolutionBusy={resolutionBusy} onResolve={resolveAtCursor} />
+        <TutorPanel repository={repository} lesson={selectedLesson} nextSkill={nextSkill} learnerState={learnerState} provider={provider} agents={agents} mode={mode} messages={messages} askMessages={askMessages} busy={agentBusy} currentFile={currentFile} selection={selection} guideStage={guideStage} onGuideStage={updateGuideStage} onWorkspaceMode={changeWorkspaceMode} onNextSkill={selectSkill} onProvider={setProvider} onMode={setMode} onAsk={ask} onSaveMemory={saveMemory} onQuizEvidence={() => updateEvidence("quiz", 0.55, `Submitted quiz answer for ${selectedLesson.title}`)} onDone={() => toggleComplete(selectedLesson)} complete={completed.has(selectedLesson.id)} practiceSession={practiceSession} practiceReport={practiceReport} practiceBusy={practiceBusy} onCreatePractice={createPractice} onInspectPractice={inspectPractice} onOpenPractice={() => { if (practiceSession) void bridge.openPractice(practiceSession.id); }} onRemovePractice={removePractice} />
       </div>
       {recovery?.ready && !recovery.clean && !recoveryDismissed && <div className="recovery-banner" role="status" data-orphaned={recovery.practice?.orphaned.length ?? 0} data-interrupted={recovery.interruptedWrites?.length ?? 0} data-recovered={String(Boolean(recovery.practice?.recovered))}>
         <Icon name="target" size={14} />

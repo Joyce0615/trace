@@ -286,12 +286,17 @@ export async function resolveSymbol(rootPath, request, options = {}) {
     const position = { line: Math.max(0, (request.line ?? 1) - 1), character: Math.max(0, (request.column ?? 1) - 1) };
     const params = { textDocument: { uri }, position };
     const ask = (method) => connection.request(method, params, timeoutMs).catch(() => null);
-    let [definition, typeDefinition, implementation, hover] = await Promise.all([
+    // `definition` and `hover` are retried below, so they cannot be `const`;
+    // the other two are answered once.
+    let [definition, hover] = [null, null];
+    const [firstDefinition, typeDefinition, implementation, firstHover] = await Promise.all([
       ask("textDocument/definition"),
       ask("textDocument/typeDefinition"),
       ask("textDocument/implementation"),
       ask("textDocument/hover"),
     ]);
+    definition = firstDefinition;
+    hover = firstHover;
     // Servers such as clangd build the AST asynchronously after didOpen, so an empty
     // first answer is retried once before falling back to the static index.
     if (!locationsFrom(definition).length) {

@@ -32,6 +32,8 @@ export function looksRemote(value) {
 function rejectShellHazards(value) {
   if (value.length > MAX_URL_LENGTH) throw new RemoteSourceError(`Repository URLs are limited to ${MAX_URL_LENGTH} characters.`, "too-long");
   // Control characters and newlines can smuggle extra arguments into helpers.
+  // Matching control characters is the point of this check.
+  // eslint-disable-next-line no-control-regex
   if (/[\u0000-\u001f\u007f]/.test(value)) throw new RemoteSourceError("Repository URLs cannot contain control characters.", "control-characters");
   // A leading dash would be parsed by git as an option rather than a URL.
   if (value.startsWith("-")) throw new RemoteSourceError("Repository URLs cannot start with a dash.", "option-injection");

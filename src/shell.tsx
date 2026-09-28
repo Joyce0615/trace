@@ -111,10 +111,10 @@ export function VirtualList<Item>({ items, itemHeight, height, className, role, 
   onScrollTopChange?: (scrollTop: number) => void;
 }) {
   const [scrollTop, setScrollTop] = useState(0);
-  const [window, setWindow] = useState(() => windowFor({ total: items.length, itemHeight, scrollTop: 0, viewportHeight: height, overscan, maxRendered }));
-  useEffect(() => {
-    setWindow(windowFor({ total: items.length, itemHeight, scrollTop, viewportHeight: height, overscan, maxRendered }));
-  }, [height, itemHeight, items.length, maxRendered, overscan, scrollTop]);
+  // Derived during render rather than mirrored into state: the window is a pure
+  // function of the scroll offset and the props, and holding a second copy of it
+  // in state only creates a frame where the two disagree.
+  const window = windowFor({ total: items.length, itemHeight, scrollTop, viewportHeight: height, overscan, maxRendered });
 
   return <div
     className={`virtual-list ${className ?? ""}`.trim()}
