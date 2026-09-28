@@ -15,7 +15,10 @@
     "test:electron": "node tests/electron-smoke.mjs",
     "lint": "eslint .",
     "coverage": "node --test --experimental-test-coverage --test-coverage-exclude='tests/**' --test-coverage-exclude='src/**' --test-coverage-lines=95 --test-coverage-branches=75 --test-coverage-functions=92 tests/*.test.mjs",
-    "test:components": "node tests/component-smoke.mjs"
+    "test:components": "node tests/component-smoke.mjs",
+    "preflight": "node scripts/preflight.mjs",
+    "test:portable": "node tests/electron-portable.mjs",
+    "ci": "npm run lint && npm run build && npm run coverage && npm run test:components && npm run test:ui && npm run test:portable"
   },
   "dependencies": {
     "@monaco-editor/react": "4.7.0",

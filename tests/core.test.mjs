@@ -22,6 +22,7 @@ import { GIT_HISTORY_VERSION, busFactor, detectRenames, historyLessons, historyS
 import { MISCONCEPTIONS, MISCONCEPTION_VERSION, buildProbe, calibrateSkill, detectMisconceptions, diagnoseLearner, gradeProbe } from "../electron/misconception.mjs";
 import { SIGNING_ALGORITHM, SIGNING_VERSION, anchorPayload, assessmentPayload, canonicalize, createKeyPair, digestOf, keyIdFor, loadOrCreateKeyPair, loadTrustedKeys, packagePayload, publicIdentity, responsePayload, setKeyTrust, signPackage, signPayload, verifyPackageSignature, verifyPayload } from "../electron/signing.mjs";
 import { COURSE_PACKAGE_FORMAT, detectLicense, importCourse, packageCourse, verifyPackage } from "../electron/course-package.mjs";
+import { CAPABILITIES, createFixtureRepository } from "../scripts/preflight.mjs";
 import { DEEP_LINK_SCHEME, DEEP_LINK_VERSION, deepLinkFromArgv, formatDeepLink, isSafeRelativePath, parseDeepLink } from "../electron/deep-link.mjs";
 import { DEFAULT_WINDOW, VIRTUALIZATION_VERSION, buildHeightIndex, cullGraph, describeCulling, indexAt, scrollToIndex, variableWindowFor, windowFor } from "../electron/virtualization.mjs";
 import { CONTRAST_LEVELS, CONTRAST_TARGETS, GRAPH_CATEGORIES, THEMES, THEME_VERSION, colorDistance, contrast as contrastOf, deriveColor, hexToRgb, luminance, luminanceForContrast, normalizeDisplaySettings, paletteFor, paletteSeparation, parseHex, rgbToHex, simulateVision, withLuminance } from "../electron/theme.mjs";
@@ -5722,4 +5723,118 @@ test("a deep link is parsed as untrusted input and can only ask for what is alre
   assert.equal(deepLinkFromArgv(), null);
   assert.equal(DEEP_LINK_VERSION, 1);
   assert.equal(DEEP_LINK_SCHEME, "trace");
+});
+
+test("the suite is portable, and the CI matrix runs what it claims to", async (context) => {
+  // --- Nothing the tests need is tied to one machine ----------------------
+  // The deep desktop smoke deliberately targets a real repository, and says so
+  // with an environment variable; nothing else may hard-code a path.
+  const projectFiles = [
+    ...(await readdir(path.resolve("electron"))).map((name) => path.join("electron", name)),
+    ...(await readdir(path.resolve("src"))).map((name) => path.join("src", name)),
+    ...(await readdir(path.resolve("scripts"))).map((name) => path.join("scripts", name)),
+    ...(await readdir(path.resolve("tests"))).map((name) => path.join("tests", name)),
+  ].filter((name) => /\.(mjs|cjs|ts|tsx|d\.mts)$/.test(name));
+  // The rule is not "no absolute path appears anywhere" — invented paths are
+  // legitimate *data* for the redaction and deep-link tests. It is that nothing
+  // may **depend** on a path that happens to exist on this machine and outside
+  // this project, which is what makes a suite unrunnable elsewhere.
+  const projectRoot = path.resolve(".");
+  const absolutePath = /["'`](\/(?:Users|home|opt|srv)\/[^"'`\s]+)["'`]/g;
+  for (const file of projectFiles) {
+    const source = await readFile(path.resolve(file), "utf8");
+    const offenders = [];
+    for (const match of source.matchAll(absolutePath)) {
+      const candidate = match[1];
+      if (candidate.startsWith(projectRoot)) continue;
+      let exists = true;
+      try {
+        await access(candidate);
+      } catch {
+        exists = false;
+      }
+      // A path that exists here and nowhere guaranteed is a dependency on this
+      // machine; the deep smoke declares its one such default explicitly.
+      if (exists && !source.includes("TRACE_ELECTRON_REPO")) offenders.push(`${file}: ${candidate}`);
+    }
+    assert.deepEqual(offenders, [], `${file} depends on a path outside the project`);
+  }
+  // ...and the one file that does is explicit about it.
+  const deepSmoke = await readFile(path.resolve("tests", "electron-smoke.mjs"), "utf8");
+  assert.match(deepSmoke, /process\.env\.TRACE_ELECTRON_REPO \?\?/, "the deep smoke must let its repository be overridden");
+  // Windows uses a different separator; a joined path built from string
+  // concatenation would work on two platforms and break on the third.
+  for (const file of projectFiles.filter((name) => name.startsWith("electron"))) {
+    const source = await readFile(path.resolve(file), "utf8");
+    assert.equal(/["'`]\/tmp\//.test(source), false, `${file} assumes a POSIX temporary directory`);
+  }
+
+  // --- The fixture repository is real, and the same everywhere ------------
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-ci-"));
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  const fixture = await createFixtureRepository(path.join(workspace, "fixture"));
+  const head = (await execFileAsync("git", ["-C", fixture, "rev-parse", "HEAD"])).stdout.trim();
+  assert.match(head, /^[0-9a-f]{40}$/, "the fixture is not a git repository");
+  const commits = (await execFileAsync("git", ["-C", fixture, "rev-list", "--count", "HEAD"])).stdout.trim();
+  assert.equal(commits, "2", "history-based tests need more than one commit");
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(fixture, path.join(workspace, "clones"));
+  assert.ok(repository.files.length >= 8, `the fixture indexed only ${repository.files.length} files`);
+  assert.ok(repository.symbols.length >= 8, `the fixture yielded only ${repository.symbols.length} symbols`);
+  // Enough of the app's surface has something to work on: several languages, a
+  // recognised license, imports to resolve, and call edges to follow.
+  assert.ok(Object.keys(repository.stats.languages).length >= 3, JSON.stringify(repository.stats.languages));
+  assert.equal(detectLicense(Object.fromEntries(await Promise.all(
+    repository.files.filter((file) => /^LICEN[CS]E/i.test(file.name)).map(async (file) => [file.path, await readRepositoryFile(fixture, file.path)]),
+  ))).id, "Apache-2.0");
+  assert.ok(repository.imports.length >= 2, String(repository.imports.length));
+  assert.ok(repository.callEdges.length >= 2, String(repository.callEdges.length));
+  // Indexed paths are always repository-relative and forward-slashed, whatever
+  // the platform's separator is.
+  assert.ok(repository.files.every((file) => !file.path.includes("\\") && !path.isAbsolute(file.path)), JSON.stringify(repository.files.slice(0, 3)));
+  // The second commit moved a definition, which is what the portable desktop
+  // suite migrates across.
+  const first = (await execFileAsync("git", ["-C", fixture, "rev-list", "--max-parents=0", "HEAD"])).stdout.trim();
+  const before = await readFileAtCommit(fixture, first, "engine/runner.py");
+  const after = await readRepositoryFile(fixture, "engine/runner.py");
+  assert.equal(before.ok, true);
+  assert.notEqual(before.content, after, "the fixture's two commits are identical, so migration has nothing to follow");
+  assert.ok(after.split("\n").indexOf("def round_up(value, multiple):") > before.content.split("\n").indexOf("def round_up(value, multiple):"));
+
+  // --- Capabilities are detected rather than assumed ----------------------
+  assert.ok(CAPABILITIES.length >= 4);
+  assert.ok(CAPABILITIES.every((capability) => capability.id && capability.why && typeof capability.detect === "function"));
+  assert.deepEqual([...CAPABILITIES.map((capability) => capability.id)].sort(), ["clangd", "electron", "git", "python"]);
+  const preflight = await execFileAsync(process.execPath, [path.resolve("scripts", "preflight.mjs")]);
+  const report = JSON.parse(preflight.stdout);
+  assert.equal(report.node, process.version);
+  assert.ok(report.platform.includes(os.platform()));
+  assert.equal(report.capabilities.git.available, true, "git is required for these tests to mean anything");
+  assert.deepEqual(report.missing, []);
+  // A required capability that is absent must fail the run rather than skip it.
+  const refused = await execFileAsync(process.execPath, [path.resolve("scripts", "preflight.mjs"), "--require=git,cobol"]).catch((error) => error);
+  assert.equal(refused.code, 1, "a missing required capability did not fail the preflight");
+  assert.match(refused.stderr, /Missing required capabilities: cobol/);
+
+  // --- The workflows run what they say they run ---------------------------
+  const workflow = await readFile(path.resolve(".github", "workflows", "ci.yml"), "utf8");
+  for (const platform of ["ubuntu-latest", "macos-latest", "windows-latest"]) {
+    assert.ok(workflow.includes(platform), `the matrix does not cover ${platform}`);
+  }
+  for (const node of ["20.x", "22.x", "24.x"]) assert.ok(workflow.includes(node), `the matrix does not cover Node ${node}`);
+  // Every script the workflow invokes has to exist, or the matrix is decorative.
+  const scripts = JSON.parse(await readFile(path.resolve("package.json"), "utf8")).scripts;
+  for (const invoked of [...workflow.matchAll(/npm run ([\w:]+)/g)].map((match) => match[1])) {
+    assert.ok(scripts[invoked], `the workflow runs "npm run ${invoked}", which package.json does not define`);
+  }
+  assert.ok(workflow.includes("npm test"), "the matrix does not run the core tests");
+  assert.ok(workflow.includes("xvfb-run"), "Electron cannot start on a Linux runner without a display server");
+  assert.ok(workflow.includes("--require=git,electron"), "the matrix does not require the capabilities it depends on");
+  // The Electron matrix pins the version in package.json plus its neighbours.
+  const pinned = JSON.parse(await readFile(path.resolve("package.json"), "utf8")).devDependencies.electron;
+  assert.ok(workflow.includes(`"${pinned}"`), `the Electron matrix does not include the pinned version ${pinned}`);
+  const audit = await readFile(path.resolve(".github", "workflows", "audit.yml"), "utf8");
+  assert.match(audit, /npm audit --omit=dev/);
+  assert.match(audit, /schedule:/, "a vulnerability disclosed on Tuesday should fail the build on Tuesday");
 });

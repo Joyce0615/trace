@@ -61,7 +61,7 @@ export default typescript.config(
     },
   },
   {
-    files: ["electron/**/*.mjs", "*.mjs"],
+    files: ["electron/**/*.mjs", "scripts/**/*.mjs", "*.mjs"],
     languageOptions: {
       ecmaVersion: 2024,
       sourceType: "module",
@@ -73,6 +73,11 @@ export default typescript.config(
       "prefer-const": "error",
       "no-unused-vars": ["error", { argsIgnorePattern: "^_", varsIgnorePattern: "^_" }],
     },
+  },
+  {
+    // The preflight is a command-line tool; printing its report is its job.
+    files: ["scripts/**/*.mjs"],
+    rules: { "no-console": "off" },
   },
   {
     // Tests print their evidence and reach into internals on purpose.
