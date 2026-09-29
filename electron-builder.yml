@@ -1,0 +1,73 @@
+# Installer configuration (item 55).
+#
+# `scripts/release.mjs` builds and signs the *payload* and its update manifest —
+# the part that can be done without credentials. This file declares what turning
+# that payload into a signed, notarized installer must do, so that the steps
+# which need an Apple Developer ID, an Authenticode certificate, and Apple's
+# notary service are written down rather than improvised at release time.
+#
+# Nothing here has been executed: this build has none of those credentials, and
+# producing an unsigned artifact that *looked* signed would be worse than
+# producing none. `npm run release` reports `signedApplication: false` and
+# `notarized: false` for exactly that reason.
+
+appId: dev.trace.studio
+productName: Trace
+copyright: Trace contributors
+
+directories:
+  output: release/installers
+  buildResources: build
+
+files:
+  - dist/**/*
+  - electron/**/*
+  - package.json
+  - "!**/*.map"
+
+# The update feed the app checks. The manifest it serves is the one
+# `scripts/release.mjs` signs, and `electron/updates.mjs` refuses anything whose
+# signature is missing, untrusted, older, or for another platform.
+publish:
+  provider: generic
+  url: https://releases.example.invalid/trace
+  channel: stable
+
+mac:
+  category: public.app-category.developer-tools
+  target:
+    - target: dmg
+      arch: [arm64, x64]
+    - target: zip
+      arch: [arm64, x64]
+  # The hardened runtime is what notarization requires, and what stops a
+  # library being injected into the app at launch.
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  # Requires CSC_LINK / CSC_KEY_PASSWORD (a Developer ID Application certificate).
+  identity: null
+
+# Requires APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID.
+afterSign: build/notarize.cjs
+
+win:
+  target:
+    - target: nsis
+      arch: [x64, arm64]
+  # Requires WIN_CSC_LINK / WIN_CSC_KEY_PASSWORD (an Authenticode certificate).
+  signingHashAlgorithms: [sha256]
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+
+linux:
+  category: Development
+  target:
+    - target: AppImage
+      arch: [x64, arm64]
+    - target: deb
+      arch: [x64]

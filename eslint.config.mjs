@@ -100,7 +100,11 @@ export default typescript.config(
     rules: { "@typescript-eslint/no-unused-vars": "off" },
   },
   {
-    files: ["electron/preload.cjs"],
-    languageOptions: { sourceType: "commonjs", globals: { require: "readonly", module: "readonly" } },
+    files: ["electron/preload.cjs", "build/*.cjs"],
+    languageOptions: {
+      sourceType: "commonjs",
+      globals: { require: "readonly", module: "readonly", exports: "readonly", process: "readonly", console: "readonly" },
+    },
+    rules: { "no-console": "off" },
   },
 );

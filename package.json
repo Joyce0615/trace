@@ -18,7 +18,8 @@
     "test:components": "node tests/component-smoke.mjs",
     "preflight": "node scripts/preflight.mjs",
     "test:portable": "node tests/electron-portable.mjs",
-    "ci": "npm run lint && npm run build && npm run coverage && npm run test:components && npm run test:ui && npm run test:portable"
+    "ci": "npm run lint && npm run build && npm run coverage && npm run test:components && npm run test:ui && npm run test:portable",
+    "release": "npm run build && node scripts/release.mjs"
   },
   "dependencies": {
     "@monaco-editor/react": "4.7.0",

@@ -23,6 +23,8 @@ import { MISCONCEPTIONS, MISCONCEPTION_VERSION, buildProbe, calibrateSkill, dete
 import { SIGNING_ALGORITHM, SIGNING_VERSION, anchorPayload, assessmentPayload, canonicalize, createKeyPair, digestOf, keyIdFor, loadOrCreateKeyPair, loadTrustedKeys, packagePayload, publicIdentity, responsePayload, setKeyTrust, signPackage, signPayload, verifyPackageSignature, verifyPayload } from "../electron/signing.mjs";
 import { COURSE_PACKAGE_FORMAT, detectLicense, importCourse, packageCourse, verifyPackage } from "../electron/course-package.mjs";
 import { CAPABILITIES, createFixtureRepository } from "../scripts/preflight.mjs";
+import { buildRelease } from "../scripts/release.mjs";
+import { UPDATE_MANIFEST_VERSION, artifactDigest, buildUpdateManifest, compareVersions, describeUpdate, evaluateUpdate, signUpdateManifest } from "../electron/updates.mjs";
 import { DEEP_LINK_SCHEME, DEEP_LINK_VERSION, deepLinkFromArgv, formatDeepLink, isSafeRelativePath, parseDeepLink } from "../electron/deep-link.mjs";
 import { DEFAULT_WINDOW, VIRTUALIZATION_VERSION, buildHeightIndex, cullGraph, describeCulling, indexAt, scrollToIndex, variableWindowFor, windowFor } from "../electron/virtualization.mjs";
 import { CONTRAST_LEVELS, CONTRAST_TARGETS, GRAPH_CATEGORIES, THEMES, THEME_VERSION, colorDistance, contrast as contrastOf, deriveColor, hexToRgb, luminance, luminanceForContrast, normalizeDisplaySettings, paletteFor, paletteSeparation, parseHex, rgbToHex, simulateVision, withLuminance } from "../electron/theme.mjs";
@@ -5837,4 +5839,152 @@ test("the suite is portable, and the CI matrix runs what it claims to", async (c
   const audit = await readFile(path.resolve(".github", "workflows", "audit.yml"), "utf8");
   assert.match(audit, /npm audit --omit=dev/);
   assert.match(audit, /schedule:/, "a vulnerability disclosed on Tuesday should fail the build on Tuesday");
+});
+
+test("an update is refused unless every check passes, and a release is reproducible", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-release-"));
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+
+  // --- Version comparison is numeric, not lexical -------------------------
+  // The single most common downgrade bug: "0.9.0" > "0.10.0" as strings.
+  assert.ok(compareVersions("0.10.0", "0.9.0") > 0, "0.10.0 must be newer than 0.9.0");
+  assert.ok(compareVersions("1.0.0", "0.99.99") > 0);
+  assert.equal(compareVersions("1.2.3", "1.2.3"), 0);
+  assert.ok(compareVersions("1.2.3", "1.2.4") < 0);
+  assert.ok(compareVersions("1.0.0", "1.0.0-beta.1") > 0, "a release beats its own pre-release");
+  assert.ok(compareVersions("1.0.0-beta.1", "1.0.0-beta.2") < 0);
+  assert.ok(compareVersions("2", "1.9.9") > 0);
+
+  // --- A real signed manifest ----------------------------------------------
+  const keyPair = await loadOrCreateKeyPair(path.join(workspace, "keys"));
+  const payload = Buffer.from("the bytes that would be executed");
+  const digest = artifactDigest(payload);
+  assert.match(digest, /^sha512:[A-Za-z0-9+/=]+$/);
+  assert.equal(artifactDigest(payload), digest, "the digest is a function of the bytes");
+  assert.notEqual(artifactDigest(Buffer.concat([payload, Buffer.from("!")])), digest);
+
+  const manifest = signUpdateManifest(buildUpdateManifest({
+    releaseVersion: "0.2.0",
+    channel: "stable",
+    notes: "Adds offline export.",
+    artifacts: [
+      { platform: "darwin", arch: "arm64", target: "dmg", name: "trace-0.2.0-darwin-arm64.dmg", size: payload.length, digest },
+      { platform: "win32", arch: "x64", target: "nsis", name: "trace-0.2.0-win32-x64.exe", size: payload.length, digest },
+    ],
+  }), keyPair);
+  const trusted = [keyPair.keyId ?? publicIdentity(keyPair).keyId];
+  const current = { version: "0.1.0", platform: "darwin", arch: "arm64", channel: "stable" };
+
+  // --- The accepting case ---------------------------------------------------
+  const accepted = evaluateUpdate(manifest, current, { trustedKeyIds: trusted, downloadedBytes: payload });
+  assert.equal(accepted.acceptable, true, accepted.detail);
+  assert.equal(accepted.artifact.name, "trace-0.2.0-darwin-arm64.dmg");
+  assert.equal(accepted.verifiedBytes, true);
+  assert.equal(accepted.seal.trust, "trusted");
+  assert.match(describeUpdate(accepted), /0\.1\.0 → 0\.2\.0 for darwin\/arm64, verified/);
+  // Without the bytes it is still acceptable, and says it has not checked them.
+  assert.equal(evaluateUpdate(manifest, current, { trustedKeyIds: trusted }).verifiedBytes, false);
+
+  // --- Every refusal, and each one names itself ---------------------------
+  const refusals = [
+    ["unsigned-or-tampered", { ...manifest, signature: null }, current, { trustedKeyIds: trusted }],
+    ["unsigned-or-tampered", { ...manifest, releaseVersion: "9.9.9" }, current, { trustedKeyIds: trusted }],
+    ["untrusted-key", manifest, current, { trustedKeyIds: [] }],
+    ["already-current", manifest, { ...current, version: "0.2.0" }, { trustedKeyIds: trusted }],
+    ["downgrade", manifest, { ...current, version: "0.3.0" }, { trustedKeyIds: trusted }],
+    ["wrong-channel", manifest, { ...current, channel: "beta" }, { trustedKeyIds: trusted }],
+    ["no-artifact", manifest, { ...current, platform: "linux" }, { trustedKeyIds: trusted }],
+    ["no-artifact", manifest, { ...current, arch: "x64" }, { trustedKeyIds: trusted }],
+    ["wrong-product", { ...manifest, product: "something-else" }, current, { trustedKeyIds: trusted }],
+    ["unreadable", { format: "not-an-update" }, current, { trustedKeyIds: trusted }],
+    ["unreadable", { ...manifest, format: "trace-update-v1", version: 99 }, current, { trustedKeyIds: trusted }],
+    ["digest-mismatch", manifest, current, { trustedKeyIds: trusted, downloadedBytes: Buffer.from("something else entirely") }],
+  ];
+  for (const [reason, candidate, installation, options] of refusals) {
+    const result = evaluateUpdate(candidate, installation, options);
+    assert.equal(result.acceptable, false, `${reason} was accepted`);
+    assert.equal(result.reason, reason, `expected ${reason}, got ${result.reason}: ${result.detail}`);
+    assert.ok(result.detail && result.detail.length > 10, `${reason} was refused without an explanation`);
+    assert.equal(result.artifact, null);
+    assert.match(describeUpdate(result), /^No update: /);
+  }
+  // A downgrade is refused even though the manifest is perfectly, genuinely
+  // signed — which is the whole point: a signed old release is still an old one.
+  const downgrade = evaluateUpdate(manifest, { ...current, version: "0.3.0" }, { trustedKeyIds: trusted });
+  assert.equal(downgrade.seal.verified, true);
+  assert.equal(downgrade.seal.trust, "trusted");
+  assert.match(downgrade.detail, /a signed old release is still an old release/);
+
+  // A signature over a *different subject* cannot be lifted onto an update.
+  const lifted = { ...manifest, signature: signPayload("course-package", manifest, keyPair) };
+  assert.equal(evaluateUpdate(lifted, current, { trustedKeyIds: trusted }).reason, "unsigned-or-tampered");
+
+  // --- The upgrade path ----------------------------------------------------
+  const gated = signUpdateManifest(buildUpdateManifest({
+    releaseVersion: "0.4.0", channel: "stable", minimumFrom: "0.3.0",
+    artifacts: [{ platform: "darwin", arch: "arm64", target: "dmg", name: "x.dmg", size: payload.length, digest }],
+  }), keyPair);
+  assert.equal(evaluateUpdate(gated, current, { trustedKeyIds: trusted }).reason, "upgrade-path");
+  assert.equal(evaluateUpdate(gated, { ...current, version: "0.3.1" }, { trustedKeyIds: trusted }).acceptable, true);
+
+  // --- A real release build, twice -----------------------------------------
+  // The artifacts must be byte-identical across runs, or the digest in the
+  // manifest cannot be checked by anybody but the machine that built it.
+  const first = await buildRelease({ outputDirectory: path.join(workspace, "one"), keyDirectory: path.join(workspace, "keys") });
+  const second = await buildRelease({ outputDirectory: path.join(workspace, "two"), keyDirectory: path.join(workspace, "keys") });
+  assert.equal(first.manifest.artifacts.length, 4, "every platform and architecture must be built");
+  assert.deepEqual(
+    first.manifest.artifacts.map((artifact) => `${artifact.platform}/${artifact.arch}`).sort(),
+    ["darwin/arm64", "darwin/x64", "linux/x64", "win32/x64"],
+  );
+  for (const artifact of first.manifest.artifacts) {
+    const twin = second.manifest.artifacts.find((candidate) => candidate.name === artifact.name);
+    assert.equal(twin.digest, artifact.digest, `${artifact.name} is not reproducible`);
+    assert.equal(twin.size, artifact.size);
+    assert.ok(artifact.size > 10_000, `${artifact.name} is suspiciously small at ${artifact.size} bytes`);
+  }
+  // The artifact really is a readable archive containing a runnable app.
+  const sample = first.manifest.artifacts.find((artifact) => artifact.platform === "linux");
+  const extracted = path.join(workspace, "extracted");
+  await mkdir(extracted, { recursive: true });
+  await execFileAsync("tar", ["-xzf", path.join(first.output, sample.name), "-C", extracted]);
+  await access(path.join(extracted, "electron", "main.mjs"));
+  await access(path.join(extracted, "dist", "index.html"));
+  const packaged = JSON.parse(await readFile(path.join(extracted, "package.json"), "utf8"));
+  assert.equal(packaged.main, "electron/main.mjs");
+  // ...and the digest in the manifest is the digest of the file on disk.
+  assert.equal(artifactDigest(await readFile(path.join(first.output, sample.name))), sample.digest);
+
+  // The manifest it wrote verifies with the key it wrote alongside it.
+  const written = JSON.parse(await readFile(path.join(first.output, "latest.json"), "utf8"));
+  const identity = JSON.parse(await readFile(path.join(first.output, "public-key.json"), "utf8"));
+  assert.equal(identity.publicKey.includes("PRIVATE"), false, "a private key was written next to the release");
+  const installed = { version: "0.0.1", platform: "linux", arch: "x64", channel: "stable" };
+  assert.equal(evaluateUpdate(written, installed, { trustedKeyIds: [identity.keyId], downloadedBytes: await readFile(path.join(first.output, sample.name)) }).acceptable, true);
+  // ...and not with anybody else's.
+  assert.equal(evaluateUpdate(written, installed, { trustedKeyIds: ["some-other-key"] }).reason, "untrusted-key");
+
+  // --- The build says what it did not do ----------------------------------
+  // "Signed releases" is the kind of phrase that hides a gap, so the gap is
+  // reported by the build itself rather than left to a README.
+  assert.equal(first.signedApplication, false);
+  assert.equal(first.notarized, false);
+  assert.deepEqual(first.installers, []);
+  assert.match(first.limitation, /Apple Developer ID|Authenticode|notary/);
+
+  // --- The packaging configuration declares what it must ------------------
+  const builder = await readFile(path.resolve("electron-builder.yml"), "utf8");
+  for (const required of ["hardenedRuntime: true", "entitlements:", "afterSign:", "target: dmg", "target: nsis", "target: AppImage", "publish:"]) {
+    assert.ok(builder.includes(required), `electron-builder.yml does not declare ${required}`);
+  }
+  const entitlements = await readFile(path.resolve("build", "entitlements.mac.plist"), "utf8");
+  // The two entitlements most often pasted in to make a build "work" give away
+  // most of what the hardened runtime is for; both are explicitly false.
+  assert.match(entitlements, /disable-library-validation<\/key>\s*<false\/>/);
+  assert.match(entitlements, /allow-dyld-environment-variables<\/key>\s*<false\/>/);
+  const notarize = await readFile(path.resolve("build", "notarize.cjs"), "utf8");
+  assert.match(notarize, /APPLE_ID/);
+  assert.match(notarize, /throw new Error\(`Cannot notarize/, "a missing credential must fail rather than skip silently");
+  assert.match(notarize, /TRACE_ALLOW_UNNOTARIZED/);
+  assert.equal(UPDATE_MANIFEST_VERSION, 1);
 });
