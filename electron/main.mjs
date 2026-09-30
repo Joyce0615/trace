@@ -1,5 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { askAgent, detectAgents, generateCourseWithAgent } from "./agents.mjs";
@@ -42,6 +43,7 @@ import { loadNotes, saveNotes } from "./notes-store.mjs";
 import { applyNoteEdit } from "./notes.mjs";
 import { anchorPayload, loadOrCreateKeyPair, loadTrustedKeys, publicIdentity, responsePayload, setKeyTrust, signPackage, signPayload, verifyPackageSignature, verifyPayload } from "./signing.mjs";
 import { forgetEverything, loadExperimentState, recordObservation, setConsent } from "./experiment-store.mjs";
+import { buildSbom, publicSupplyChainReport, scanDependencies } from "./supply-chain.mjs";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const openedRepositories = new Map();
@@ -92,6 +94,9 @@ function forgetRepository(repositoryId, { keepIndex = false } = {}) {
 
 const knowledgeGraphs = new Map();
 const indexingRequests = new Map();
+// Not a repository cache: the bill of materials describes the application, not
+// anything a learner opened, so it must survive switching repositories.
+const supplyChainReports = new Map();
 const callChainSets = repositoryCache("callChainSets");
 const localizationExercises = repositoryCache("localizationExercises");
 const raceTasks = repositoryCache("raceTasks");
@@ -1221,6 +1226,40 @@ const ipcHandlers = {
   },
 
   "practice:remove": (_event, request) => removePracticeSession(request.sessionId, Boolean(request.discardChanges)),
+
+  /**
+   * What this build is made of (item 56).
+   *
+   * Two sources, in this order, and the answer says which one it used. A
+   * packaged application does not ship `package-lock.json`, so rebuilding the
+   * bill of materials from the lockfile is impossible there — but the release
+   * puts `sbom.cdx.json` *inside* the artifact precisely so the shipped copy
+   * can be read. Falling back to "unknown" rather than to an empty list is the
+   * point: an application that reported no dependencies would be describing a
+   * fact about its own packaging as a fact about its dependencies.
+   */
+  "supply-chain:report": async (_event, request) => {
+    const scope = request?.scope ?? "all";
+    const cached = supplyChainReports.get(scope);
+    if (cached) return cached;
+    const projectRoot = path.resolve(currentDirectory, "..");
+    let bom = null;
+    let source = null;
+    try {
+      bom = JSON.parse(await readFile(path.join(projectRoot, "sbom.cdx.json"), "utf8"));
+      source = "shipped";
+    } catch {
+      try {
+        bom = await buildSbom({ projectRoot });
+        source = "lockfile";
+      } catch (cause) {
+        return { available: false, source: null, reason: cause?.message ?? "No bill of materials is available in this installation." };
+      }
+    }
+    const report = { available: true, source, ...publicSupplyChainReport(bom, scanDependencies(bom, { scope })) };
+    supplyChainReports.set(scope, report);
+    return report;
+  },
 
   "window:new": async (_event) => {
     const created = createWindow();

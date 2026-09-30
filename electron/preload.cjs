@@ -43,6 +43,7 @@ contextBridge.exposeInMainWorld("trace", {
   importCourse: (request) => ipcRenderer.invoke("course:import", request),
   migrateCourse: (request) => ipcRenderer.invoke("course:migrate", request),
   revertCourseMigration: (request) => ipcRenderer.invoke("course:revert-migration", request),
+  supplyChain: (request) => ipcRenderer.invoke("supply-chain:report", request ?? {}),
   newWindow: () => ipcRenderer.invoke("window:new", {}),
   windowState: () => ipcRenderer.invoke("window:state", {}),
   openDeepLink: (url) => ipcRenderer.invoke("deep-link:open", { url }),

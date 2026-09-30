@@ -357,6 +357,9 @@ export const IPC_SCHEMAS = {
     course: s.opaque(),
     migrationId: s.string({ maxLength: 160, optional: true, nullable: true }),
   }),
+  // Item 56: what this build is made of. No repository reference, because the
+  // answer is a property of the application rather than of anything opened.
+  "supply-chain:report": s.object({ scope: s.literal(["all", "runtime"], { optional: true }) }),
   "window:new": s.object({}),
   "window:state": s.object({}),
   "deep-link:open": s.object({ url: s.string({ maxLength: 2_048, minLength: 1 }) }),

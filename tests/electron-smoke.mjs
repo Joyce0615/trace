@@ -1920,6 +1920,50 @@ try {
   // Nothing anywhere in the shell steals the tab order with a positive tabindex.
   assert.equal(await page.evaluate(() => document.querySelectorAll('[tabindex]:not([tabindex="0"]):not([tabindex="-1"])').length), 0);
 
+  /*
+   * Item 56: the running application can say what it is made of, through the
+   * same validated IPC boundary as everything else. Building the bill of
+   * materials in a unit test proves the module; asking the live main process
+   * proves the channel, the schema, and — the part that only shows up here —
+   * that no install path from the build machine crosses into the renderer.
+   */
+  const supplyChain = await page.evaluate(async () => {
+    const all = await window.trace.supplyChain({});
+    const runtime = await window.trace.supplyChain({ scope: "runtime" });
+    let rejected = null;
+    try {
+      await window.trace.supplyChain({ scope: "everything" });
+    } catch (error) {
+      rejected = error.message;
+    }
+    return { all, runtime, rejected, text: JSON.stringify(all) };
+  });
+  assert.equal(supplyChain.all.available, true, JSON.stringify(supplyChain.all).slice(0, 400));
+  assert.equal(supplyChain.all.source, "lockfile");
+  assert.equal(supplyChain.all.format, "CycloneDX 1.5");
+  assert.match(supplyChain.all.digest, /^sha256:[0-9a-f]{64}$/);
+  assert.ok(supplyChain.all.counts.total > 100, String(supplyChain.all.counts.total));
+  assert.equal(supplyChain.all.counts.runtime + supplyChain.all.counts.development, supplyChain.all.counts.total);
+  assert.ok(supplyChain.all.licenses.some((entry) => entry.license === "MIT"));
+  // The renderer is told plainly that the vulnerability half did not run,
+  // rather than being handed an empty list it would read as "clean".
+  assert.equal(supplyChain.all.scan.vulnerabilities, null);
+  assert.equal(supplyChain.all.scan.advisoryFeed.available, false);
+  assert.match(supplyChain.all.scan.summary, /Known vulnerabilities were NOT checked/);
+  assert.equal(supplyChain.runtime.counts.total, supplyChain.all.counts.total);
+  assert.ok(supplyChain.runtime.scan.findings.length < supplyChain.all.scan.findings.length);
+  assert.match(supplyChain.rejected ?? "", /must be one of all, runtime/, String(supplyChain.rejected));
+  assert.equal(supplyChain.text.includes("node_modules/"), false, "an install path from the build machine reached the renderer");
+  assert.equal(supplyChain.text.includes(os.homedir()), false, "a build-machine home directory reached the renderer");
+  const supplyChainReport = {
+    source: supplyChain.all.source,
+    components: supplyChain.all.counts.total,
+    runtime: supplyChain.all.counts.runtime,
+    topLicense: supplyChain.all.licenses[0],
+    bySeverity: supplyChain.all.scan.bySeverity,
+    advisoryFeedAvailable: supplyChain.all.scan.advisoryFeed.available,
+  };
+
   const overflow = await page.evaluate(() => ({
     x: document.documentElement.scrollWidth > document.documentElement.clientWidth,
     y: document.documentElement.scrollHeight > document.documentElement.clientHeight,
@@ -1960,6 +2004,7 @@ try {
     executableQuiz: { entry: quizAudit.quiz.entry, anchor: `${quizAudit.quiz.anchor.path}:${quizAudit.quiz.anchor.line}`, hiddenCases: quizAudit.quiz.hiddenCases.length, buildMs: Math.round(quizAudit.buildMs), constantScore: `${quizAudit.constant.passedCases}/${quizAudit.constant.totalCases}`, enforced: quizAudit.constant.enforced, loopingStatus: quizAudit.looping.status },
     schedule: { skills: schedulePlan.summary.skills, due: schedulePlan.summary.due, stale: schedulePlan.summary.stale, meanRetention: schedulePlan.summary.meanRetention, recordedMastery: schedulePlan.summary.recordedMastery, retainedMastery: schedulePlan.summary.retainedMastery, grantedIntervalDays: scheduleAudit.recorded.review.intervalDays },
     executionTrace: { runtime: traceAudit.runtimes.python.version, calls: traceAudit.ran.summary.callCount, transitions: traceAudit.ran.summary.transitions.length, confirmed: traceAudit.ran.summary.confirmedStaticEdges, dynamicOnly: traceAudit.ran.summary.dynamicOnlyEdges },
+    supplyChain: supplyChainReport,
   }, null, 2));
 } finally {
   await electronApp.close();

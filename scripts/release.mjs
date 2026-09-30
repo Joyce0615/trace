@@ -3,6 +3,7 @@ import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { artifactDigest, buildUpdateManifest, signUpdateManifest } from "../electron/updates.mjs";
 import { loadOrCreateKeyPair, publicIdentity } from "../electron/signing.mjs";
+import { BUILD_TYPE, buildProvenance, buildSbom, describeScan, sbomDigest, scanDependencies, signProvenance } from "../electron/supply-chain.mjs";
 
 /**
  * Build the release payload and its signed update manifest (item 55).
@@ -121,15 +122,20 @@ async function collect(projectRoot) {
   return entries.sort((left, right) => left.name.localeCompare(right.name));
 }
 
-async function packageTarget(projectRoot, outputDirectory, version, target) {
+async function packageTarget(projectRoot, outputDirectory, version, target, sbom) {
   const name = `trace-${version}-${target.platform}-${target.arch}.tar.gz`;
   const destination = path.join(outputDirectory, name);
   const entries = await collect(projectRoot);
+  // The bill of materials travels *inside* the artifact (item 56). An SBOM kept
+  // only on the build server describes something the person holding the file
+  // cannot check; one shipped alongside the bytes it describes can be compared
+  // with what is actually there.
+  entries.push({ name: "sbom.cdx.json", body: Buffer.from(`${JSON.stringify(sbom, null, 2)}\n`) });
   entries.push({
     name: "BUILD_INFO.json",
     // Deliberately no timestamp: a build stamp makes every artifact unique and
     // destroys the only property that makes a digest worth comparing.
-    body: Buffer.from(`${JSON.stringify({ version, platform: target.platform, arch: target.arch, target: target.target, files: entries.length }, null, 2)}\n`),
+    body: Buffer.from(`${JSON.stringify({ version, platform: target.platform, arch: target.arch, target: target.target, files: entries.length, sbomDigest: sbomDigest(sbom) }, null, 2)}\n`),
   });
   entries.sort((left, right) => left.name.localeCompare(right.name));
   const archive = gzipSync(tarball(entries), { level: 9 });
@@ -143,26 +149,59 @@ async function packageTarget(projectRoot, outputDirectory, version, target) {
   };
 }
 
-export async function buildRelease({ projectRoot = path.resolve("."), outputDirectory, channel = "stable", notes = "", minimumFrom = null, keyDirectory } = {}) {
+export async function buildRelease({ projectRoot = path.resolve("."), outputDirectory, channel = "stable", notes = "", minimumFrom = null, keyDirectory, advisories = null } = {}) {
   const manifestPackage = JSON.parse(await readFile(path.join(projectRoot, "package.json"), "utf8"));
   const version = manifestPackage.version;
   const output = outputDirectory ?? path.join(projectRoot, "release");
   await mkdir(output, { recursive: true });
 
+  // Built once and shared by every target, so all four artifacts attest to the
+  // same materials rather than to four separate readings of the tree.
+  const sbom = await buildSbom({ projectRoot });
+  const scan = scanDependencies(sbom, { advisories });
+
   const artifacts = [];
-  for (const target of TARGETS) artifacts.push(await packageTarget(projectRoot, output, version, target));
+  for (const target of TARGETS) artifacts.push(await packageTarget(projectRoot, output, version, target, sbom));
 
   const manifest = buildUpdateManifest({ product: "trace", releaseVersion: version, channel, notes, minimumFrom, artifacts, releasedAt: "2020-01-01T00:00:00.000Z" });
   const keyPair = await loadOrCreateKeyPair(keyDirectory ?? path.join(output, "keys"));
   const signed = signUpdateManifest(manifest, keyPair);
+
+  // The attestation cannot live inside the artifacts it is about — it names
+  // their digests — so it goes beside them, signed under its own subject.
+  const provenance = signProvenance(buildProvenance({
+    artifacts,
+    sbom,
+    builderId: `local-npm-release/${manifestPackage.name}`,
+    buildType: BUILD_TYPE,
+    invocation: {
+      source: manifestPackage.name,
+      targets: TARGETS.map((target) => `${target.platform}/${target.arch}`),
+      node: process.version,
+      // The platform is recorded because a cross-platform difference is the
+      // first thing to look at when a rebuild does not match; it is not part of
+      // the subject, so it cannot make the artifacts differ.
+      platform: `${process.platform}-${process.arch}`,
+      invocationId: null,
+    },
+    sourceDigest: sbomDigest(sbom),
+  }), keyPair);
+
   await writeFile(path.join(output, "latest.json"), JSON.stringify(signed, null, 2));
   await writeFile(path.join(output, "public-key.json"), JSON.stringify(publicIdentity(keyPair), null, 2));
+  await writeFile(path.join(output, "sbom.cdx.json"), `${JSON.stringify(sbom, null, 2)}\n`);
+  await writeFile(path.join(output, "provenance.json"), `${JSON.stringify(provenance, null, 2)}\n`);
+  await writeFile(path.join(output, "dependency-scan.json"), `${JSON.stringify(scan, null, 2)}\n`);
 
   return {
     version,
     output,
     manifest: signed,
     identity: publicIdentity(keyPair),
+    sbom,
+    provenance,
+    scan,
+    scanSummary: describeScan(scan),
     // Stated on every build so a consumer cannot mistake this for a signed,
     // notarized installer.
     signedApplication: false,
@@ -179,6 +218,9 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     output: result.output,
     artifacts: result.manifest.artifacts.map((artifact) => ({ name: artifact.name, size: artifact.size, digest: `${artifact.digest.slice(0, 24)}…` })),
     keyId: result.identity.keyId,
+    sbom: { serialNumber: result.sbom.serialNumber, digest: sbomDigest(result.sbom), components: result.sbom.components.length },
+    provenance: { subjects: result.provenance.subject.length, materials: result.provenance.predicate.buildDefinition.resolvedDependencies.length, builder: result.provenance.predicate.runDetails.builder.id },
+    scan: result.scanSummary,
     signedApplication: result.signedApplication,
     notarized: result.notarized,
     limitation: result.limitation,

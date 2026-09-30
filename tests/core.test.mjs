@@ -56,6 +56,7 @@ import { answerFromLocalIndex, buildContextPack, loadCachedResponse, saveCachedR
 import { buildSkillGraph, createLearnerState, reconcileLearnerState } from "../electron/skill-graph.mjs";
 import { loadLearnerState, loadLearnerStateReport, saveLearnerState } from "../electron/learning-store.mjs";
 import { DURABLE_VERSION, inspectDurable, readDurable, sweepInterruptedWrites, writeDurable } from "../electron/durable-store.mjs";
+import { BUILD_TYPE, DEFAULT_LICENSE_POLICY, IN_TOTO_STATEMENT_TYPE, SBOM_SPEC_VERSION, SLSA_PREDICATE_TYPE, SUPPLY_CHAIN_VERSION, buildProvenance, buildSbom, compareBuilds, describeScan, firstByteDifference, hashesFromIntegrity, importNpmAudit, licenseBreakdown, publicSupplyChainReport, purlFor, runtimeComponents, satisfiesRange, sbomDigest, scanDependencies, scanPasses, signProvenance, verifyProvenance } from "../electron/supply-chain.mjs";
 
 const execFileAsync = promisify(execFile);
 const round4 = (value) => Number(Number(value).toFixed(4));
@@ -782,7 +783,7 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
     "learning:diagnose", "learning:probe", "learning:schedule", "learning:review",
     "quiz:build", "quiz:grade", "explain:task", "explain:grade",
     "activity:build", "activity:grade", "hint:next", "analytics:report",
-    "course:package", "course:import", "course:verify-signature", "course:migrate", "course:revert-migration", "notes:list", "notes:save", "archive:export", "archive:import", "recovery:report", "practice:release", "window:new", "window:state", "deep-link:open", "deep-link:last",
+    "course:package", "course:import", "course:verify-signature", "course:migrate", "course:revert-migration", "notes:list", "notes:save", "archive:export", "archive:import", "recovery:report", "practice:release", "supply-chain:report", "window:new", "window:state", "deep-link:open", "deep-link:last",
     "signing:identity", "signing:trust", "goals:plan", "experiment:state", "experiment:consent", "experiment:forget", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
@@ -5987,4 +5988,439 @@ test("an update is refused unless every check passes, and a release is reproduci
   assert.match(notarize, /throw new Error\(`Cannot notarize/, "a missing credential must fail rather than skip silently");
   assert.match(notarize, /TRACE_ALLOW_UNNOTARIZED/);
   assert.equal(UPDATE_MANIFEST_VERSION, 1);
+});
+
+test("the bill of materials is read off the tree, the scan admits what it did not check, and provenance is refused unless every check passes", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-supply-"));
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  const projectRoot = path.resolve(".");
+
+  // --- Version ranges, because advisories are stated as ranges -------------
+  // Getting any of these wrong means either missing a vulnerable version or
+  // flagging a patched one, and both destroy trust in the scanner.
+  const ranges = [
+    ["1.2.3", "1.2.3", true], ["1.2.4", "1.2.3", false],
+    ["1.2.3", "*", true], ["1.2.3", "", true],
+    ["1.2.3", "<1.3.0", true], ["1.3.0", "<1.3.0", false], ["1.3.0", "<=1.3.0", true],
+    ["1.2.3", ">=1.0.0 <2.0.0", true], ["2.0.0", ">=1.0.0 <2.0.0", false],
+    ["1.2.3", ">=1.0.0, <2.0.0", true],
+    ["1.5.0", "1.2.3 - 2.0.0", true], ["2.0.1", "1.2.3 - 2.0.0", false], ["1.2.2", "1.2.3 - 2.0.0", false],
+    ["1.9.9", "^1.2.3", true], ["2.0.0", "^1.2.3", false], ["1.2.2", "^1.2.3", false],
+    // ^0.x is narrower than ^1.x: before 1.0.0 the minor is the breaking position.
+    ["0.2.9", "^0.2.3", true], ["0.3.0", "^0.2.3", false], ["0.0.4", "^0.0.3", false],
+    ["1.2.9", "~1.2.3", true], ["1.3.0", "~1.2.3", false],
+    ["1.2.9", "1.2.x", true], ["1.3.0", "1.2.x", false], ["1.9.0", "1.x", true], ["2.0.0", "1.x", false],
+    ["1.2.3", "<1.0.0 || >=1.2.0", true], ["1.1.0", "<1.0.0 || >=1.2.0", false],
+    // npm reads a bare partial version as a range. Treating `1.2` as `=1.2.0`
+    // would clear every patch release of a version an advisory names.
+    ["1.2.9", "1.2", true], ["1.3.0", "1.2", false], ["1.9.0", "1", true], ["2.0.0", "1", false],
+    ["not-a-version", "<9.9.9", false],
+    ["1.2.3", "not-a-range", false],
+  ];
+  for (const [version, range, expected] of ranges) {
+    assert.equal(satisfiesRange(version, range), expected, `${version} vs ${range}`);
+  }
+  // A pre-release of a vulnerable version is vulnerable, so advisory matching
+  // includes pre-releases by default — the opposite of npm's install rules.
+  assert.equal(satisfiesRange("1.4.0-rc.1", "<1.4.2"), true);
+  assert.equal(satisfiesRange("1.4.0-rc.1", "<1.4.2", { includePrerelease: false }), false);
+  assert.equal(satisfiesRange("1.4.0-rc.1", ">=1.4.0-alpha <1.4.2", { includePrerelease: false }), true);
+
+  // --- Identifiers and hashes ---------------------------------------------
+  assert.equal(purlFor("react", "19.2.8"), "pkg:npm/react@19.2.8");
+  assert.equal(purlFor("@monaco-editor/react", "4.7.0"), "pkg:npm/%40monaco-editor%2Freact@4.7.0");
+  const knownIntegrity = "sha512-" + Buffer.from("0123456789abcdef".repeat(4), "hex").toString("base64");
+  assert.deepEqual(hashesFromIntegrity(knownIntegrity), [{ alg: "SHA-512", content: "0123456789abcdef".repeat(4) }]);
+  assert.deepEqual(hashesFromIntegrity("sha1-YWJj").map((hash) => hash.alg), ["SHA-1"]);
+  assert.deepEqual(hashesFromIntegrity(""), []);
+  assert.deepEqual(hashesFromIntegrity("not-an-integrity"), []);
+
+  // --- A bill of materials for this project, from the real tree ------------
+  const bom = await buildSbom({ projectRoot });
+  const lockfile = JSON.parse(await readFile(path.join(projectRoot, "package-lock.json"), "utf8"));
+  const projectManifest = JSON.parse(await readFile(path.join(projectRoot, "package.json"), "utf8"));
+  assert.equal(bom.bomFormat, "CycloneDX");
+  assert.equal(bom.specVersion, SBOM_SPEC_VERSION);
+  assert.equal(bom.metadata.component.name, projectManifest.name);
+  assert.ok(bom.components.length > 100, `only ${bom.components.length} components were found`);
+  assert.equal(bom.components.length, Object.keys(lockfile.packages).filter((key) => key && !lockfile.packages[key].link).length);
+
+  // Real packages, at the versions the lockfile actually pins.
+  for (const name of ["react", "react-dom", "monaco-editor", "electron", "web-tree-sitter", "typescript"]) {
+    const component = bom.components.find((candidate) => candidate["bom-ref"] === `node_modules/${name}`);
+    assert.ok(component, `${name} is missing from the bill of materials`);
+    assert.equal(component.version, lockfile.packages[`node_modules/${name}`].version);
+    assert.equal(component.purl, `pkg:npm/${name}@${component.version}`);
+    assert.deepEqual(component.hashes.map((hash) => hash.alg), ["SHA-512"], `${name} has no strong integrity hash`);
+    assert.match(component.hashes[0].content, /^[0-9a-f]{128}$/);
+  }
+  // Every component carries an identifier and a hash — no placeholders.
+  for (const component of bom.components) {
+    assert.ok(component.purl.startsWith("pkg:npm/"), `${component.name} has no purl`);
+    assert.ok(component.version, `${component.name} has no version`);
+    assert.ok(component.hashes.length, `${component.name} has no integrity hash`);
+  }
+
+  // The dependency graph resolves the way npm does, so a nested duplicate is a
+  // distinct node rather than a collision.
+  const reactDom = bom.dependencies.find((entry) => entry.ref === "node_modules/react-dom");
+  assert.ok(reactDom.dependsOn.includes("node_modules/react"), reactDom.dependsOn.join(","));
+  assert.ok(reactDom.dependsOn.includes("node_modules/scheduler"));
+
+  // The strongest available cross-check: the set npm flagged as non-development
+  // must equal the set reachable from package.json's runtime dependencies.
+  // Two independent signals about the same question; if they disagree, the
+  // "what actually ships" number in the report is wrong.
+  const byRef = new Map(bom.dependencies.map((entry) => [entry.ref, entry.dependsOn]));
+  const rootRef = `${projectManifest.name}@${projectManifest.version}`;
+  const runtimeNames = new Set(Object.keys(projectManifest.dependencies ?? {}));
+  const reachable = new Set(byRef.get(rootRef).filter((ref) => runtimeNames.has(ref.replace(/^node_modules\//, ""))));
+  const queue = [...reachable];
+  while (queue.length) {
+    for (const child of byRef.get(queue.shift()) ?? []) {
+      if (!reachable.has(child)) { reachable.add(child); queue.push(child); }
+    }
+  }
+  assert.deepEqual(
+    runtimeComponents(bom).map((component) => component["bom-ref"]).sort(),
+    [...reachable].sort(),
+    "the packages npm calls non-development and the ones reachable from package.json disagree",
+  );
+  assert.ok(runtimeComponents(bom).length < bom.components.length / 4, "almost all of this tree is build-time only; if that stops being true, say so");
+
+  // --- Determinism, which is what makes an SBOM comparable ----------------
+  const again = await buildSbom({ projectRoot });
+  assert.equal(sbomDigest(again), sbomDigest(bom));
+  assert.equal(again.serialNumber, bom.serialNumber, "the serial number must be derived from the content, not generated");
+  assert.match(bom.serialNumber, /^urn:uuid:[0-9a-f-]{36}$/);
+  // No wall clock anywhere: a timestamp is the field that silently makes every
+  // CycloneDX document unique and every comparison useless.
+  const serialized = JSON.stringify(bom);
+  assert.equal(/"timestamp"/.test(serialized), false, "the bill of materials carries a timestamp");
+  assert.equal(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(serialized), false, "the bill of materials carries an ISO date");
+  assert.ok(bom.metadata.properties.some((property) => property.name === "trace:timestampOmitted"));
+
+  // --- The scan on the real tree, and what it refuses to claim -------------
+  const scan = scanDependencies(bom, {});
+  assert.equal(scan.vulnerabilities, null, "with no feed the scan must report null, never an empty list");
+  assert.equal(scan.advisoryFeed.available, false);
+  assert.match(describeScan(scan), /Known vulnerabilities were NOT checked/);
+  const gateWithoutFeed = scanPasses(scan, { failOn: "high" });
+  assert.equal(gateWithoutFeed.passed, false, "a gate must not go green because it had no database");
+  assert.equal(gateWithoutFeed.reason, "no-advisory-feed");
+  // Without that requirement the same report passes on severity alone, which
+  // is what a build with a genuinely unreachable registry needs.
+  assert.equal(scanPasses(scan, { failOn: "high", requireAdvisoryFeed: false }).passed, true, JSON.stringify(scan.bySeverity));
+  assert.equal(scan.bySeverity.critical + scan.bySeverity.high, 0, JSON.stringify(scan.findings.filter((item) => ["critical", "high"].includes(item.severity)), null, 1));
+
+  // Findings that are true of this tree right now, each checked against the
+  // lockfile rather than against the scanner's own output.
+  const idsFound = new Set(scan.findings.map((finding) => finding.id));
+  const lockDuplicates = new Map();
+  for (const [key, entry] of Object.entries(lockfile.packages)) {
+    if (!key) continue;
+    const name = key.slice(key.lastIndexOf("node_modules/") + "node_modules/".length);
+    if (!lockDuplicates.has(name)) lockDuplicates.set(name, new Set());
+    lockDuplicates.get(name).add(entry.version);
+  }
+  const expectedDuplicates = [...lockDuplicates.entries()].filter(([, versions]) => versions.size > 1).length;
+  assert.equal(scan.findings.filter((finding) => finding.id === "duplicate-versions").length, expectedDuplicates);
+  assert.ok(expectedDuplicates > 0, "this tree really does carry duplicate versions; the check must see them");
+  // Copyleft that is neither denied nor waved through: lightningcss is MPL-2.0.
+  const review = scan.findings.filter((finding) => finding.id === "license-review");
+  assert.ok(review.some((finding) => finding.component.startsWith("lightningcss@")), review.map((item) => item.component).join(","));
+  assert.ok(DEFAULT_LICENSE_POLICY.review.includes("MPL-2.0"));
+  // Prebuilt machine code that no step in this repository produced.
+  const natives = scan.findings.filter((finding) => finding.id === "prebuilt-native-binary");
+  assert.ok(natives.some((finding) => finding.component.startsWith("fsevents@")), natives.map((item) => item.component).join(","));
+  // The lockfile claims fsevents runs an install script; the installed package
+  // declares none. Believing the stale flag means auditing a script that does
+  // not exist while missing ones that do, so the disagreement is reported.
+  assert.ok(idsFound.has("stale-install-script-flag"));
+  assert.ok(scan.findings.filter((finding) => finding.id === "optional-not-installed").every((finding) => finding.severity === "info"));
+
+  // Scoping to what ships is a much smaller question than scoping to what builds.
+  const runtimeScan = scanDependencies(bom, { scope: "runtime" });
+  assert.equal(runtimeScan.components, runtimeComponents(bom).length);
+  assert.ok(runtimeScan.findings.length < scan.findings.length);
+
+  // --- A tree built to be wrong, so the checks are shown to fire -----------
+  // Everything above says this project is clean, which proves nothing about the
+  // scanner. This fixture is deliberately broken in eight distinct ways.
+  const broken = path.join(workspace, "broken");
+  await mkdir(path.join(broken, "node_modules"), { recursive: true });
+  const install = async (name, manifest) => {
+    await mkdir(path.join(broken, "node_modules", name), { recursive: true });
+    await writeFile(path.join(broken, "node_modules", name, "package.json"), JSON.stringify(manifest));
+  };
+  await writeFile(path.join(broken, "package.json"), JSON.stringify({ name: "broken", version: "1.0.0", dependencies: { good: "1.0.0" } }));
+  await writeFile(path.join(broken, "package-lock.json"), JSON.stringify({
+    name: "broken",
+    lockfileVersion: 3,
+    packages: {
+      "": { name: "broken", version: "1.0.0", dependencies: { good: "1.0.0" } },
+      "node_modules/good": { version: "1.0.0", resolved: "https://registry.npmjs.org/good/-/good-1.0.0.tgz", integrity: "sha512-YWJj", license: "MIT" },
+      "node_modules/no-integrity": { version: "2.0.0", resolved: "https://registry.npmjs.org/no-integrity/-/no-integrity-2.0.0.tgz", license: "MIT" },
+      "node_modules/weak-hash": { version: "3.0.0", resolved: "https://registry.npmjs.org/weak-hash/-/weak-hash-3.0.0.tgz", integrity: "sha1-YWJj", license: "MIT" },
+      "node_modules/elsewhere": { version: "4.0.0", resolved: "https://packages.internal.example/elsewhere.tgz", integrity: "sha512-YWJj", license: "MIT" },
+      "node_modules/copyleft": { version: "5.0.0", resolved: "https://registry.npmjs.org/copyleft/-/copyleft-5.0.0.tgz", integrity: "sha512-YWJj", license: "AGPL-3.0" },
+      "node_modules/nameless": { version: "6.0.0", resolved: "https://registry.npmjs.org/nameless/-/nameless-6.0.0.tgz", integrity: "sha512-YWJj" },
+      "node_modules/drifted": { version: "7.0.0", resolved: "https://registry.npmjs.org/drifted/-/drifted-7.0.0.tgz", integrity: "sha512-YWJj", license: "MIT" },
+      "node_modules/absent": { version: "8.0.0", resolved: "https://registry.npmjs.org/absent/-/absent-8.0.0.tgz", integrity: "sha512-YWJj", license: "MIT" },
+      "node_modules/hooked": { version: "9.0.0", resolved: "https://registry.npmjs.org/hooked/-/hooked-9.0.0.tgz", integrity: "sha512-YWJj", license: "MIT", hasInstallScript: true },
+    },
+  }));
+  for (const [name, version] of [["good", "1.0.0"], ["no-integrity", "2.0.0"], ["weak-hash", "3.0.0"], ["elsewhere", "4.0.0"], ["copyleft", "5.0.0"], ["nameless", "6.0.0"]]) {
+    await install(name, { name, version });
+  }
+  // Installed at a version the lockfile does not name: the build would attest
+  // to 7.0.0 and execute 7.0.1.
+  await install("drifted", { name: "drifted", version: "7.0.1" });
+  await install("hooked", { name: "hooked", version: "9.0.0", scripts: { postinstall: "node ./setup.js" } });
+  // `absent` is deliberately never written to disk.
+
+  const brokenBom = await buildSbom({ projectRoot: broken });
+  const brokenScan = scanDependencies(brokenBom, {});
+  const bySeverityFor = (id) => brokenScan.findings.filter((finding) => finding.id === id);
+  const expectations = [
+    ["missing-integrity", "no-integrity@2.0.0", "high"],
+    ["weak-integrity", "weak-hash@3.0.0", "moderate"],
+    ["untrusted-registry", "elsewhere@4.0.0", "high"],
+    ["license-denied", "copyleft@5.0.0", "high"],
+    ["license-unknown", "nameless@6.0.0", "moderate"],
+    ["lockfile-drift", "drifted@7.0.0", "high"],
+    ["not-installed", "absent@8.0.0", "high"],
+    ["install-script", "hooked@9.0.0", "moderate"],
+  ];
+  for (const [id, component, severity] of expectations) {
+    const found = bySeverityFor(id);
+    assert.equal(found.length, 1, `${id} fired ${found.length} times`);
+    assert.equal(found[0].component, component);
+    assert.equal(found[0].severity, severity, `${id} was rated ${found[0].severity}`);
+    assert.ok(found[0].detail.length > 20, `${id} has no explanation`);
+    assert.ok(found[0].remediation.length > 10, `${id} says nothing about what to do`);
+  }
+  assert.match(bySeverityFor("lockfile-drift")[0].detail, /attests to the lockfile and executes the disk/);
+  // The healthy package in the same tree is not flagged at all.
+  assert.equal(brokenScan.findings.filter((finding) => finding.component === "good@1.0.0").length, 0);
+  assert.equal(scanPasses(brokenScan, { failOn: "high", requireAdvisoryFeed: false }).passed, false);
+  assert.match(scanPasses(brokenScan, { failOn: "high", requireAdvisoryFeed: false }).detail, /license-denied|lockfile-drift|not-installed/);
+  // A lockfile too old to carry integrity hashes is refused rather than
+  // producing a bill of materials with nothing in it to check.
+  await writeFile(path.join(broken, "package-lock.json.v1"), JSON.stringify({ lockfileVersion: 1, packages: {} }));
+  const ancient = path.join(workspace, "ancient");
+  await mkdir(ancient, { recursive: true });
+  await writeFile(path.join(ancient, "package.json"), JSON.stringify({ name: "a", version: "1.0.0" }));
+  await writeFile(path.join(ancient, "package-lock.json"), JSON.stringify({ lockfileVersion: 1, dependencies: {} }));
+  await assert.rejects(() => buildSbom({ projectRoot: ancient }), /lockfileVersion 1/);
+  const lockless = path.join(workspace, "lockless");
+  await mkdir(lockless, { recursive: true });
+  await writeFile(path.join(lockless, "package.json"), JSON.stringify({ name: "a", version: "1.0.0" }));
+  await assert.rejects(() => buildSbom({ projectRoot: lockless }), /would describe ranges, not the versions actually installed/);
+
+  // --- An advisory feed, in the shape npm actually emits -------------------
+  const auditReport = {
+    auditReportVersion: 2,
+    vulnerabilities: {
+      "weak-hash": {
+        name: "weak-hash",
+        severity: "critical",
+        isDirect: false,
+        via: [{ source: 1088948, name: "weak-hash", dependency: "weak-hash", title: "Prototype pollution in weak-hash", url: "https://github.com/advisories/GHSA-test-test-test", severity: "critical", range: "<3.1.0" }],
+        effects: ["good"],
+        range: "<3.1.0",
+        nodes: ["node_modules/weak-hash"],
+        fixAvailable: { name: "weak-hash", version: "3.1.0", isSemVerMajor: false },
+      },
+      // A transitive entry whose `via` is a *string* pointing at the advisory
+      // above. Counting it would report the same advisory twice.
+      good: { name: "good", severity: "critical", isDirect: true, via: ["weak-hash"], effects: [], range: "*", nodes: ["node_modules/good"], fixAvailable: true },
+      copyleft: {
+        name: "copyleft",
+        severity: "low",
+        via: [{ source: 2, name: "copyleft", title: "Not applicable to this version", url: null, severity: "low", range: ">=6.0.0" }],
+        range: ">=6.0.0",
+        nodes: ["node_modules/copyleft"],
+        fixAvailable: false,
+      },
+    },
+  };
+  const feed = importNpmAudit(auditReport);
+  assert.equal(feed.source, "npm-audit");
+  assert.equal(feed.advisories.length, 2, "the string `via` must not be counted as its own advisory");
+  assert.equal(feed.advisories.find((advisory) => advisory.name === "weak-hash").id, "npm:1088948");
+  assert.equal(feed.advisories.find((advisory) => advisory.name === "weak-hash").fixedIn, "3.1.0");
+  assert.equal(importNpmAudit({ auditReportVersion: 2, vulnerabilities: {} }).advisories.length, 0);
+
+  const scanned = scanDependencies(brokenBom, { advisories: feed });
+  assert.equal(scanned.advisoryFeed.available, true);
+  assert.equal(scanned.advisoryFeed.advisories, 2);
+  // weak-hash@3.0.0 is inside `<3.1.0`; copyleft@5.0.0 is outside `>=6.0.0`.
+  assert.deepEqual(scanned.vulnerabilities.map((item) => `${item.name}@${item.version}`), ["weak-hash@3.0.0"]);
+  assert.equal(scanned.vulnerabilities[0].severity, "critical");
+  assert.equal(scanned.vulnerabilities[0].fixedIn, "3.1.0");
+  assert.match(describeScan(scanned), /Checked against 2 advisories from npm-audit: 1 affected/);
+  assert.equal(scanPasses(scanned, { failOn: "critical" }).passed, false);
+  assert.match(scanned.findings.find((finding) => finding.id === "known-vulnerability").remediation, /Upgrade to 3\.1\.0/);
+  // ...and the same feed against a tree it does not affect says so plainly.
+  const clean = scanDependencies(bom, { advisories: feed });
+  assert.deepEqual(clean.vulnerabilities, []);
+  assert.match(describeScan(clean), /no known vulnerabilities/);
+  assert.equal(scanPasses(clean, { failOn: "high" }).passed, true, JSON.stringify(scanPasses(clean, { failOn: "high" })));
+
+  // --- Provenance ----------------------------------------------------------
+  const keyPair = await loadOrCreateKeyPair(path.join(workspace, "keys"));
+  const trusted = [keyPair.keyId];
+  const artifacts = [
+    { name: "trace-linux-x64.tar.gz", digest: artifactDigest(Buffer.from("linux artifact")), size: 14 },
+    { name: "trace-darwin-arm64.tar.gz", digest: artifactDigest(Buffer.from("darwin artifact")), size: 15 },
+  ];
+  const statement = signProvenance(buildProvenance({
+    artifacts,
+    sbom: bom,
+    builderId: "local-npm-release/codebase-learning-studio",
+    invocation: { source: "codebase-learning-studio", targets: ["linux/x64", "darwin/arm64"], node: process.version, platform: "test" },
+    sourceDigest: sbomDigest(bom),
+  }), keyPair);
+  assert.equal(statement._type, IN_TOTO_STATEMENT_TYPE);
+  assert.equal(statement.predicateType, SLSA_PREDICATE_TYPE);
+  assert.equal(statement.predicate.buildDefinition.buildType, BUILD_TYPE);
+  assert.equal(statement.predicate.buildDefinition.resolvedDependencies.length, bom.components.length);
+  assert.equal(statement.predicate.runDetails.byproducts[0].digest.sha256, sbomDigest(bom).slice("sha256:".length));
+  // Digests are hex in an in-toto subject and base64 in the update manifest;
+  // storing both encodings of the same bytes is how they drift apart.
+  assert.match(statement.subject[0].digest.sha512, /^[0-9a-f]{128}$/);
+  assert.equal(statement.signature.subject, "provenance");
+  // Same absence of a wall clock, for the same reason.
+  assert.equal(/startedOn|finishedOn/.test(JSON.stringify(statement.predicate)), false);
+
+  const accepted = verifyProvenance(statement, { artifacts, trustedKeyIds: trusted, expectedBuilder: "local-npm-release/codebase-learning-studio", sbom: bom });
+  assert.equal(accepted.accepted, true, accepted.detail);
+  assert.equal(accepted.materials, bom.components.length);
+  assert.equal(accepted.seal.trust, "trusted");
+
+  const refusals = [
+    ["unreadable", { predicateType: SLSA_PREDICATE_TYPE }, {}],
+    ["unknown-predicate", { ...statement, predicateType: "https://example/other" }, { trustedKeyIds: trusted }],
+    ["unsigned-or-tampered", { ...statement, signature: null }, { trustedKeyIds: trusted }],
+    ["unsigned-or-tampered", { ...statement, subject: [statement.subject[0]] }, { trustedKeyIds: trusted }],
+    ["untrusted-key", statement, { trustedKeyIds: [] }],
+    ["builder-mismatch", statement, { trustedKeyIds: trusted, expectedBuilder: "github-actions" }],
+    ["subject-missing", statement, { trustedKeyIds: trusted, artifacts: [{ name: "trace-win32-x64.exe", digest: artifactDigest(Buffer.from("x")) }] }],
+    ["digest-mismatch", statement, { trustedKeyIds: trusted, artifacts: [{ name: artifacts[0].name, digest: artifactDigest(Buffer.from("substituted bytes")) }] }],
+    ["material-missing", statement, { trustedKeyIds: trusted, sbom: { components: [...bom.components, { purl: "pkg:npm/smuggled@1.0.0", hashes: [] }] } }],
+  ];
+  for (const [reason, candidate, options] of refusals) {
+    const result = verifyProvenance(candidate, options);
+    assert.equal(result.accepted, false, `${reason} was accepted`);
+    assert.equal(result.reason, reason, `expected ${reason}, got ${result.reason}: ${result.detail}`);
+    assert.ok(result.detail && result.detail.length > 10, `${reason} was refused without an explanation`);
+  }
+  // A signature over a different subject cannot be lifted onto an attestation.
+  const lifted = { ...statement, signature: signPayload("update-manifest", statement, keyPair) };
+  assert.equal(verifyProvenance(lifted, { trustedKeyIds: trusted }).reason, "unsigned-or-tampered");
+  assert.match(verifyProvenance({ ...statement, subject: [statement.subject[0]] }, { trustedKeyIds: trusted }).detail, /signature did not verify/);
+  assert.throws(() => buildProvenance({ artifacts, sbom: bom }), /builder identity/);
+  assert.throws(() => buildProvenance({ artifacts: [], sbom: bom, builderId: "x" }), /without a subject/);
+
+  // --- Reproducibility -----------------------------------------------------
+  assert.deepEqual(compareBuilds(artifacts, artifacts), { reproducible: true, compared: 2, differences: [] });
+  const drifted = compareBuilds(artifacts, [{ ...artifacts[0], digest: artifactDigest(Buffer.from("other")), size: 5 }]);
+  assert.equal(drifted.reproducible, false);
+  assert.deepEqual(drifted.differences.map((difference) => [difference.name, difference.reason]).sort(), [
+    ["trace-darwin-arm64.tar.gz", "missing-in-second"],
+    ["trace-linux-x64.tar.gz", "size-and-digest"],
+  ]);
+  assert.equal(compareBuilds([], [artifacts[0]]).differences[0].reason, "missing-in-first");
+  const difference = firstByteDifference(Buffer.from("built at 2026-01-01"), Buffer.from("built at 2026-01-02"));
+  assert.equal(difference.identical, false);
+  assert.equal(difference.offset, 18);
+  assert.equal(firstByteDifference(Buffer.from("same"), Buffer.from("same")).identical, true);
+  assert.equal(firstByteDifference(Buffer.from("ab"), Buffer.from("abc")).offset, 2);
+
+  // --- The release carries all of it, twice, identically -------------------
+  const first = await buildRelease({ outputDirectory: path.join(workspace, "release-one"), keyDirectory: path.join(workspace, "keys") });
+  const second = await buildRelease({ outputDirectory: path.join(workspace, "release-two"), keyDirectory: path.join(workspace, "keys") });
+  assert.equal(compareBuilds(first.manifest.artifacts, second.manifest.artifacts).reproducible, true);
+  // The attestation itself is reproducible: only the countersignature's clock
+  // differs, and that is metadata beside the signature rather than inside it.
+  assert.deepEqual({ ...second.provenance, signature: null }, { ...first.provenance, signature: null });
+  assert.equal(second.provenance.signature.signature, first.provenance.signature.signature);
+  assert.equal(second.provenance.signature.digest, first.provenance.signature.digest);
+  assert.equal(sbomDigest(second.sbom), sbomDigest(first.sbom));
+
+  // Every artifact the manifest lists is a subject of the attestation, at the
+  // digest the manifest records.
+  const provenanceCheck = verifyProvenance(first.provenance, {
+    artifacts: first.manifest.artifacts,
+    trustedKeyIds: [first.identity.keyId],
+    expectedBuilder: "local-npm-release/codebase-learning-studio",
+    sbom: first.sbom,
+  });
+  assert.equal(provenanceCheck.accepted, true, provenanceCheck.detail);
+  assert.equal(provenanceCheck.subject.length, 4);
+
+  // The files a consumer needs are beside the release, and the bill of
+  // materials is also *inside* every artifact, where somebody holding the file
+  // can compare it with what is actually there.
+  for (const name of ["latest.json", "public-key.json", "sbom.cdx.json", "provenance.json", "dependency-scan.json"]) {
+    await access(path.join(first.output, name));
+  }
+  const writtenProvenance = JSON.parse(await readFile(path.join(first.output, "provenance.json"), "utf8"));
+  assert.equal(verifyProvenance(writtenProvenance, { artifacts: first.manifest.artifacts, trustedKeyIds: [first.identity.keyId] }).accepted, true);
+  assert.equal(JSON.stringify(writtenProvenance).includes("PRIVATE"), false);
+  const linux = first.manifest.artifacts.find((artifact) => artifact.platform === "linux");
+  const unpacked = path.join(workspace, "unpacked");
+  await mkdir(unpacked, { recursive: true });
+  await execFileAsync("tar", ["-xzf", path.join(first.output, linux.name), "-C", unpacked]);
+  const shipped = JSON.parse(await readFile(path.join(unpacked, "sbom.cdx.json"), "utf8"));
+  assert.equal(sbomDigest(shipped), sbomDigest(first.sbom), "the shipped bill of materials is not the one the release attests to");
+  const buildInfo = JSON.parse(await readFile(path.join(unpacked, "BUILD_INFO.json"), "utf8"));
+  assert.equal(buildInfo.sbomDigest, sbomDigest(first.sbom));
+
+  // --- The renderer build is reproducible too ------------------------------
+  // The payload contains `dist`, so an artifact digest is only checkable by a
+  // third party if `vite build` produces the same bytes twice.
+  let distFiles;
+  try {
+    distFiles = await readdir(path.join(projectRoot, "dist", "assets"));
+  } catch {
+    distFiles = null;
+  }
+  if (!distFiles) {
+    context.diagnostic("dist is absent; run `npm run build` to check that the renderer build is reproducible.");
+  } else {
+    const rebuilt = path.join(workspace, "dist-rebuild");
+    await execFileAsync(process.execPath, [path.join(projectRoot, "node_modules", "vite", "bin", "vite.js"), "build", "--outDir", rebuilt, "--emptyOutDir"], { cwd: projectRoot, maxBuffer: 32 * 1024 * 1024 });
+    const digestTree = async (directory) => {
+      const entries = (await readdir(directory, { recursive: true, withFileTypes: true })).filter((entry) => entry.isFile());
+      const digests = [];
+      for (const entry of entries) {
+        const relative = path.relative(directory, path.join(entry.parentPath ?? entry.path, entry.name));
+        digests.push([relative, createHash("sha256").update(await readFile(path.join(directory, relative))).digest("hex")]);
+      }
+      return digests.sort((left, right) => left[0].localeCompare(right[0]));
+    };
+    const original = await digestTree(path.join(projectRoot, "dist"));
+    const copy = await digestTree(rebuilt);
+    assert.ok(original.length > 20, `only ${original.length} files in dist`);
+    const differing = copy.filter(([name, digest]) => (original.find(([candidate]) => candidate === name) ?? [null, null])[1] !== digest);
+    assert.deepEqual(differing.map(([name]) => name), [], "the renderer build is not byte-reproducible");
+    assert.equal(copy.length, original.length);
+  }
+
+  // --- What a renderer is allowed to see ----------------------------------
+  const publicReport = publicSupplyChainReport(bom, scan);
+  assert.equal(publicReport.version, SUPPLY_CHAIN_VERSION);
+  assert.equal(publicReport.counts.total, bom.components.length);
+  assert.equal(publicReport.counts.runtime + publicReport.counts.development, publicReport.counts.total);
+  assert.ok(publicReport.licenses.some((entry) => entry.license === "MIT"));
+  assert.equal(publicReport.scan.vulnerabilities, null);
+  // Paths on the build machine are a fact about the builder, not about the
+  // dependency, and they do not cross the boundary.
+  const publicText = JSON.stringify(publicReport);
+  assert.equal(publicText.includes("npm:path"), false);
+  assert.equal(publicText.includes("node_modules/"), false, "an install path reached the renderer payload");
+  assert.equal(publicText.includes(os.homedir()), false);
+  assert.deepEqual(licenseBreakdown({ components: [] }), []);
 });
