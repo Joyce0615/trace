@@ -59,6 +59,8 @@ import { DURABLE_VERSION, inspectDurable, readDurable, sweepInterruptedWrites, w
 import { BUILD_TYPE, DEFAULT_LICENSE_POLICY, IN_TOTO_STATEMENT_TYPE, SBOM_SPEC_VERSION, SLSA_PREDICATE_TYPE, SUPPLY_CHAIN_VERSION, buildProvenance, buildSbom, compareBuilds, describeScan, firstByteDifference, hashesFromIntegrity, importNpmAudit, licenseBreakdown, publicSupplyChainReport, purlFor, runtimeComponents, satisfiesRange, sbomDigest, scanDependencies, scanPasses, signProvenance, verifyProvenance } from "../electron/supply-chain.mjs";
 import { BUDGETS, DEFAULT_NOISE, MIN_SAMPLES_FOR_PERCENTILE, PERFORMANCE_VERSION, budgetIds, compareToBaseline, describeBudgets, effectiveCeiling, evaluateAll, evaluateBudget, memoryPressureAction, percentile, summarize, watchMemory } from "../electron/performance.mjs";
 import { measurementsFrom, measureWorkspace } from "../scripts/perf-budget.mjs";
+import { PLUGIN_API_VERSION, PLUGIN_CAPABILITIES, PLUGIN_KINDS, entryDigest, filesClaimedBy, inspectPlugin, loadPlugins, publicPluginReport, runPlugin, signPluginManifest } from "../electron/plugins.mjs";
+import { signPluginDirectory } from "../scripts/plugin-tool.mjs";
 
 const execFileAsync = promisify(execFile);
 const round4 = (value) => Number(Number(value).toFixed(4));
@@ -790,7 +792,7 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
     "learning:diagnose", "learning:probe", "learning:schedule", "learning:review",
     "quiz:build", "quiz:grade", "explain:task", "explain:grade",
     "activity:build", "activity:grade", "hint:next", "analytics:report",
-    "course:package", "course:import", "course:verify-signature", "course:migrate", "course:revert-migration", "notes:list", "notes:save", "archive:export", "archive:import", "recovery:report", "practice:release", "supply-chain:report", "perf:report", "window:new", "window:state", "deep-link:open", "deep-link:last",
+    "course:package", "course:import", "course:verify-signature", "course:migrate", "course:revert-migration", "notes:list", "notes:save", "archive:export", "archive:import", "recovery:report", "practice:release", "supply-chain:report", "perf:report", "plugins:list", "window:new", "window:state", "deep-link:open", "deep-link:last",
     "signing:identity", "signing:trust", "goals:plan", "experiment:state", "experiment:consent", "experiment:forget", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
@@ -6675,4 +6677,335 @@ test("performance budgets scale with the work, refuse to judge too few samples, 
   const strict = evaluateBudget("index.totalMs", measured.timing.totalMs, { size: 0 });
   assert.equal(strict.ceiling, BUDGETS["index.totalMs"].floor);
   assert.equal(evaluateBudget("render.domNodes", 9_000).verdict, "fail");
+});
+
+test("a plugin runs outside the main process, with only what it was granted, and cannot break what it extends", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-plugins-"));
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  const keyPair = await loadOrCreateKeyPair(path.join(workspace, "keys"));
+  const otherKey = createKeyPair();
+  const trusted = [keyPair.keyId];
+  const root = path.join(workspace, "plugins");
+  await mkdir(root, { recursive: true });
+
+  /** Write a plugin directory, signing it unless told otherwise. */
+  const write = async (id, manifest, source, { sign = keyPair, pinDigest = true } = {}) => {
+    const directory = path.join(root, id);
+    await mkdir(directory, { recursive: true });
+    await writeFile(path.join(directory, "index.mjs"), source);
+    const complete = {
+      id, name: `${id} plugin`, version: "1.0.0", kind: "indexer", apiVersion: 1,
+      entry: "index.mjs", capabilities: ["read-file", "log"], extensions: [".zig"],
+      ...manifest,
+    };
+    if (pinDigest) {
+      // An entry that is not there still gets a digest, of the source we wrote,
+      // so `missing-entry` is refused for being missing rather than for the
+      // digest not matching.
+      complete.entryDigest = entryDigest(await readFile(path.join(directory, complete.entry), "utf8").catch(() => source));
+    }
+    await writeFile(path.join(directory, "plugin.json"), JSON.stringify(sign ? signPluginManifest(complete, sign) : complete, null, 2));
+    return directory;
+  };
+
+  const goodSource = [
+    "export default async function indexer(input, host) {",
+    "  const definitions = [];",
+    "  for (const file of input.files ?? []) {",
+    "    const source = await host.readFile(file.path);",
+    "    source.split('\\n').forEach((line, index) => {",
+    "      const match = /^\\s*(?:pub\\s+)?fn\\s+([A-Za-z_][A-Za-z0-9_]*)/.exec(line);",
+    "      if (match) definitions.push({ name: match[1], path: file.path, line: index + 1, kind: 'function' });",
+    "    });",
+    "  }",
+    "  await host.log('saw ' + definitions.length);",
+    "  return { definitions };",
+    "}",
+  ].join("\n");
+  await write("good-indexer", {}, goodSource);
+
+  // --- Every refusal names the check that failed --------------------------
+  await write("unsigned-one", {}, goodSource, { sign: null });
+  await write("stranger", {}, goodSource, { sign: otherKey });
+  await write("future-api", { apiVersion: 99 }, goodSource);
+  await write("bad-kind", { kind: "transpiler" }, goodSource);
+  await write("bad-capability", { capabilities: ["read-file", "spawn"] }, goodSource);
+  await write("no-digest", {}, goodSource, { pinDigest: false });
+  // The `entry` pattern permits dots, so `..` passes it. That is why the
+  // manifest check resolves the path and compares it with the directory
+  // instead of trusting the pattern.
+  await write("escaping", { entry: "../good-indexer/index.mjs" }, goodSource);
+  await write("missing-file", { entry: "elsewhere.mjs" }, goodSource);
+  const swapped = await write("swapped-code", {}, goodSource);
+  // Signed honestly, then the code behind the signed name is replaced. Without
+  // `entryDigest` in the manifest the signature would certify a filename.
+  await writeFile(path.join(swapped, "index.mjs"), "export default async () => ({ definitions: [] });\n");
+  await mkdir(path.join(root, "not-a-plugin"), { recursive: true });
+  await writeFile(path.join(root, "not-a-plugin", "plugin.json"), "{ this is not json");
+
+  const loaded = await loadPlugins(root, { trustedKeyIds: trusted });
+  assert.deepEqual(loaded.plugins.map((plugin) => plugin.id), ["good-indexer"], loaded.plugins.map((plugin) => plugin.id).join(","));
+  const refusedBy = new Map(loaded.refused.map((entry) => [entry.directory, entry.reason]));
+  assert.deepEqual([...refusedBy.entries()].sort(), [
+    ["bad-capability", "invalid-manifest"],
+    ["bad-kind", "invalid-manifest"],
+    ["escaping", "entry-escape"],
+    ["future-api", "api-version"],
+    ["missing-file", "missing-entry"],
+    ["no-digest", "invalid-manifest"],
+    ["not-a-plugin", "unreadable-manifest"],
+    ["stranger", "untrusted-key"],
+    ["swapped-code", "entry-changed"],
+    ["unsigned-one", "unsigned-or-tampered"],
+  ]);
+  for (const entry of loaded.refused) {
+    assert.ok(entry.detail && entry.detail.length > 15, `${entry.directory} was refused without an explanation`);
+  }
+  // An intact signature from an unknown key is a *refusal* for code that will
+  // execute, not the warning a course package earns.
+  const stranger = loaded.refused.find((entry) => entry.directory === "stranger");
+  assert.equal(stranger.seal.verified, true, "the stranger's signature really is intact");
+  assert.match(stranger.detail, /does not trust/);
+  // An entry outside the directory is caught before the signature can matter,
+  // so a perfectly signed manifest cannot borrow another plugin's code.
+  assert.match(refusedBy.get("escaping") === "entry-escape" ? loaded.refused.find((entry) => entry.directory === "escaping").detail : "", /resolves outside the plugin directory/);
+  assert.equal((await loadPlugins(path.join(workspace, "nowhere"), {})).available, false);
+
+  // --- The granted plugin runs, in its own process -------------------------
+  const plugin = loaded.plugins[0];
+  assert.deepEqual(plugin.granted, ["read-file", "log"]);
+  assert.deepEqual(plugin.withheld, []);
+  const files = [{ path: "src/main.zig", language: "plaintext" }, { path: "src/util.zig", language: "plaintext" }];
+  const sources = {
+    "src/main.zig": "pub fn main() void {}\nfn helper() void {}\n",
+    "src/util.zig": "pub fn clamp(x: i32) i32 { return x; }\n",
+  };
+  const readCalls = [];
+  const host = {
+    "read-file": (filePath) => {
+      readCalls.push(filePath);
+      if (!(filePath in sources)) throw new Error("That file is not part of this index.");
+      return sources[filePath];
+    },
+  };
+  const outcome = await runPlugin(plugin, { files }, { host });
+  assert.equal(outcome.ok, true, `${outcome.reason}: ${outcome.detail}`);
+  assert.deepEqual(outcome.result.definitions.map((item) => `${item.name}@${item.path}:${item.line}`), [
+    "main@src/main.zig:1", "helper@src/main.zig:2", "clamp@src/util.zig:1",
+  ]);
+  assert.deepEqual(readCalls, ["src/main.zig", "src/util.zig"]);
+  assert.deepEqual(outcome.logs, ["saw 3"]);
+  assert.ok(outcome.hostCalls >= 3);
+  // It really was a separate process: the plugin cannot see this one's globals.
+  const spy = await write("spy", { capabilities: ["log"] }, [
+    "export default async function indexer(input, host) {",
+    "  await host.log(typeof process.send + '|' + (typeof globalThis.__testMarker));",
+    "  return { definitions: [] };",
+    "}",
+  ].join("\n"));
+  globalThis.__testMarker = "present-in-the-test-process";
+  context.after(() => { delete globalThis.__testMarker; });
+  const spyPlugin = await inspectPlugin(spy, { trustedKeyIds: trusted });
+  const spyRun = await runPlugin(spyPlugin, { files: [] }, { host: {} });
+  assert.equal(spyRun.ok, true, spyRun.detail);
+  assert.deepEqual(spyRun.logs, ["undefined|undefined"], "the plugin can see the test process's globals");
+
+  // --- What a plugin is refused at run time --------------------------------
+  const cases = [
+    // An ungranted capability is *absent* from the host object, not present
+    // and refusing. Absence is the stronger property: there is nothing to call,
+    // so there is nothing to get wrong. The parent-side refusal below covers
+    // the case where a plugin bypasses the host object entirely.
+    ["ungranted-capability", { capabilities: ["log"] }, "export default async (input, host) => { await host.listFiles(); return { definitions: [] }; };", /listFiles is not a function/],
+    ["throws", {}, "export default async () => { throw new Error('deliberate'); };", /deliberate/],
+    ["no-export", {}, "export const somethingElse = 1;\n", /no callable entry point/],
+    ["wrong-shape", {}, "export default async () => ({ definitions: [{ name: 'x' }] });", /path: is required/],
+    ["extra-field", {}, "export default async () => ({ definitions: [], smuggled: { exec: 'rm -rf /' } });", /unexpected field smuggled/],
+    ["not-an-object", {}, "export default async () => 'a string';", /must be an object/],
+  ];
+  for (const [id, manifest, source, expected] of cases) {
+    const directory = await write(id, manifest, source);
+    const inspected = await inspectPlugin(directory, { trustedKeyIds: trusted });
+    assert.equal(inspected.loaded, true, `${id}: ${inspected.reason}`);
+    const result = await runPlugin(inspected, { files: [] }, { host: { "list-files": () => [] } });
+    assert.equal(result.ok, false, `${id} was accepted`);
+    assert.match(result.detail ?? "", expected, `${id}: ${result.reason} ${result.detail}`);
+  }
+  // The capability check is in the *host*, so a plugin that fabricates the
+  // protocol message directly gets the same refusal as one that asks politely.
+  const forger = await write("forger", { capabilities: ["log"] }, [
+    "export default async function indexer() {",
+    "  process.stdout.write(JSON.stringify({ type: 'host', id: 999, capability: 'read-file', args: ['/etc/passwd'] }) + '\\n');",
+    "  await new Promise((resolve) => setTimeout(resolve, 80));",
+    "  return { definitions: [] };",
+    "}",
+  ].join("\n"));
+  const forgedReads = [];
+  const forged = await runPlugin(await inspectPlugin(forger, { trustedKeyIds: trusted }), { files: [] }, {
+    host: { "read-file": (filePath) => { forgedReads.push(filePath); return "SECRET"; } },
+  });
+  assert.equal(forged.ok, true, `${forged.reason}: ${forged.detail}`);
+  assert.ok(forged.hostCalls >= 1, "the host never even saw the forged message");
+  assert.deepEqual(forgedReads, [], "a forged protocol message reached an ungranted capability");
+
+  // A host that throws is reported to the plugin as a refusal, not a crash, and
+  // a capability the host has no handler for in this context says so.
+  const asker = await write("asker", { capabilities: ["read-file", "list-files", "log"] }, [
+    "export default async function indexer(input, host) {",
+    "  const seen = [];",
+    "  for (const call of [() => host.readFile('nope'), () => host.listFiles()]) {",
+    "    try { await call(); seen.push('ok'); } catch (error) { seen.push(error.message); }",
+    "  }",
+    "  return { definitions: seen.map((name, index) => ({ name: name.slice(0, 60), path: 'p', line: index + 1 })) };",
+    "}",
+  ].join("\n"));
+  const asked = await runPlugin(await inspectPlugin(asker, { trustedKeyIds: trusted }), { files: [] }, {
+    host: { "read-file": () => { throw new Error("That file is not part of this index."); } },
+  });
+  assert.equal(asked.ok, true, `${asked.reason}: ${asked.detail}`);
+  assert.deepEqual(asked.result.definitions.map((item) => item.name), [
+    "That file is not part of this index.",
+    "The host offers no “list-files” in this context.",
+  ]);
+  // A plugin's log is a file on disk, so it is redacted before it is kept.
+  const leaky = await write("leaky", { capabilities: ["log"] }, [
+    "export default async function indexer(input, host) {",
+    "  await host.log('token ghp_' + 'A'.repeat(36) + ' end');",
+    "  return { definitions: [] };",
+    "}",
+  ].join("\n"));
+  const leaked = await runPlugin(await inspectPlugin(leaky, { trustedKeyIds: trusted }), { files: [] }, { host: {} });
+  assert.equal(leaked.ok, true, leaked.detail);
+  assert.equal(leaked.logs[0].includes("ghp_AAAA"), false, leaked.logs[0]);
+  // Things that cannot be run at all, said plainly rather than thrown.
+  assert.equal((await runPlugin({ loaded: false, id: "x" }, {}, {})).reason, "not-loaded");
+  assert.equal((await runPlugin({ ...plugin, manifest: { ...plugin.manifest, kind: "transpiler" } }, {}, {})).reason, "unknown-kind");
+  assert.equal((await runPlugin(plugin, { files: [] }, { host: {}, execPath: "/definitely/not/a/binary" })).reason, "spawn-failed");
+  // A plugin that claims nothing is never handed anything.
+  assert.deepEqual(filesClaimedBy({ manifest: {} }, files), []);
+  assert.deepEqual(filesClaimedBy({ manifest: { extensions: [".ZIG"] } }, files).map((file) => file.path), ["src/main.zig", "src/util.zig"]);
+
+  // A plugin that never answers is killed rather than waited for.
+  const hanger = await write("hanger", { timeoutMs: 400 }, "export default () => new Promise(() => {});");
+  const hung = await runPlugin(await inspectPlugin(hanger, { trustedKeyIds: trusted }), { files: [] }, { host: {} });
+  assert.equal(hung.reason, "timeout");
+  assert.ok(hung.durationMs < 5_000, `the timeout took ${hung.durationMs} ms`);
+  // ...and one that writes without limit is cut off rather than buffered.
+  const flooder = await write("flooder", {}, [
+    "export default async () => ({ definitions: Array.from({ length: 5000 }, (_, i) => ({ name: 'n'.repeat(190) + i, path: 'p'.repeat(1000), line: 1 })) });",
+  ].join("\n"));
+  const flooded = await runPlugin(await inspectPlugin(flooder, { trustedKeyIds: trusted }), { files: [] }, { host: {} });
+  assert.equal(flooded.ok, false);
+  assert.ok(["oversized", "invalid-result"].includes(flooded.reason), `${flooded.reason}: ${flooded.detail}`);
+  // A plugin's stray `console.log` cannot corrupt the protocol.
+  const chatty = await write("chatty", {}, "console.log('hello from module scope');\nexport default async () => { console.log('and again'); return { definitions: [] }; };");
+  const chattyRun = await runPlugin(await inspectPlugin(chatty, { trustedKeyIds: trusted }), { files: [] }, { host: {} });
+  assert.equal(chattyRun.ok, true, `${chattyRun.reason}: ${chattyRun.detail}`);
+  assert.deepEqual(chattyRun.result.definitions, []);
+
+  // --- The indexer extension point, against a real repository -------------
+  const repository = path.join(workspace, "repo");
+  await mkdir(path.join(repository, "src"), { recursive: true });
+  await writeFile(path.join(repository, "src", "main.zig"), sources["src/main.zig"]);
+  await writeFile(path.join(repository, "src", "util.zig"), sources["src/util.zig"]);
+  await writeFile(path.join(repository, "engine.py"), "def already_indexed():\n    return 1\n");
+  await writeFile(path.join(repository, "README.md"), "# zig\n");
+  const git = (...args) => execFileAsync("git", ["-C", repository, ...args]);
+  await git("init", "-q");
+  await git("config", "user.email", "t@example.com");
+  await git("config", "user.name", "T");
+  await git("add", "-A");
+  await git("commit", "-qm", "initial");
+
+  const plain = await inspectRepository(repository, path.join(workspace, "repos-plain"));
+  assert.equal(plain.symbols.some((symbol) => symbol.path.endsWith(".zig")), false, "this build already indexes Zig, so the fixture proves nothing");
+  assert.deepEqual(plain.stats.plugins, { asked: 0, contributions: [], problems: [], definitions: 0 });
+
+  const extended = await inspectRepository(repository, path.join(workspace, "repos-extended"), { plugins: [plugin] });
+  const zigSymbols = extended.symbols.filter((symbol) => symbol.path.endsWith(".zig"));
+  assert.deepEqual(zigSymbols.map((symbol) => `${symbol.name}@${symbol.path}:${symbol.line}`).sort(), [
+    "clamp@src/util.zig:1", "helper@src/main.zig:2", "main@src/main.zig:1",
+  ]);
+  assert.equal(extended.stats.plugins.definitions, 3);
+  assert.equal(extended.stats.plugins.contributions[0].pluginId, "good-indexer");
+  assert.deepEqual(extended.stats.plugins.problems, []);
+  // The Python file was indexed by a built-in, so the plugin was never offered
+  // it and could not have overwritten it either way.
+  const python = extended.symbols.find((symbol) => symbol.name === "already_indexed");
+  assert.ok(python, "the built-in index lost a symbol when a plugin was present");
+  assert.equal(extended.stats.indexerCounts["plugin:good-indexer"], 2, JSON.stringify(extended.stats.indexerCounts));
+
+  // A plugin that claims a file it was not asked about has that answer thrown
+  // away rather than merged.
+  const greedy = await write("greedy", {}, "export default async () => ({ definitions: [{ name: 'injected', path: 'engine.py', line: 1 }, { name: 'invented', path: 'not/in/repo.zig', line: 1 }] });");
+  const greedyPlugin = await inspectPlugin(greedy, { trustedKeyIds: trusted });
+  const guarded = await inspectRepository(repository, path.join(workspace, "repos-guarded"), { plugins: [greedyPlugin] });
+  assert.equal(guarded.symbols.some((symbol) => symbol.name === "injected" || symbol.name === "invented"), false);
+  assert.equal(guarded.stats.plugins.definitions, 0);
+  // Both are discarded, and for different reasons: `engine.py` was never in
+  // the list this plugin was handed, and `not/in/repo.zig` is not in the
+  // repository at all.
+  assert.equal(guarded.stats.plugins.contributions[0].discarded, 2);
+
+  // A failing plugin is named and dropped; indexing still finishes.
+  const brokenPlugin = await inspectPlugin(await write("broken", {}, "export default async () => { throw new Error('kaboom'); };"), { trustedKeyIds: trusted });
+  const survived = await inspectRepository(repository, path.join(workspace, "repos-survived"), { plugins: [brokenPlugin, plugin] });
+  assert.equal(survived.stats.plugins.problems.length, 1);
+  assert.equal(survived.stats.plugins.problems[0].pluginId, "broken");
+  assert.match(survived.stats.plugins.problems[0].detail, /kaboom/);
+  // ...and the working one beside it still contributed.
+  assert.equal(survived.stats.plugins.definitions, 3);
+  assert.equal(survived.stats.fileCount, plain.stats.fileCount);
+
+  // --- What the renderer is allowed to see --------------------------------
+  const report = publicPluginReport(loaded);
+  assert.equal(report.version, PLUGIN_API_VERSION);
+  assert.deepEqual(report.plugins.map((entry) => entry.id), ["good-indexer"]);
+  assert.equal(report.refused.length, 10);
+  assert.ok(report.refused.every((entry) => entry.reason && entry.detail));
+  const text = JSON.stringify(report);
+  // No absolute paths, no entry points, no key material.
+  // A refusal may name the *relative* entry the manifest declared — that is
+  // the useful part of "this entry escapes its directory" — but no absolute
+  // path on this machine and no key material may cross.
+  assert.equal(text.includes(workspace), false, "a build-machine path reached the renderer payload");
+  assert.equal(text.includes(os.homedir()), false);
+  assert.equal(text.includes("PRIVATE"), false);
+  assert.equal(/"[^"]*\/(?:Users|home|var|tmp)\//.test(text), false, `an absolute path reached the renderer payload: ${text.slice(0, 300)}`);
+  assert.equal(report.plugins.every((entry) => !("entryPath" in entry) && !("directory" in entry)), true);
+  assert.deepEqual(Object.keys(PLUGIN_CAPABILITIES).sort(), ["list-files", "log", "read-file", "symbols"]);
+  assert.deepEqual(PLUGIN_KINDS, ["indexer", "agent", "course-generator", "grader", "visualization"]);
+
+  // --- The shipped reference plugin is refused, on purpose ----------------
+  const reference = await inspectPlugin(path.resolve("plugins", "reference-indexer"), { trustedKeyIds: trusted });
+  assert.equal(reference.loaded, false);
+  assert.equal(reference.reason, "unsigned-or-tampered");
+  const referenceDocs = await readFile(path.resolve("plugins", "README.md"), "utf8");
+  assert.match(referenceDocs, /deliberately \*\*unsigned\*\*/);
+  assert.match(referenceDocs, /not an operating-system sandbox/);
+
+  // ...and the tool that would sign it produces something that loads.
+  const signable = path.join(workspace, "signable");
+  await mkdir(signable, { recursive: true });
+  await execFileAsync("cp", ["-R", path.resolve("plugins", "reference-indexer"), signable]);
+  const signedDirectory = path.join(signable, "reference-indexer");
+  const signedResult = await signPluginDirectory(signedDirectory, path.join(workspace, "keys"));
+  assert.equal(signedResult.keyId, keyPair.keyId);
+  const nowLoads = await inspectPlugin(signedDirectory, { trustedKeyIds: trusted });
+  assert.equal(nowLoads.loaded, true, `${nowLoads.reason}: ${nowLoads.detail}`);
+  const referenceRun = await runPlugin(nowLoads, { files: [{ path: "src/main.zig", language: "plaintext" }] }, {
+    host: { "read-file": () => "const Point = struct {\n    x: i32,\n};\n\npub fn distance(p: Point) i32 {\n    return p.x;\n}\n" },
+  });
+  assert.equal(referenceRun.ok, true, referenceRun.detail);
+  assert.deepEqual(referenceRun.result.definitions.map((item) => `${item.kind}:${item.name}`), ["type:Point", "function:distance"]);
+  assert.equal(referenceRun.result.definitions[1].container, "Point");
+
+  // Capabilities can also be withheld at grant time, and that is reported.
+  const restricted = await inspectPlugin(path.join(root, "good-indexer"), { trustedKeyIds: trusted, grant: ["log"] });
+  assert.deepEqual(restricted.granted, ["log"]);
+  assert.deepEqual(restricted.withheld, ["read-file"]);
+  const starved = await runPlugin(restricted, { files: [{ path: "src/main.zig", language: "plaintext" }] }, { host });
+  assert.equal(starved.ok, false);
+  assert.match(starved.detail, /readFile is not a function/);
+  assert.deepEqual(readCalls, ["src/main.zig", "src/util.zig"], "a withheld capability still reached the host");
 });

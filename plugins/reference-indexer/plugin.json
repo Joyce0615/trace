@@ -1,0 +1,14 @@
+{
+  "id": "reference-indexer",
+  "name": "Reference Zig indexer",
+  "version": "1.0.0",
+  "kind": "indexer",
+  "apiVersion": 1,
+  "entry": "index.mjs",
+  "entryDigest": "0000000000000000000000000000000000000000000000000000000000000000",
+  "capabilities": ["read-file", "log"],
+  "languages": ["zig"],
+  "extensions": [".zig"],
+  "description": "Indexes Zig definitions, which this build has no grammar for. Shipped unsigned on purpose: the application refuses it, which is the demonstration.",
+  "timeoutMs": 5000
+}

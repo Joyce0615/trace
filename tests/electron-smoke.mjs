@@ -2010,6 +2010,33 @@ try {
   });
   assert.match(perfRejected ?? "", /must be a finite number/, String(perfRejected));
 
+  /*
+   * Item 58: the plugin surface, through the live IPC boundary.
+   *
+   * No plugins are installed in a fresh user-data directory, and the answer to
+   * "what extensions are running" being an empty list *with the contract
+   * attached* is the useful answer: a renderer can show what a plugin would be
+   * allowed to do before anybody installs one.
+   */
+  const plugins = await page.evaluate(() => window.trace.plugins());
+  assert.equal(plugins.version, 1);
+  assert.deepEqual(plugins.plugins, [], JSON.stringify(plugins.plugins));
+  assert.deepEqual(plugins.kinds, ["indexer", "agent", "course-generator", "grader", "visualization"]);
+  assert.deepEqual(Object.keys(plugins.capabilities).sort(), ["list-files", "log", "read-file", "symbols"]);
+  assert.equal(plugins.limits.timeoutMs, 15_000);
+  // The real index ran with the plugin extension point live and nothing broke.
+  assert.equal(perf.index.files > 1_000, true);
+  // ...and the channel takes no payload that could name something to execute.
+  const pluginRejected = await page.evaluate(async () => {
+    try {
+      await window.trace.plugins({ run: "/tmp/evil.mjs" });
+      return null;
+    } catch (error) {
+      return error.message;
+    }
+  });
+  assert.equal(pluginRejected, null, "plugins:list must ignore any payload rather than accept one");
+
   const startupBudgets = evaluateAll({ "startup.firstWindowMs": firstWindowMs, "startup.interactiveMs": interactiveMs });
   assert.equal(startupBudgets.passed, true, `${startupBudgets.summary}\n${describeBudgets(startupBudgets)}`);
 
@@ -2072,6 +2099,7 @@ try {
     executionTrace: { runtime: traceAudit.runtimes.python.version, calls: traceAudit.ran.summary.callCount, transitions: traceAudit.ran.summary.transitions.length, confirmed: traceAudit.ran.summary.confirmedStaticEdges, dynamicOnly: traceAudit.ran.summary.dynamicOnlyEdges },
     supplyChain: supplyChainReport,
     performance: performanceReport,
+    plugins: { installed: plugins.plugins.length, refused: plugins.refused.length, kinds: plugins.kinds.length, capabilities: Object.keys(plugins.capabilities).length },
   }, null, 2));
 } finally {
   await electronApp.close();

@@ -45,6 +45,7 @@ import { anchorPayload, loadOrCreateKeyPair, loadTrustedKeys, publicIdentity, re
 import { forgetEverything, loadExperimentState, recordObservation, setConsent } from "./experiment-store.mjs";
 import { buildSbom, publicSupplyChainReport, scanDependencies } from "./supply-chain.mjs";
 import { BUDGETS, budgetIds, evaluateAll } from "./performance.mjs";
+import { loadPlugins, publicPluginReport } from "./plugins.mjs";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const openedRepositories = new Map();
@@ -98,6 +99,33 @@ const indexingRequests = new Map();
 // Not a repository cache: the bill of materials describes the application, not
 // anything a learner opened, so it must survive switching repositories.
 const supplyChainReports = new Map();
+
+/**
+ * Plugins are read once per launch (item 58).
+ *
+ * Re-reading them would mean a directory that changes under a running
+ * application changes what it trusts, which is a race worth not having: a
+ * plugin verified at launch and swapped afterwards would keep its granted
+ * capabilities. Restarting is the way to install one.
+ */
+let pluginsPromise = null;
+function loadedPlugins() {
+  if (!pluginsPromise) {
+    pluginsPromise = (async () => {
+      // The same trust list item 45 built for course packages. A key the
+      // learner trusted for one kind of signed artifact is a key they trusted;
+      // maintaining a second list would mean two places to get it wrong.
+      const trustedKeyIds = await loadTrustedKeys(signingDirectory());
+      return loadPlugins(path.join(app.getPath("userData"), "plugins"), {
+        trustedKeyIds,
+        // Granted explicitly. A capability a plugin asked for and did not get
+        // is reported as `withheld` rather than quietly ignored.
+        grant: ["read-file", "list-files", "symbols", "log"],
+      });
+    })().catch(() => ({ directory: null, plugins: [], refused: [], available: false }));
+  }
+  return pluginsPromise;
+}
 const callChainSets = repositoryCache("callChainSets");
 const localizationExercises = repositoryCache("localizationExercises");
 const raceTasks = repositoryCache("raceTasks");
@@ -379,6 +407,9 @@ const ipcHandlers = {
         signal: controller.signal,
         onProgress,
         limits: request.limits,
+        // Item 58: indexer plugins get the files the built-in indexers could
+        // not read at all, and nothing else.
+        plugins: (await loadedPlugins()).plugins,
       });
     } catch (cause) {
       if (cause instanceof IndexCancelledError || cause?.cancelled) {
@@ -1305,6 +1336,15 @@ const ipcHandlers = {
         : null,
     };
   },
+
+  /**
+   * Which extensions are installed, and which were refused (item 58).
+   *
+   * Refusals are part of the answer. A plugin somebody installed and that is
+   * silently not running is the worst of the three possible outcomes: worse
+   * than running, and worse than being told plainly that it will not.
+   */
+  "plugins:list": async () => publicPluginReport(await loadedPlugins()),
 
   "window:new": async (_event) => {
     const created = createWindow();

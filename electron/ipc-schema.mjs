@@ -360,6 +360,10 @@ export const IPC_SCHEMAS = {
   // Item 56: what this build is made of. No repository reference, because the
   // answer is a property of the application rather than of anything opened.
   "supply-chain:report": s.object({ scope: s.literal(["all", "runtime"], { optional: true }) }),
+  // Item 58: which extensions are installed, which were refused, and why.
+  // No payload can select or run one: a renderer that could name a plugin to
+  // execute would be a renderer that could execute code.
+  "plugins:list": s.object({}),
   // Item 57: what the last index cost, judged against the declared budgets.
   // Samples come from the renderer because only the renderer can time a paint;
   // they are bounded here so a hostile page cannot make the main process hold

@@ -4,6 +4,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { analyzeSource, treeSitterSupports } from "./tree-sitter-index.mjs";
 import { memoryPressureAction, watchMemory } from "./performance.mjs";
+import { runIndexerPlugins } from "./plugins.mjs";
 import { resolveImportsStatically } from "./language-server.mjs";
 import { cloneArguments, cloneDestination, cloneEnvironment, looksRemote, parseRemoteSource, summarizeSubmodules, verifyExistingClone } from "./clone-guard.mjs";
 
@@ -624,6 +625,7 @@ export async function inspectRepository(input, repositoriesDirectory, options = 
    * happened rather than to wonder why half the call chains are missing.
    */
   const analyses = [];
+  const analyzedFiles = [];
   const memoryAtStart = process.memoryUsage();
   const memory = watchMemory({ intervalMs: limits.memorySampleIntervalMs ?? 25 });
   const memoryActions = [];
@@ -650,10 +652,85 @@ export async function inspectRepository(input, repositoriesDirectory, options = 
     }
     const batch = sourceFiles.slice(start, start + batchSize);
     analyses.push(...await Promise.all(batch.map((file) => analyzeFile(location.rootPath, file, { allowTreeSitter }))));
+    analyzedFiles.push(...batch);
     start += batch.length;
     report("analyze", analyses.length, sourceFiles.length, "Extracting definitions and call edges");
   }
   const memoryUsage = memory.stop();
+
+  /*
+   * Item 58: indexer plugins, asked *last* and only about what the built-in
+   * indexers could not read.
+   *
+   * The order is the whole safety argument. An extension asked first, or asked
+   * about everything, could quietly replace what a learner is told the
+   * repository contains; asked about the files where tree-sitter has no grammar
+   * and the regex patterns found nothing, the worst it can do is add symbols
+   * for a language this build does not support — which is the reason somebody
+   * would write one.
+   */
+  const pluginReport = { asked: 0, contributions: [], problems: [], definitions: 0 };
+  if (options.plugins?.some((plugin) => plugin?.manifest?.kind === "indexer")) {
+    // "What the built-in indexers could not read" is two things, and the second
+    // is the one that matters: files they *tried* and got nothing from, and
+    // files they could not attempt at all because there is no grammar and no
+    // regex pattern for the language. A plugin that only ever saw the first
+    // group could never index a language this build has never heard of, which
+    // is the reason to write one.
+    const analyzedIndex = new Map(analyzedFiles.map((file, index) => [file.path, index]));
+    const unread = fileRecords
+      .filter((file) => {
+        const index = analyzedIndex.get(file.path);
+        return index === undefined ? true : analyses[index].indexer === "none";
+      })
+      .slice(0, limits.maxAnalyzedFiles);
+    if (unread.length) {
+      pluginReport.asked = unread.length;
+      const indexedPaths = new Set(fileRecords.map((file) => file.path));
+      const outcome = await runIndexerPlugins(options.plugins, {
+        files: unread,
+        host: {
+          "read-file": (filePath) => (indexedPaths.has(filePath)
+            ? readRepositoryFile(location.rootPath, filePath)
+            : Promise.reject(new Error("That file is not part of this index."))),
+          "list-files": () => unread.map((file) => file.path),
+          symbols: (filePath) => analyses[analyzedIndex.get(filePath) ?? -1]?.symbols ?? [],
+        },
+      });
+      pluginReport.problems = outcome.problems;
+      // Snapshotted *before* anything is merged. Reading the live value would
+      // mean the first definition a plugin contributes for a file marks that
+      // file as claimed and every later one for the same file is rejected —
+      // which is exactly the bug this snapshot removes.
+      const claimable = new Set(unread.map((file) => file.path));
+      const claimedBy = new Map();
+      for (const contribution of outcome.contributions) {
+        let added = 0;
+        for (const found of contribution.definitions) {
+          // Only for files that really did come back empty: a plugin cannot
+          // overwrite a definition a built-in indexer already produced, and the
+          // first plugin to claim a file keeps it.
+          if (!claimable.has(found.path)) continue;
+          const owner = claimedBy.get(found.path);
+          if (owner !== undefined && owner !== contribution.pluginId) continue;
+          claimedBy.set(found.path, contribution.pluginId);
+          const index = analyzedIndex.get(found.path);
+          const record = { name: found.name, kind: found.kind ?? "symbol", path: found.path, line: found.line, container: found.container ?? null };
+          if (index === undefined) {
+            analyzedIndex.set(found.path, analyses.length);
+            analyzedFiles.push(fileRecords.find((file) => file.path === found.path));
+            analyses.push({ symbols: [record], references: [], callEdges: [], imports: [], indexer: `plugin:${contribution.pluginId}` });
+          } else {
+            analyses[index].symbols.push(record);
+            analyses[index].indexer = `plugin:${contribution.pluginId}`;
+          }
+          added += 1;
+        }
+        pluginReport.contributions.push({ pluginId: contribution.pluginId, definitions: added, discarded: contribution.discarded, durationMs: contribution.durationMs, logs: contribution.logs });
+        pluginReport.definitions += added;
+      }
+    }
+  }
 
   report("link", 0, 1, "Resolving references and imports");
   throwIfCancelled(signal, "link");
@@ -778,6 +855,9 @@ export async function inspectRepository(input, repositoriesDirectory, options = 
         actions: memoryActions,
         degraded: memoryActions.some((action) => action.action === "degrade-indexer"),
       },
+      // Item 58: what extensions contributed, and which ones failed. A plugin
+      // that ran and a plugin that was dropped must be distinguishable.
+      plugins: pluginReport,
     },
     indexedAt: new Date().toISOString(),
   };
