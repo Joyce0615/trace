@@ -44,6 +44,7 @@ import { applyNoteEdit } from "./notes.mjs";
 import { anchorPayload, loadOrCreateKeyPair, loadTrustedKeys, publicIdentity, responsePayload, setKeyTrust, signPackage, signPayload, verifyPackageSignature, verifyPayload } from "./signing.mjs";
 import { forgetEverything, loadExperimentState, recordObservation, setConsent } from "./experiment-store.mjs";
 import { buildSbom, publicSupplyChainReport, scanDependencies } from "./supply-chain.mjs";
+import { BUDGETS, budgetIds, evaluateAll } from "./performance.mjs";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const openedRepositories = new Map();
@@ -1259,6 +1260,50 @@ const ipcHandlers = {
     const report = { available: true, source, ...publicSupplyChainReport(bom, scanDependencies(bom, { scope })) };
     supplyChainReports.set(scope, report);
     return report;
+  },
+
+  /**
+   * What the last index cost, judged against the declared budgets (item 57).
+   *
+   * The measurements are taken where they happen: indexing time and peak
+   * resident memory in the main process, render timings in the renderer, which
+   * is the only place that can see a paint. Nothing here is a *new*
+   * measurement — the point of a budget is to judge the numbers the real work
+   * already produced, not to run a benchmark that resembles the real work.
+   */
+  "perf:report": async (_event, request) => {
+    const repository = request?.repository ? openedRepository(request.repository) : null;
+    const measurements = {};
+    const sizes = {};
+    if (repository?.stats?.timing) {
+      const files = repository.stats.fileCount || 1;
+      measurements["index.totalMs"] = repository.stats.timing.totalMs;
+      measurements["index.peakRssBytes"] = repository.stats.memory.peakRss;
+      measurements["index.peakHeapBytes"] = repository.stats.memory.peakHeap;
+      sizes["index.totalMs"] = { size: files };
+      sizes["index.peakRssBytes"] = { size: files };
+      sizes["index.peakHeapBytes"] = { size: files };
+    }
+    for (const [id, samples] of Object.entries(request?.render ?? {})) {
+      if (!BUDGETS[id]) continue;
+      // A budget with a `percentile` flag wants the distribution; the rest want
+      // the worst observation, because one slow switch is the complaint.
+      measurements[id] = BUDGETS[id].percentile ? { samples } : Math.max(...samples, 0);
+    }
+    const report = evaluateAll(measurements, sizes);
+    return {
+      ...report,
+      budgets: Object.fromEntries(budgetIds().map((id) => [id, { label: BUDGETS[id].label, unit: BUDGETS[id].unit, limit: BUDGETS[id].limit, warnAt: BUDGETS[id].warnAt, per: BUDGETS[id].per ?? null, floor: BUDGETS[id].floor ?? null, why: BUDGETS[id].why }])),
+      index: repository
+        ? {
+          files: repository.stats.fileCount,
+          analyzed: repository.stats.timing.analyzedFiles,
+          phases: repository.stats.timing.phases,
+          memoryActions: repository.stats.memory.actions,
+          degraded: repository.stats.memory.degraded,
+        }
+        : null,
+    };
   },
 
   "window:new": async (_event) => {

@@ -4,6 +4,7 @@ import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { chromium } from "playwright";
 import { auditSnapshot, collectAccessibilitySnapshot, summarizeAudit } from "../electron/accessibility.mjs";
+import { describeBudgets, evaluateAll } from "../electron/performance.mjs";
 
 const targetUrl = process.env.TRACE_URL ?? "http://127.0.0.1:5173";
 const artifactDirectory = path.resolve("artifacts", "qa");
@@ -56,6 +57,25 @@ const monacoRequests = () => requestedScripts.filter((url) => /editor\.api|edito
 const languageRequests = () => requestedScripts.filter((url) => /languages\/definitions|\/(python|typescript|cpp|rust|go)-/.test(url));
 
 try {
+  /*
+   * Item 57: a long-task observer, installed before the first navigation so it
+   * sees the work the first paint does. A long task is the frame budget being
+   * missed many times in a row — nothing responds, including the scroll — and
+   * it is invisible to every other assertion in this file, all of which wait
+   * patiently for whatever they need.
+   */
+  await page.addInitScript(() => {
+    window.__longTasks = [];
+    try {
+      new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) window.__longTasks.push(entry.duration);
+      }).observe({ type: "longtask", buffered: true });
+    } catch {
+      // No long-task support means no measurement, which is reported as an
+      // absent measurement rather than as a clean one.
+      window.__longTasks = null;
+    }
+  });
   await page.goto(targetUrl, { waitUntil: "networkidle" });
   // Item 48: the welcome screen is audited before anything is clicked, so a
   // regression in the very first thing a learner sees cannot hide behind a
@@ -881,10 +901,17 @@ try {
   await page.screenshot({ path: path.join(artifactDirectory, "colour-vision.png") });
 
   // Item 48: every view a learner can reach, audited, not just the first one.
+  // Item 57: and timed while we are there, because switching panels is the one
+  // interaction that pulls in a lazily loaded chunk.
+  const viewSwitchMs = [];
+  const domNodeCounts = [];
   for (const view of ["Diagram", "Code", "Chains", "Locate", "Review", "Notes", "Lesson"]) {
+    const startedAt = Date.now();
     await page.locator(".content-tabs").getByRole("tab", { name: view }).click();
     await page.locator(`[role="tab"][aria-selected="true"]`).filter({ hasText: view }).waitFor();
+    viewSwitchMs.push(Date.now() - startedAt);
     await page.waitForTimeout(900);
+    domNodeCounts.push(await page.evaluate(() => document.querySelectorAll("*").length));
     await auditAccessibility(`${view} view`);
   }
   await page.screenshot({ path: path.join(artifactDirectory, "accessibility.png") });
@@ -900,7 +927,41 @@ try {
   assert.ok((compactFit.tutorBottom ?? Infinity) <= compactFit.height + 1, JSON.stringify(compactFit));
 
   assert.deepEqual(errors, [], `Browser errors:\n${errors.join("\n")}`);
-  console.log(JSON.stringify({ ok: true, screenshots: artifactDirectory, fit, compactFit, accessibility: a11yAudits }, null, 2));
+
+  /*
+   * Item 57: the render budgets, judged rather than printed.
+   *
+   * Stated limitation: this page is served by the dev server, so the bytes are
+   * unminified and every module is a separate request. Timings here are
+   * therefore *worse* than production, which makes a pass meaningful and a
+   * failure worth investigating rather than the other way round. The
+   * entry-bundle budget is the one that needs the production build, and it is
+   * checked in `npm test` against `dist` instead.
+   */
+  const longTasks = await page.evaluate(() => window.__longTasks);
+  const renderMeasurements = {
+    "render.viewSwitchMs": Math.max(...viewSwitchMs),
+    "render.domNodes": Math.max(...domNodeCounts),
+  };
+  // No long-task support means no measurement. Reporting zero would be a claim.
+  if (Array.isArray(longTasks) && longTasks.length) renderMeasurements["render.longTaskMs"] = Math.max(...longTasks);
+  const renderBudgets = evaluateAll(renderMeasurements);
+  assert.equal(renderBudgets.passed, true, `${renderBudgets.summary}\n${describeBudgets(renderBudgets)}`);
+  assert.ok(viewSwitchMs.length === 7 && domNodeCounts.every((count) => count > 50), JSON.stringify(domNodeCounts));
+
+  console.log(JSON.stringify({
+    ok: true,
+    screenshots: artifactDirectory,
+    fit,
+    compactFit,
+    accessibility: a11yAudits,
+    performance: {
+      viewSwitchMs,
+      maxDomNodes: Math.max(...domNodeCounts),
+      longTasks: Array.isArray(longTasks) ? { count: longTasks.length, longestMs: longTasks.length ? Math.round(Math.max(...longTasks)) : 0 } : "unsupported",
+      verdicts: renderBudgets.results.map((result) => `${result.id}=${result.verdict}(${result.value}/${result.ceiling})`),
+    },
+  }, null, 2));
 } finally {
   await context.close();
   await browser.close();

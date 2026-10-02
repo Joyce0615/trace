@@ -360,6 +360,14 @@ export const IPC_SCHEMAS = {
   // Item 56: what this build is made of. No repository reference, because the
   // answer is a property of the application rather than of anything opened.
   "supply-chain:report": s.object({ scope: s.literal(["all", "runtime"], { optional: true }) }),
+  // Item 57: what the last index cost, judged against the declared budgets.
+  // Samples come from the renderer because only the renderer can time a paint;
+  // they are bounded here so a hostile page cannot make the main process hold
+  // an unbounded array of numbers.
+  "perf:report": s.object({
+    repository: s.object({ id: s.string({ maxLength: 128 }), rootPath: s.string({ maxLength: 4_096 }) }, { optional: true, nullable: true }),
+    render: s.record({ maxKeys: 8, value: s.array(s.number({ min: 0, max: 600_000 }), { maxItems: 200 }), optional: true }),
+  }),
   "window:new": s.object({}),
   "window:state": s.object({}),
   "deep-link:open": s.object({ url: s.string({ maxLength: 2_048, minLength: 1 }) }),

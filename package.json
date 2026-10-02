@@ -18,6 +18,7 @@
     "test:components": "node tests/component-smoke.mjs",
     "preflight": "node scripts/preflight.mjs",
     "test:portable": "node tests/electron-portable.mjs",
+    "perf": "node scripts/perf-budget.mjs",
     "sbom": "node scripts/supply-chain.mjs",
     "supply-chain": "node scripts/supply-chain.mjs --audit --require-advisories --fail-on=high",
     "ci": "npm run lint && npm run build && npm run coverage && npm run test:components && npm run test:ui && npm run test:portable",

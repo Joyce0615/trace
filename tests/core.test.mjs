@@ -57,6 +57,8 @@ import { buildSkillGraph, createLearnerState, reconcileLearnerState } from "../e
 import { loadLearnerState, loadLearnerStateReport, saveLearnerState } from "../electron/learning-store.mjs";
 import { DURABLE_VERSION, inspectDurable, readDurable, sweepInterruptedWrites, writeDurable } from "../electron/durable-store.mjs";
 import { BUILD_TYPE, DEFAULT_LICENSE_POLICY, IN_TOTO_STATEMENT_TYPE, SBOM_SPEC_VERSION, SLSA_PREDICATE_TYPE, SUPPLY_CHAIN_VERSION, buildProvenance, buildSbom, compareBuilds, describeScan, firstByteDifference, hashesFromIntegrity, importNpmAudit, licenseBreakdown, publicSupplyChainReport, purlFor, runtimeComponents, satisfiesRange, sbomDigest, scanDependencies, scanPasses, signProvenance, verifyProvenance } from "../electron/supply-chain.mjs";
+import { BUDGETS, DEFAULT_NOISE, MIN_SAMPLES_FOR_PERCENTILE, PERFORMANCE_VERSION, budgetIds, compareToBaseline, describeBudgets, effectiveCeiling, evaluateAll, evaluateBudget, memoryPressureAction, percentile, summarize, watchMemory } from "../electron/performance.mjs";
+import { measurementsFrom, measureWorkspace } from "../scripts/perf-budget.mjs";
 
 const execFileAsync = promisify(execFile);
 const round4 = (value) => Number(Number(value).toFixed(4));
@@ -505,7 +507,12 @@ test("the production entry bundle excludes Monaco and stays inside its budget", 
     assert.equal(/monaco-editor\/esm\/vs\/editor\/editor\.main/.test(source), false, `${asset} statically bundles the Monaco editor core`);
     assert.equal(/createMonacoBaseAPI|StandaloneEditor/.test(source), false, `${asset} statically bundles Monaco internals`);
   }
-  assert.ok(eagerBytes < 320_000, `eager bundle grew to ${eagerBytes} bytes across ${eager.join(", ")}`);
+  // The ceiling lives in `BUDGETS` (item 57) rather than as a number here, so
+  // there is exactly one place it can be raised and it cannot be raised
+  // without a reason written beside it.
+  const bundleBudget = evaluateBudget("render.entryBundleBytes", eagerBytes);
+  assert.equal(bundleBudget.verdict === "fail", false, `eager bundle grew to ${eagerBytes} bytes across ${eager.join(", ")}; ${bundleBudget.detail}`);
+  assert.equal(BUDGETS["render.entryBundleBytes"].limit, 320_000);
 
   // Monaco still ships, but only as separately fetchable chunks.
   const monacoCore = assets.filter((asset) => /^editor\.api-.*\.js$/.test(asset));
@@ -783,7 +790,7 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
     "learning:diagnose", "learning:probe", "learning:schedule", "learning:review",
     "quiz:build", "quiz:grade", "explain:task", "explain:grade",
     "activity:build", "activity:grade", "hint:next", "analytics:report",
-    "course:package", "course:import", "course:verify-signature", "course:migrate", "course:revert-migration", "notes:list", "notes:save", "archive:export", "archive:import", "recovery:report", "practice:release", "supply-chain:report", "window:new", "window:state", "deep-link:open", "deep-link:last",
+    "course:package", "course:import", "course:verify-signature", "course:migrate", "course:revert-migration", "notes:list", "notes:save", "archive:export", "archive:import", "recovery:report", "practice:release", "supply-chain:report", "perf:report", "window:new", "window:state", "deep-link:open", "deep-link:last",
     "signing:identity", "signing:trust", "goals:plan", "experiment:state", "experiment:consent", "experiment:forget", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
@@ -6423,4 +6430,249 @@ test("the bill of materials is read off the tree, the scan admits what it did no
   assert.equal(publicText.includes("node_modules/"), false, "an install path reached the renderer payload");
   assert.equal(publicText.includes(os.homedir()), false);
   assert.deepEqual(licenseBreakdown({ components: [] }), []);
+});
+
+test("performance budgets scale with the work, refuse to judge too few samples, and the indexer gives ground before it runs out of memory", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-perf-"));
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+
+  // --- Percentiles, and knowing when not to report one --------------------
+  const evenly = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+  assert.equal(percentile(evenly, 0.5), 5);
+  assert.equal(percentile(evenly, 0.95), 10);
+  assert.equal(percentile(evenly, 0), 1);
+  assert.equal(percentile([], 0.5), null);
+  assert.equal(percentile([5], 0.95), 5);
+  // Non-numbers are dropped rather than sorted into the middle of the list.
+  assert.equal(percentile([1, null, 3, undefined, Number.NaN, 5], 0.5), 3);
+  const summary = summarize(evenly);
+  assert.equal(summary.count, 10);
+  assert.equal(summary.reliable, true);
+  assert.deepEqual([summary.min, summary.max, summary.mean, summary.p50], [1, 10, 5.5, 5]);
+  // A p95 over five samples is the maximum with a decimal point on it.
+  assert.equal(summarize([1, 2, 3, 4, 5]).reliable, false);
+  assert.equal(MIN_SAMPLES_FOR_PERCENTILE, 8);
+  assert.deepEqual(summarize([]), { count: 0, reliable: false, min: null, max: null, mean: null, p50: null, p95: null, p99: null });
+
+  // --- A budget that scales with the input ---------------------------------
+  // "Index in under ten seconds" is a statement about the fixture. Run it on a
+  // repository twice the size and it fails with nothing having got slower.
+  const indexBudget = BUDGETS["index.totalMs"];
+  assert.equal(indexBudget.per, "files");
+  assert.equal(effectiveCeiling(indexBudget, 2_000), 24_000);
+  // ...but never below the floor, or a two-file fixture fails for being small.
+  assert.equal(effectiveCeiling(indexBudget, 2), indexBudget.floor);
+  assert.equal(effectiveCeiling(BUDGETS["render.entryBundleBytes"], 9_999), 320_000, "an unscaled budget must ignore the size");
+  for (const id of budgetIds()) {
+    const budget = BUDGETS[id];
+    assert.ok(budget.why && budget.why.length > 30, `${id} has no reason recorded, so nobody can argue with it`);
+    assert.ok(budget.warnAt < budget.limit, `${id} warns at or above the point it fails`);
+    assert.ok(budget.unit, `${id} has no unit`);
+    if (budget.per) assert.ok(budget.floor > 0, `${id} scales with ${budget.per} but has no floor`);
+  }
+
+  // --- Verdicts ------------------------------------------------------------
+  const wellUnder = evaluateBudget("index.totalMs", 4_000, { size: 2_000 });
+  assert.equal(wellUnder.verdict, "pass");
+  assert.equal(wellUnder.ceiling, 24_000);
+  assert.equal(wellUnder.headroom, 20_000);
+  assert.match(wellUnder.detail, /4000 ms against a ceiling of 24000/);
+  assert.equal(evaluateBudget("index.totalMs", 13_000, { size: 2_000 }).verdict, "warn");
+  const over = evaluateBudget("index.totalMs", 30_000, { size: 2_000 });
+  assert.equal(over.verdict, "fail");
+  assert.match(over.detail, /exceeds the ceiling of 24000/);
+  assert.ok(over.why.length > 30, "a failure that does not say why the ceiling exists is one nobody can act on");
+  assert.throws(() => evaluateBudget("index.somethingElse", 1), /Unknown performance budget/);
+
+  // A percentile budget takes samples, and says so when there are too few.
+  const thin = evaluateBudget("search.p95Ms", { samples: [10, 12, 9] });
+  assert.equal(thin.verdict, "insufficient-data", JSON.stringify(thin));
+  assert.match(thin.detail, /below the 8 needed/);
+  const thick = evaluateBudget("search.p95Ms", { samples: [10, 12, 9, 11, 10, 13, 9, 400] });
+  assert.equal(thick.verdict, "fail");
+  assert.equal(thick.value, 400, "the p95 of eight samples is the largest");
+  assert.equal(thick.samples.reliable, true);
+  assert.equal(evaluateBudget("search.coldMs", Number.NaN).verdict, "insufficient-data");
+  // `Number(null)` is 0 and `Number("")` is 0, so a measurement that was never
+  // taken would otherwise score better than any measurement that was.
+  for (const missing of [null, undefined, "", "12"]) {
+    assert.equal(evaluateBudget("search.coldMs", missing).verdict, "insufficient-data", `${JSON.stringify(missing)} was judged as a measurement`);
+  }
+
+  // --- The whole set, and what it refuses to call clean --------------------
+  const passing = evaluateAll({ "search.coldMs": 20, "render.entryBundleBytes": 100_000 });
+  assert.equal(passing.passed, true);
+  // A suite that quietly stopped measuring startup must not report a clean sheet.
+  assert.ok(passing.unmeasured.includes("startup.firstWindowMs"));
+  assert.match(passing.summary, /not measured/);
+  const failing = evaluateAll({ "search.coldMs": 5_000, "render.entryBundleBytes": 900_000 });
+  assert.equal(failing.passed, false);
+  assert.deepEqual(failing.failures.sort(), ["render.entryBundleBytes", "search.coldMs"]);
+  assert.match(failing.summary, /2 budget\(s\) exceeded/);
+  assert.match(failing.summary, /against 320000/);
+  assert.equal(describeBudgets(failing).split("\n").length, 2);
+  assert.match(describeBudgets(failing), /^FAIL/m);
+
+  // --- Regression against a baseline, with a noise floor -------------------
+  // Without one, every run "regresses", people stop reading the output, and the
+  // check is worse than nothing.
+  const baseline = evaluateAll({ "search.coldMs": 100, "render.entryBundleBytes": 200_000, "render.domNodes": 1_000 });
+  const noisy = compareToBaseline(evaluateAll({ "search.coldMs": 108, "render.entryBundleBytes": 203_000, "render.domNodes": 1_050 }), baseline);
+  assert.equal(noisy.clean, true, JSON.stringify(noisy.changes));
+  assert.deepEqual(noisy.changes.map((change) => change.kind), ["unchanged", "unchanged", "unchanged"]);
+  const regressed = compareToBaseline(evaluateAll({ "search.coldMs": 300, "render.entryBundleBytes": 200_000, "render.domNodes": 1_000 }), baseline);
+  assert.equal(regressed.clean, false);
+  assert.deepEqual(regressed.regressions, ["search.coldMs"]);
+  assert.match(regressed.summary, /100 → 300 ms \(200%\)/);
+  // A 20% change of 3 ms is scheduler noise; the absolute threshold catches it.
+  const tiny = compareToBaseline(evaluateAll({ "search.coldMs": 4 }), evaluateAll({ "search.coldMs": 2 }));
+  assert.equal(tiny.changes[0].kind, "unchanged", JSON.stringify(tiny.changes[0]));
+  assert.equal(DEFAULT_NOISE.absolute.ms, 25);
+  // A metric that stopped being measured is not an improvement.
+  const dropped = compareToBaseline(evaluateAll({ "search.coldMs": 100 }), baseline);
+  assert.deepEqual(dropped.stoppedMeasuring.sort(), ["render.domNodes", "render.entryBundleBytes"]);
+  assert.equal(dropped.clean, false);
+  assert.match(dropped.summary, /no longer measured/);
+  assert.equal(compareToBaseline(evaluateAll({ "search.coldMs": 100 }), { results: [] }).changes[0].kind, "new");
+  const better = compareToBaseline(evaluateAll({ "search.coldMs": 40 }), evaluateAll({ "search.coldMs": 100 }));
+  assert.deepEqual(better.improvements, ["search.coldMs"]);
+  assert.equal(better.clean, true);
+
+  // --- The memory watch ----------------------------------------------------
+  // Peak, not final: by the time a phase ends, whatever nearly exhausted the
+  // machine has usually been collected.
+  const readings = [{ rss: 100, heapUsed: 40 }, { rss: 900, heapUsed: 300 }, { rss: 120, heapUsed: 45 }];
+  let cursor = 0;
+  const watch = watchMemory({ intervalMs: 10_000, now: () => readings[Math.min(cursor++, readings.length - 1)] });
+  watch.sample();
+  watch.sample();
+  assert.equal(watch.peak().peakRss, 900);
+  const stopped = watch.stop();
+  assert.equal(stopped.peakRss, 900, "the high-water mark must survive the value falling back");
+  assert.equal(stopped.peakHeap, 300);
+  assert.ok(stopped.samples >= 3);
+
+  // The guard has two rungs, and only one of them changes any result.
+  assert.equal(memoryPressureAction(1_000, { softLimit: 2_000, hardLimit: 3_000 }).action, "none");
+  const narrow = memoryPressureAction(2_500, { softLimit: 2_000, hardLimit: 3_000 });
+  assert.equal(narrow.action, "narrow-concurrency");
+  assert.match(narrow.reason, /without changing any result/);
+  const degrade = memoryPressureAction(3_500, { softLimit: 2_000, hardLimit: 3_000 });
+  assert.equal(degrade.action, "degrade-indexer");
+  assert.match(degrade.reason, /fewer symbols and no call edges/);
+  assert.equal(memoryPressureAction(9e12, {}).action, "none", "an absent limit must not act");
+
+  // --- The real indexer, timed and watched --------------------------------
+  const fixture = await createFixtureRepository(path.join(workspace, "repo"));
+  const indexed = await inspectRepository(fixture, path.join(workspace, "repos"));
+  const timing = indexed.stats.timing;
+  assert.ok(timing.totalMs > 0);
+  // Per phase, because a single total tells you it got slower and not which
+  // part did.
+  for (const phase of ["prepare", "discover", "read", "git", "analyze", "link"]) {
+    assert.ok(phase in timing.phases, `no timing for the ${phase} phase: ${Object.keys(timing.phases).join(", ")}`);
+    assert.ok(timing.phases[phase] >= 0);
+  }
+  assert.ok(Object.values(timing.phases).reduce((sum, value) => sum + value, 0) <= timing.totalMs + 1);
+  assert.equal(timing.analyzedFiles > 0, true);
+  assert.equal(indexed.stats.memory.peakRss > 0, true);
+  assert.equal(indexed.stats.memory.peakHeap > 0, true);
+  assert.deepEqual(indexed.stats.memory.actions, [], "the guard acted on a nine-file repository");
+  assert.equal(indexed.stats.memory.degraded, false);
+  const treeSitterSymbols = indexed.symbols.length;
+  const treeSitterEdges = indexed.stats.callEdgeCount;
+  assert.ok(treeSitterEdges > 0, "the fixture must produce call edges when tree-sitter is used");
+
+  // --- The guard actually acting -------------------------------------------
+  // A limit of one byte is not realistic, and that is the point: it forces the
+  // rung deterministically, on any machine, and proves the degraded index is
+  // still a working index rather than an empty one.
+  const guarded = await inspectRepository(fixture, path.join(workspace, "repos-guarded"), {
+    limits: { memorySoftLimitBytes: 1, memoryHardLimitBytes: 2, analysisBatchSize: 2 },
+  });
+  assert.equal(guarded.stats.memory.degraded, true);
+  const actions = guarded.stats.memory.actions.map((action) => action.action);
+  assert.ok(actions.includes("degrade-indexer"), actions.join(","));
+  assert.match(guarded.stats.memory.actions.find((action) => action.action === "degrade-indexer").reason, /hard limit/);
+  assert.equal(typeof guarded.stats.memory.actions[0].atFile, "number");
+  // Degraded still means indexed: the regex indexer finds fewer symbols and no
+  // call edges, and the repository is still usable.
+  assert.ok(guarded.symbols.length > 0, "the degraded index found no symbols at all");
+  assert.ok(guarded.symbols.length <= treeSitterSymbols);
+  assert.equal(guarded.stats.indexerCounts["tree-sitter"] ?? 0, 0, "tree-sitter kept running past the hard limit");
+  assert.ok((guarded.stats.indexerCounts.regex ?? 0) > 0, JSON.stringify(guarded.stats.indexerCounts));
+  assert.equal(guarded.stats.callEdgeCount, 0, "the regex indexer cannot produce call edges, so claiming any would be a lie");
+  assert.equal(guarded.stats.fileCount, indexed.stats.fileCount, "the guard must not lose files");
+  // And the soft rung on its own narrows concurrency without degrading.
+  const narrowed = await inspectRepository(fixture, path.join(workspace, "repos-narrow"), {
+    limits: { memorySoftLimitBytes: 1, memoryHardLimitBytes: 9_000_000_000_000, analysisBatchSize: 8 },
+  });
+  assert.equal(narrowed.stats.memory.degraded, false);
+  assert.ok(narrowed.stats.memory.actions.some((action) => action.action === "narrow-concurrency"), JSON.stringify(narrowed.stats.memory.actions));
+  assert.equal(narrowed.symbols.length, treeSitterSymbols, "narrowing concurrency changed a result, which it must never do");
+  assert.equal(narrowed.stats.callEdgeCount, treeSitterEdges);
+  assert.ok(narrowed.stats.memory.actions.at(-1).batchSize <= 4, JSON.stringify(narrowed.stats.memory.actions.at(-1)));
+
+  // --- Measuring, and where the measurement is honest ----------------------
+  const measured = await measureWorkspace(fixture, { repositoriesDirectory: path.join(workspace, "repos-measured") });
+  assert.equal(measured.repository.files, indexed.stats.fileCount);
+  assert.ok(measured.samples.length >= MIN_SAMPLES_FOR_PERCENTILE, `${measured.samples.length} samples is too few to produce a p95`);
+  assert.ok(measured.coldMs >= 0);
+  const { measurements, sizes } = measurementsFrom(measured, { entryBytes: 200_000 });
+  // Totals, not rates: the rate lives in the budget and is scaled by the size.
+  assert.equal(measurements["index.totalMs"], measured.timing.totalMs);
+  assert.equal(measurements["index.peakRssBytes"], measured.memory.peakRss);
+  assert.equal(sizes["index.totalMs"].size, measured.repository.files);
+  assert.equal(evaluateAll(measurements, sizes).results.find((result) => result.id === "render.entryBundleBytes").value, 200_000);
+  assert.equal(evaluateAll(measurements, sizes).results.find((result) => result.id === "search.p95Ms").verdict !== "insufficient-data", true);
+  assert.equal(PERFORMANCE_VERSION, 1);
+  /*
+   * Resident memory is a property of the process, not of the operation, and
+   * this test file has already indexed a real repository, built two releases,
+   * and parsed a thousand files. Judging `index.peakRssBytes` here would be
+   * judging the test runner. That is not a caveat to write in a comment and
+   * move on from — it is the reason the memory budget is enforced by running
+   * the real tool in a clean process below, and the reason `stats.memory`
+   * reports the reading at the start beside the peak.
+   */
+  assert.ok(indexed.stats.memory.rssAtStart > 0);
+  assert.ok(indexed.stats.memory.peakRss >= indexed.stats.memory.rssAtStart);
+  assert.ok(measured.memory.peakRss > measured.memory.rssAtStart - 1);
+
+  // --- The tool, run for real, in its own process --------------------------
+  const reportPath = path.join(workspace, "perf.json");
+  const cleanRun = await execFileAsync(process.execPath, [path.resolve("scripts", "perf-budget.mjs"), `--repo=${fixture}`, `--out=${reportPath}`], { maxBuffer: 32 * 1024 * 1024 });
+  const written = JSON.parse(await readFile(reportPath, "utf8"));
+  assert.equal(written.passed, true, `${written.summary}\n${cleanRun.stderr}`);
+  assert.equal(written.repository.files, indexed.stats.fileCount);
+  assert.ok(written.results.some((result) => result.id === "index.peakRssBytes" && result.verdict === "pass"), JSON.stringify(written.results.find((result) => result.id === "index.peakRssBytes")));
+  assert.ok(written.machine.platform.length > 3, "a performance report that does not say what machine produced it is not comparable");
+  assert.ok(written.phases.analyze >= 0);
+  assert.deepEqual(written.memoryActions, []);
+  // Startup and rendering cannot be measured without a window, and the report
+  // says which budgets it did not reach rather than implying a clean sheet.
+  assert.deepEqual(written.unmeasured.sort(), ["render.domNodes", "render.longTaskMs", "render.viewSwitchMs", "startup.firstWindowMs", "startup.interactiveMs"]);
+
+  // ...and it fails the run rather than printing a number, when a baseline says
+  // the same measurement used to be far better.
+  const baselinePath = path.join(workspace, "baseline.json");
+  await writeFile(baselinePath, JSON.stringify({
+    results: written.results.map((result) => (result.id === "index.totalMs" ? { ...result, value: Math.max(1, result.value / 100) } : result)),
+  }));
+  await assert.rejects(
+    () => execFileAsync(process.execPath, [path.resolve("scripts", "perf-budget.mjs"), `--repo=${fixture}`, `--baseline=${baselinePath}`], { maxBuffer: 32 * 1024 * 1024 }),
+    (error) => {
+      assert.equal(error.code, 1, "a regression must fail the run, not merely be printed");
+      assert.match(error.stderr, /regression\(s\): index\.totalMs/);
+      return true;
+    },
+  );
+  // An unreadable baseline is reported as unreadable, not as "no regressions".
+  const unreadable = await execFileAsync(process.execPath, [path.resolve("scripts", "perf-budget.mjs"), `--repo=${fixture}`, "--baseline=/nonexistent/baseline.json", `--out=${path.join(workspace, "perf2.json")}`], { maxBuffer: 32 * 1024 * 1024 });
+  assert.equal(JSON.parse(await readFile(path.join(workspace, "perf2.json"), "utf8")).regression.unavailable, true, unreadable.stdout.slice(0, 200));
+
+  // A budget only earns its keep if it fails, so this proves it would.
+  const strict = evaluateBudget("index.totalMs", measured.timing.totalMs, { size: 0 });
+  assert.equal(strict.ceiling, BUDGETS["index.totalMs"].floor);
+  assert.equal(evaluateBudget("render.domNodes", 9_000).verdict, "fail");
 });

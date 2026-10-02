@@ -3,6 +3,7 @@ import { access, lstat, mkdir, readdir, readFile, realpath, rm, stat } from "nod
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { analyzeSource, treeSitterSupports } from "./tree-sitter-index.mjs";
+import { memoryPressureAction, watchMemory } from "./performance.mjs";
 import { resolveImportsStatically } from "./language-server.mjs";
 import { cloneArguments, cloneDestination, cloneEnvironment, looksRemote, parseRemoteSource, summarizeSubmodules, verifyExistingClone } from "./clone-guard.mjs";
 
@@ -83,6 +84,20 @@ export const DEFAULT_INDEX_LIMITS = {
   maxCallEdges: 20_000,
   maxImports: 20_000,
   analysisBatchSize: 48,
+  /**
+   * Memory guards for the analysis phase (item 57).
+   *
+   * Measured on a 2,196-file repository: peak resident memory during analysis
+   * is about 1.6 GB while what survives the phase is around 0.45 GB, because
+   * most of the peak is the parser's WebAssembly arena and garbage the
+   * collector has not got to yet. So there are two rungs. The soft limit
+   * narrows concurrency, which lowers the high-water mark and changes nothing
+   * about the result. The hard limit stops using tree-sitter, which *does*
+   * change the result — fewer symbols, no call edges — and so is reported in
+   * `stats.memory.actions` rather than applied quietly.
+   */
+  memorySoftLimitBytes: 1_800_000_000,
+  memoryHardLimitBytes: 3_000_000_000,
 };
 
 export class IndexCancelledError extends Error {
@@ -106,9 +121,39 @@ function resolveLimits(overrides = {}) {
   return limits;
 }
 
-function progressReporter(onProgress) {
+/**
+ * Time each indexing phase (item 57).
+ *
+ * A single total tells you the index got slower; per-phase timings tell you
+ * *which* part did, which is the difference between a number in a report and a
+ * lead. The clock is monotonic, so a system time change during a long index
+ * cannot produce a negative duration.
+ */
+function phaseTimer() {
+  const durations = {};
+  let current = null;
+  let currentStarted = performance.now();
+  const startedAt = currentStarted;
+  return {
+    enter(phase) {
+      const now = performance.now();
+      if (current) durations[current] = Number(((durations[current] ?? 0) + (now - currentStarted)).toFixed(3));
+      current = phase;
+      currentStarted = now;
+    },
+    finish() {
+      const now = performance.now();
+      if (current) durations[current] = Number(((durations[current] ?? 0) + (now - currentStarted)).toFixed(3));
+      current = null;
+      return { phases: durations, totalMs: Number((now - startedAt).toFixed(3)) };
+    },
+  };
+}
+
+function progressReporter(onProgress, timer = null) {
   let lastPhase = null;
   return (phase, completed, total, message) => {
+    timer?.enter(phase);
     if (typeof onProgress !== "function") return;
     lastPhase = phase;
     try {
@@ -419,12 +464,16 @@ export async function analyzeContent(filePath, language, source) {
  * and call edges; the regex indexer remains the deterministic fallback for
  * languages without a grammar or when a parse fails.
  */
-export async function analyzeFile(rootPath, file) {
+export async function analyzeFile(rootPath, file, options = {}) {
+  // `allowTreeSitter: false` is the memory guard's last rung (item 57). The
+  // result really is different, so it gets its own cache key rather than
+  // poisoning the parsed one with a degraded answer.
+  const allowTreeSitter = options.allowTreeSitter !== false;
   const empty = { symbols: [], references: [], callEdges: [], imports: [], indexer: "none" };
   if (file.size > 600_000) return empty;
-  const canParse = treeSitterSupports(file.language, file.path);
+  const canParse = allowTreeSitter && treeSitterSupports(file.language, file.path);
   if (!canParse && !symbolPatterns(file.language).length) return empty;
-  const cacheKey = file.blobId ? `${file.path}:${file.blobId}` : null;
+  const cacheKey = file.blobId ? `${file.path}:${file.blobId}${allowTreeSitter ? "" : ":regex-only"}` : null;
   if (cacheKey && analysisCache.has(cacheKey)) {
     analysisCacheHits += 1;
     return analysisCache.get(cacheKey);
@@ -462,7 +511,8 @@ export async function analyzeFile(rootPath, file) {
 export async function inspectRepository(input, repositoriesDirectory, options = {}) {
   const limits = resolveLimits(options.limits);
   const signal = options.signal ?? null;
-  const report = progressReporter(options.onProgress);
+  const timer = phaseTimer();
+  const report = progressReporter(options.onProgress, timer);
   const truncated = [];
 
   report("prepare", 0, 1, "Locating the repository");
@@ -562,14 +612,48 @@ export async function inspectRepository(input, repositoriesDirectory, options = 
     truncated.push({ limit: "maxAnalyzedFiles", value: limits.maxAnalyzedFiles, skipped: parseableFiles.length - sourceFiles.length });
   }
 
-  // Streaming analysis: bounded-concurrency batches with progress between batches.
+  /*
+   * Streaming analysis: bounded-concurrency batches with progress between them,
+   * now watched for memory pressure (item 57).
+   *
+   * The guard is checked between batches rather than inside one, because the
+   * only lever available at that point — how many files are parsed at once — is
+   * a property of the next batch. Both rungs are recorded, and the second one
+   * is recorded loudly: dropping to the regex indexer means the rest of the
+   * repository is described less well, and a learner is entitled to know that
+   * happened rather than to wonder why half the call chains are missing.
+   */
   const analyses = [];
-  for (let start = 0; start < sourceFiles.length; start += limits.analysisBatchSize) {
+  const memoryAtStart = process.memoryUsage();
+  const memory = watchMemory({ intervalMs: limits.memorySampleIntervalMs ?? 25 });
+  const memoryActions = [];
+  let batchSize = limits.analysisBatchSize;
+  let allowTreeSitter = true;
+  let start = 0;
+  while (start < sourceFiles.length) {
     throwIfCancelled(signal, "analyze");
-    const batch = sourceFiles.slice(start, start + limits.analysisBatchSize);
-    analyses.push(...await Promise.all(batch.map((file) => analyzeFile(location.rootPath, file))));
+    // Checked *before* the batch as well as after it. Memory can already be
+    // tight when analysis begins — a second window, a large repository indexed
+    // a moment ago — and a guard that only reacts to its own damage would parse
+    // a whole batch at the very moment it should not have parsed anything.
+    memory.sample();
+    const pressure = memoryPressureAction(memory.peak().peakRss, {
+      softLimit: limits.memorySoftLimitBytes,
+      hardLimit: limits.memoryHardLimitBytes,
+    });
+    if (pressure.action === "degrade-indexer" && allowTreeSitter) {
+      allowTreeSitter = false;
+      memoryActions.push({ ...pressure, atFile: analyses.length });
+    } else if (pressure.action === "narrow-concurrency" && batchSize > 1) {
+      batchSize = Math.max(1, Math.floor(batchSize / 2));
+      memoryActions.push({ ...pressure, atFile: analyses.length, batchSize });
+    }
+    const batch = sourceFiles.slice(start, start + batchSize);
+    analyses.push(...await Promise.all(batch.map((file) => analyzeFile(location.rootPath, file, { allowTreeSitter }))));
+    start += batch.length;
     report("analyze", analyses.length, sourceFiles.length, "Extracting definitions and call edges");
   }
+  const memoryUsage = memory.stop();
 
   report("link", 0, 1, "Resolving references and imports");
   throwIfCancelled(signal, "link");
@@ -639,6 +723,8 @@ export async function inspectRepository(input, repositoriesDirectory, options = 
     .map((file) => file.path)
     .slice(0, 20);
 
+  const timing = timer.finish();
+
   return {
     ...location,
     id: createHash("sha256").update(location.rootPath).digest("hex").slice(0, 16),
@@ -669,6 +755,29 @@ export async function inspectRepository(input, repositoriesDirectory, options = 
       truncated,
       complete: truncated.length === 0,
       submodules: location.submodules ?? { declared: 0, urls: [], checkedOut: false, note: "This repository declares no submodules." },
+      // Item 57: what the index cost, so a budget has something to judge.
+      timing: {
+        ...timing,
+        analyzedFiles: sourceFiles.length,
+        msPerFile: fileRecords.length ? Number((timing.totalMs / fileRecords.length).toFixed(4)) : 0,
+      },
+      memory: {
+        peakRss: memoryUsage.peakRss,
+        peakHeap: memoryUsage.peakHeap,
+        // Resident memory is a property of the *process*, not of this
+        // operation, so the reading at the start is reported beside the peak.
+        // Without it, "1.3 GB" is unreadable: it could be this index or it
+        // could be whatever the process was already holding.
+        rssAtStart: memoryAtStart.rss,
+        heapAtStart: memoryAtStart.heapUsed,
+        samples: memoryUsage.samples,
+        softLimit: limits.memorySoftLimitBytes,
+        hardLimit: limits.memoryHardLimitBytes,
+        // Empty means the guard never had to act, which is what should normally
+        // be true; a non-empty list is the index saying it did less than usual.
+        actions: memoryActions,
+        degraded: memoryActions.some((action) => action.action === "degrade-indexer"),
+      },
     },
     indexedAt: new Date().toISOString(),
   };

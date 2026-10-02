@@ -85,7 +85,9 @@ export default typescript.config(
     languageOptions: {
       ecmaVersion: 2024,
       sourceType: "module",
-      globals: { process: "readonly", console: "readonly", Buffer: "readonly", URL: "readonly", setTimeout: "readonly", structuredClone: "readonly", fetch: "readonly", performance: "readonly", AbortController: "readonly", document: "readonly", window: "readonly", location: "readonly", getComputedStyle: "readonly", localStorage: "readonly", matchMedia: "readonly" },
+      // `PerformanceObserver` is used inside a page-injected script (item 57),
+      // which runs in the browser rather than in the test process.
+      globals: { process: "readonly", console: "readonly", Buffer: "readonly", URL: "readonly", setTimeout: "readonly", structuredClone: "readonly", fetch: "readonly", performance: "readonly", PerformanceObserver: "readonly", AbortController: "readonly", document: "readonly", window: "readonly", location: "readonly", getComputedStyle: "readonly", localStorage: "readonly", matchMedia: "readonly" },
     },
     rules: {
       "no-console": "off",

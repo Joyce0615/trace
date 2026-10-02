@@ -4,12 +4,16 @@ import os from "node:os";
 import path from "node:path";
 import { _electron as electron } from "playwright";
 import { auditSnapshot, collectAccessibilitySnapshot, summarizeAudit } from "../electron/accessibility.mjs";
+import { describeBudgets, evaluateAll } from "../electron/performance.mjs";
 
 const repositoryPath = process.env.TRACE_ELECTRON_REPO ?? "/Users/user/GitHub/flashinfer";
 const artifactDirectory = path.resolve("artifacts", "qa");
 const userDataDirectory = await mkdtemp(path.join(os.tmpdir(), "trace-electron-"));
 await mkdir(artifactDirectory, { recursive: true });
 
+// Item 57: startup is timed from before the process exists, because everything
+// between `launch` and a window a learner can look at is time they are waiting.
+const launchStartedAt = Date.now();
 const electronApp = await electron.launch({
   args: [".", `--user-data-dir=${userDataDirectory}`],
   cwd: process.cwd(),
@@ -18,6 +22,11 @@ const electronApp = await electron.launch({
 
 try {
   const page = await electronApp.firstWindow();
+  const firstWindowMs = Date.now() - launchStartedAt;
+  // "First window" is not the product; the first moment something can be
+  // clicked is, so both are measured and budgeted separately.
+  await page.getByRole("button", { name: /Explore nano-vllm|Start learning/ }).first().waitFor({ timeout: 60_000 });
+  const interactiveMs = Date.now() - launchStartedAt;
 
   // Item 20: streaming progress is reported and an in-flight index can be cancelled.
   await page.evaluate(() => {
@@ -1955,6 +1964,63 @@ try {
   assert.match(supplyChain.rejected ?? "", /must be one of all, runtime/, String(supplyChain.rejected));
   assert.equal(supplyChain.text.includes("node_modules/"), false, "an install path from the build machine reached the renderer");
   assert.equal(supplyChain.text.includes(os.homedir()), false, "a build-machine home directory reached the renderer");
+  /*
+   * Item 57: the budgets, judged against what this run actually cost.
+   *
+   * Nothing here is a benchmark. The indexing numbers are the ones the real
+   * index of a real 2,000-file repository produced a few hundred assertions
+   * ago; the startup numbers are the wait a learner had. A benchmark that
+   * resembles the work is a thing that can be tuned; the work cannot.
+   */
+  const viewSwitchSamples = [];
+  for (const view of ["Diagram", "Code", "Chains", "Lesson"]) {
+    const startedAt = Date.now();
+    await tabStrip.getByRole("tab", { name: view }).click();
+    await page.locator('[role="tab"][aria-selected="true"]').filter({ hasText: view }).waitFor();
+    viewSwitchSamples.push(Date.now() - startedAt);
+  }
+  const domNodes = await page.evaluate(() => document.querySelectorAll("*").length);
+  const perf = await page.evaluate(async (payload) => window.trace.performance(payload), {
+    repository: { id: await page.evaluate(() => window.traceWorkspace.repository.id), rootPath: repositoryPath },
+    render: { "render.viewSwitchMs": viewSwitchSamples, "render.domNodes": [domNodes] },
+  });
+  assert.equal(perf.passed, true, `${perf.summary}\n${perf.results.map((result) => `${result.verdict} ${result.id} ${result.value}/${result.ceiling}`).join("\n")}`);
+  // The main process really did measure the index, rather than returning an
+  // empty report that happens to contain no failures.
+  assert.ok(perf.index.files > 1_000, JSON.stringify(perf.index));
+  assert.ok(perf.index.phases.analyze > 0);
+  assert.equal(perf.index.degraded, false, JSON.stringify(perf.index.memoryActions));
+  const indexResult = perf.results.find((result) => result.id === "index.totalMs");
+  assert.ok(indexResult && indexResult.value > 0, JSON.stringify(indexResult));
+  assert.equal(indexResult.size, perf.index.files, "the indexing budget must scale with the repository it indexed");
+  assert.ok(indexResult.ceiling > indexResult.value, indexResult.detail);
+  const memoryResult = perf.results.find((result) => result.id === "index.peakRssBytes");
+  assert.notEqual(memoryResult.verdict, "fail", memoryResult.detail);
+  // Every budget carries the reason its ceiling exists, all the way to the UI.
+  assert.ok(Object.values(perf.budgets).every((budget) => budget.why.length > 30));
+  assert.equal(perf.budgets["render.entryBundleBytes"].limit, 320_000);
+  // The channel refuses a sample list that is not a list of numbers.
+  const perfRejected = await page.evaluate(async () => {
+    try {
+      await window.trace.performance({ render: { "render.domNodes": ["huge"] } });
+      return null;
+    } catch (error) {
+      return error.message;
+    }
+  });
+  assert.match(perfRejected ?? "", /must be a finite number/, String(perfRejected));
+
+  const startupBudgets = evaluateAll({ "startup.firstWindowMs": firstWindowMs, "startup.interactiveMs": interactiveMs });
+  assert.equal(startupBudgets.passed, true, `${startupBudgets.summary}\n${describeBudgets(startupBudgets)}`);
+
+  const performanceReport = {
+    startup: { firstWindowMs, interactiveMs, verdicts: startupBudgets.results.map((result) => `${result.id}=${result.verdict}`) },
+    index: { files: perf.index.files, analyzed: perf.index.analyzed, phases: perf.index.phases, degraded: perf.index.degraded },
+    render: { viewSwitchMs: viewSwitchSamples, domNodes },
+    verdicts: perf.results.map((result) => `${result.id}=${result.verdict}(${Math.round(result.value)}/${Math.round(result.ceiling)})`),
+    warnings: perf.warnings,
+  };
+
   const supplyChainReport = {
     source: supplyChain.all.source,
     components: supplyChain.all.counts.total,
@@ -2005,6 +2071,7 @@ try {
     schedule: { skills: schedulePlan.summary.skills, due: schedulePlan.summary.due, stale: schedulePlan.summary.stale, meanRetention: schedulePlan.summary.meanRetention, recordedMastery: schedulePlan.summary.recordedMastery, retainedMastery: schedulePlan.summary.retainedMastery, grantedIntervalDays: scheduleAudit.recorded.review.intervalDays },
     executionTrace: { runtime: traceAudit.runtimes.python.version, calls: traceAudit.ran.summary.callCount, transitions: traceAudit.ran.summary.transitions.length, confirmed: traceAudit.ran.summary.confirmedStaticEdges, dynamicOnly: traceAudit.ran.summary.dynamicOnlyEdges },
     supplyChain: supplyChainReport,
+    performance: performanceReport,
   }, null, 2));
 } finally {
   await electronApp.close();
