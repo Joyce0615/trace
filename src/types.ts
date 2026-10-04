@@ -1184,6 +1184,37 @@ export interface ExperimentReport {
   results: ExperimentResult[];
 }
 
+/**
+ * Item 60: local telemetry, as the renderer sees it.
+ *
+ * Note what is not here: no free-form string anywhere. A dimension value is a
+ * declared label, a bucket key is a numeric band, and `folded` says how much
+ * the summary is not showing.
+ */
+export interface TelemetryEventSummary {
+  event: string;
+  what: string | null;
+  count: number;
+  series: number;
+  days: number;
+  buckets: Record<string, Record<string, number>>;
+}
+
+export interface TelemetrySummary {
+  version: number;
+  consent: { granted: boolean; changedAt: string | null };
+  destination: "local-only";
+  destinationNote: string;
+  totalEvents: number;
+  totalSeries: number;
+  retentionDays: number;
+  limits: { seriesPerEvent: number; totalSeries: number };
+  folded: { dimensionValues: number; series: number };
+  events: TelemetryEventSummary[];
+  schema: { event: string; what: string; dimensions: Record<string, number>; measures: string[] }[];
+  onDisk?: boolean;
+}
+
 export interface AnalyticsRate {
   value: number | null;
   samples: number;
@@ -1604,6 +1635,11 @@ export interface TraceBridge {
   experiments(request: { repository: RepositoryRef }): Promise<ExperimentReport>;
   setExperimentConsent(request: { repository: RepositoryRef; granted: boolean }): Promise<ExperimentReport>;
   forgetExperiments(request: { repository: RepositoryRef }): Promise<{ deletedObservations: number; hadConsent: boolean; state: ExperimentReport }>;
+  telemetry(): Promise<TelemetrySummary>;
+  setTelemetryConsent(granted: boolean): Promise<TelemetrySummary>;
+  recordTelemetry(request: { event: string; dimensions?: Record<string, string>; measures?: Record<string, number> }): Promise<{ recorded: boolean; reason: string | null; detail: string | null }>;
+  forgetTelemetry(request?: { event?: string | null }): Promise<{ deletedSeries: number; deletedEvents: number; state: TelemetrySummary }>;
+  exportTelemetry(): Promise<Record<string, unknown>>;
   analytics(request: { repository: RepositoryRef; skillGraph?: SkillGraph; learnerState?: LearnerState; now?: string }): Promise<AnalyticsReport>;
   nextHint(request: { repository: RepositoryRef; kind: HintResponse["kind"]; taskId: string; used?: string[] }): Promise<HintResponse>;
   buildActivities(request: { repository: RepositoryRef; symbol?: string }): Promise<ActivitySet>;

@@ -1015,12 +1015,18 @@ export function ExperimentPanel({ repository, state, onState }: {
   state: ExperimentState;
   onState: (update: Partial<ExperimentState>) => void;
 }) {
-  const { report, status, lastDeleted } = state;
+  const { report, status, lastDeleted, telemetry, telemetryDeleted } = state;
   useEffect(() => {
     if (status !== "idle") return;
     onState({ status: "loading" });
-    void bridge.experiments({ repository: repositoryRef(repository) })
-      .then((next) => onState({ report: next, status: "ready" }))
+    // Never return the promise: React reads a returned value as a destructor.
+    void Promise.all([
+      bridge.experiments({ repository: repositoryRef(repository) }),
+      // Item 60: telemetry is not per repository, and its absence must not stop
+      // the experiment settings from loading.
+      bridge.telemetry?.().catch(() => null) ?? Promise.resolve(null),
+    ])
+      .then(([next, counters]) => onState({ report: next, telemetry: counters, status: "ready" }))
       .catch(() => onState({ status: "error" }));
   }, [onState, repository, status]);
 
@@ -1030,6 +1036,19 @@ export function ExperimentPanel({ repository, state, onState }: {
   const forget = async () => {
     const result = await bridge.forgetExperiments({ repository: repositoryRef(repository) });
     onState({ report: result.state, lastDeleted: result.deletedObservations });
+  };
+  const setTelemetry = async (granted: boolean) => {
+    onState({ telemetry: await bridge.setTelemetryConsent(granted), telemetryDeleted: null });
+  };
+  // Counters accumulate while the learner is elsewhere in the application, so
+  // there has to be a way to look again without turning consent off and on —
+  // which would delete the very thing they wanted to see.
+  const refreshTelemetry = async () => {
+    onState({ telemetry: await bridge.telemetry(), telemetryDeleted: null });
+  };
+  const forgetTelemetry = async () => {
+    const result = await bridge.forgetTelemetry({});
+    onState({ telemetry: result.state, telemetryDeleted: result.deletedEvents });
   };
 
   return <section className="experiment-panel" data-status={status} data-consent={String(Boolean(report?.consent.granted))}>
@@ -1069,6 +1088,36 @@ export function ExperimentPanel({ repository, state, onState }: {
         {lastDeleted !== null && <small data-deleted={lastDeleted}>Deleted {lastDeleted} measurement{lastDeleted === 1 ? "" : "s"}.</small>}
       </div>
     </>}
+    {telemetry && <div className="telemetry-block" data-consent={String(telemetry.consent.granted)} data-events={telemetry.totalEvents} data-series={telemetry.totalSeries}>
+      <div className="telemetry-head">
+        <span>LOCAL USAGE COUNTERS</span>
+        <span className="telemetry-buttons">
+          <button className="ghost" onClick={() => void refreshTelemetry()}>Refresh</button>
+          {telemetry.consent.granted
+            ? <button className="ghost" onClick={() => void setTelemetry(false)}>Turn off</button>
+            : <button className="ghost" onClick={() => void setTelemetry(true)}>Turn on</button>}
+        </span>
+      </div>
+      <p className="telemetry-note" data-destination={telemetry.destination}>
+        {telemetry.consent.granted
+          ? `On. ${telemetry.totalEvents} count${telemetry.totalEvents === 1 ? "" : "s"} across ${telemetry.totalSeries} series, kept for ${telemetry.retentionDays} days, on this machine and nowhere else.`
+          : "Off. Nothing is being recorded — not anonymously, not at all."}
+      </p>
+      <p className="telemetry-fields">{telemetry.destinationNote}</p>
+      <ul className="telemetry-schema">
+        {telemetry.schema.map((entry) => <li key={entry.event} data-telemetry-event={entry.event}>
+          <strong>{entry.event}</strong>
+          <small>{entry.what}</small>
+        </li>)}
+      </ul>
+      {(telemetry.folded.dimensionValues > 0 || telemetry.folded.series > 0) && <p className="telemetry-note" data-folded={telemetry.folded.dimensionValues + telemetry.folded.series}>
+        {telemetry.folded.dimensionValues} value{telemetry.folded.dimensionValues === 1 ? "" : "s"} and {telemetry.folded.series} combination{telemetry.folded.series === 1 ? "" : "s"} were folded to keep the counters bounded, and are not shown above.
+      </p>}
+      <div className="telemetry-actions">
+        <button className="danger" onClick={() => void forgetTelemetry()}>Delete counters</button>
+        {telemetryDeleted !== null && <small data-telemetry-deleted={telemetryDeleted}>Deleted {telemetryDeleted} count{telemetryDeleted === 1 ? "" : "s"}.</small>}
+      </div>
+    </div>}
   </section>;
 }
 

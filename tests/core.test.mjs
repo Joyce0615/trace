@@ -62,6 +62,8 @@ import { measurementsFrom, measureWorkspace } from "../scripts/perf-budget.mjs";
 import { PLUGIN_API_VERSION, PLUGIN_CAPABILITIES, PLUGIN_KINDS, entryDigest, filesClaimedBy, inspectPlugin, loadPlugins, publicPluginReport, runPlugin, signPluginManifest } from "../electron/plugins.mjs";
 import { signPluginDirectory } from "../scripts/plugin-tool.mjs";
 import { DOCUMENTS, checkDocumentation, userDataDirectories } from "../scripts/docs-check.mjs";
+import { LADDERS, MAX_SERIES_PER_EVENT, MAX_TOTAL_SERIES, RETENTION_DAYS, TELEMETRY_EVENTS, TELEMETRY_VERSION, bucketFor, containsOnlyDeclaredValues, createTelemetryState, exportTelemetry, forget, pruneRetention, recordEvent, setConsent as setTelemetryConsentPure, summarize as summarizeTelemetry, telemetryEventNames } from "../electron/telemetry.mjs";
+import { forgetTelemetry, loadTelemetry, record, setTelemetryConsent, telemetryFileExists } from "../electron/telemetry-store.mjs";
 
 const execFileAsync = promisify(execFile);
 const round4 = (value) => Number(Number(value).toFixed(4));
@@ -793,7 +795,8 @@ test("IPC payloads are schema-validated, size-bounded, and depth-bounded", () =>
     "learning:diagnose", "learning:probe", "learning:schedule", "learning:review",
     "quiz:build", "quiz:grade", "explain:task", "explain:grade",
     "activity:build", "activity:grade", "hint:next", "analytics:report",
-    "course:package", "course:import", "course:verify-signature", "course:migrate", "course:revert-migration", "notes:list", "notes:save", "archive:export", "archive:import", "recovery:report", "practice:release", "supply-chain:report", "perf:report", "plugins:list", "window:new", "window:state", "deep-link:open", "deep-link:last",
+    "course:package", "course:import", "course:verify-signature", "course:migrate", "course:revert-migration", "notes:list", "notes:save", "archive:export", "archive:import", "recovery:report", "practice:release", "supply-chain:report", "perf:report", "plugins:list",
+    "telemetry:state", "telemetry:consent", "telemetry:record", "telemetry:forget", "telemetry:export", "window:new", "window:state", "deep-link:open", "deep-link:last",
     "signing:identity", "signing:trust", "goals:plan", "experiment:state", "experiment:consent", "experiment:forget", "agents:ask",
     "course:enhance", "learning:load", "learning:save", "practice:create", "practice:inspect", "practice:open", "practice:remove"];
   assert.deepEqual([...Object.keys(IPC_SCHEMAS)].sort(), [...preload].sort());
@@ -7057,7 +7060,8 @@ test("the documentation is checked against the code it describes, in both direct
   // --- The privacy statement matches what the code actually does ----------
   // "No telemetry" is checkable: nothing in the main process may make an
   // outbound request other than through git, the shell, or an agent adapter.
-  assert.match(privacy, /There is none/);
+  assert.match(privacy, /\*\*Nothing is transmitted\.\*\*/);
+  assert.match(privacy, /off means nothing is recorded/);
   const electronFiles = (await readdir(path.join(projectRoot, "electron"))).filter((name) => name.endsWith(".mjs"));
   for (const name of electronFiles) {
     const source = await readFile(path.join(projectRoot, "electron", name), "utf8");
@@ -7132,4 +7136,307 @@ test("the documentation is checked against the code it describes, in both direct
   // door rather than discoverable only by listing the directory.
   const readme = await readFile(path.join(projectRoot, "README.md"), "utf8");
   for (const relative of Object.values(DOCUMENTS)) assert.ok(readme.includes(relative), `README.md does not link ${relative}`);
+});
+
+test("local telemetry records nothing without consent, cannot hold free text, is bounded, and deletes on request", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-telemetry-"));
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  const at = (day) => new Date(`${day}T12:00:00.000Z`);
+
+  // --- Off by default, and off means nothing ------------------------------
+  const fresh = createTelemetryState();
+  assert.equal(fresh.consent.granted, false);
+  assert.equal(fresh.destination, "local-only");
+  const refused = recordEvent(fresh, "search.performed", { dimensions: { strategy: "fused", hadResults: "yes" } }, at("2026-10-04"));
+  assert.equal(refused.recorded, false);
+  assert.equal(refused.reason, "no-consent");
+  // Not "recorded anonymously" — the state is byte-identical to what went in.
+  assert.deepEqual(refused.state.series, []);
+  assert.match(refused.detail, /Nothing was recorded/);
+
+  const consented = setTelemetryConsentPure(fresh, true, at("2026-10-04"));
+  assert.equal(consented.consent.granted, true);
+  assert.ok(consented.consent.changedAt);
+
+  // --- Free text cannot get in --------------------------------------------
+  // The property the whole design rests on: there is no field a path, a symbol
+  // name, a query, or an answer could occupy.
+  for (const [name, declared] of Object.entries(TELEMETRY_EVENTS)) {
+    for (const [dimension, values] of Object.entries(declared.dimensions)) {
+      assert.ok(Array.isArray(values) && values.length > 0, `${name}.${dimension} has no declared values`);
+      assert.ok(values.every((value) => typeof value === "string" && value.length <= 24), `${name}.${dimension} has a value that is not a short label`);
+    }
+    for (const ladder of Object.values(declared.measures)) {
+      assert.ok(LADDERS[ladder], `${name} uses an unknown bucket ladder ${ladder}`);
+    }
+    assert.ok(declared.what.length > 20, `${name} does not say what it is for`);
+  }
+  // A path handed in as a dimension value becomes four letters.
+  const smuggled = recordEvent(consented, "search.performed", {
+    dimensions: { strategy: "/Users/someone/secrets/prod.env", hadResults: "yes" },
+    measures: { latencyMs: 42, results: 3 },
+  }, at("2026-10-04"));
+  assert.equal(smuggled.recorded, true);
+  assert.equal(smuggled.state.series[0].dimensions.strategy, "other");
+  assert.equal(smuggled.state.folded.dimensionValues, 1);
+  assert.equal(JSON.stringify(smuggled.state).includes("secrets"), false, "a path reached the counters");
+  assert.deepEqual(containsOnlyDeclaredValues(smuggled.state), { clean: true, offenders: [] });
+  // A dimension nobody declared is refused outright, because a field nobody
+  // declared is a field nobody thought about.
+  assert.equal(recordEvent(consented, "search.performed", { dimensions: { query: "password" } }).reason, "unknown-dimension");
+  assert.equal(recordEvent(consented, "search.performed", { measures: { exactMs: 1 } }).reason, "unknown-measure");
+  assert.equal(recordEvent(consented, "keystroke.captured", {}).reason, "unknown-event");
+  assert.equal(recordEvent(consented, "search.performed", { measures: { latencyMs: "42" } }).reason, "non-numeric-measure");
+
+  // --- Measures are bucketed, never stored exactly ------------------------
+  // 4,271 ms is a fingerprint; "2500-5000" is not.
+  assert.equal(bucketFor(4_271, "duration"), "2500-5000");
+  assert.equal(bucketFor(50, "duration"), "<=100");
+  assert.equal(bucketFor(100, "duration"), "<=100");
+  assert.equal(bucketFor(101, "duration"), "100-250");
+  assert.equal(bucketFor(1_000_000, "duration"), ">30000");
+  assert.equal(bucketFor(-1, "duration"), "invalid");
+  assert.equal(bucketFor(Number.NaN, "duration"), "invalid");
+  assert.equal(bucketFor(5, "nonexistent-ladder"), "unknown");
+  assert.equal(smuggled.state.series[0].buckets.latencyMs["25-50"], 1);
+  assert.equal(JSON.stringify(smuggled.state).includes("42"), false, "an exact measurement was stored");
+
+  // --- Counters, not a stream ---------------------------------------------
+  // Twenty identical events must produce one series with a count of twenty, and
+  // no record of when any of them happened beyond the day.
+  let stream = consented;
+  for (let index = 0; index < 20; index += 1) {
+    stream = recordEvent(stream, "review.recorded", { dimensions: { grade: "good", overdue: "no" } }, new Date(`2026-10-04T${String(index % 24).padStart(2, "0")}:11:${String(index % 59).padStart(2, "0")}.000Z`)).state;
+  }
+  assert.equal(stream.series.length, 1);
+  assert.equal(stream.series[0].count, 20);
+  assert.equal(stream.series[0].day, "2026-10-04");
+  assert.equal(/T\d{2}:\d{2}/.test(JSON.stringify(stream.series)), false, "a timestamp finer than a day survived");
+
+  // --- Cardinality is bounded twice ---------------------------------------
+  // Once per dimension, by the value set; and once per event, by a ceiling on
+  // distinct combinations, past which new ones fold and the fold is counted.
+  let crowded = setTelemetryConsentPure(createTelemetryState(), true, at("2026-10-04"));
+  for (let index = 0; index < MAX_SERIES_PER_EVENT + 30; index += 1) {
+    crowded = recordEvent(crowded, "budget.exceeded", {
+      dimensions: { budget: `made.up.budget.${index}`, verdict: index % 2 ? "warn" : "fail" },
+    }, at("2026-10-04")).state;
+  }
+  // Every fabricated budget id folded to `other`, so there are only ever four
+  // combinations however many are invented.
+  const budgetSeries = crowded.series.filter((entry) => entry.event === "budget.exceeded");
+  assert.ok(budgetSeries.length <= MAX_SERIES_PER_EVENT, `${budgetSeries.length} series survived a ceiling of ${MAX_SERIES_PER_EVENT}`);
+  assert.equal(new Set(budgetSeries.map((entry) => entry.dimensions.budget)).size, 1);
+  assert.equal(crowded.folded.dimensionValues, MAX_SERIES_PER_EVENT + 30);
+  // ...and with real ids, the ceiling itself folds rather than growing.
+  let wide = setTelemetryConsentPure(createTelemetryState(), true, at("2026-10-04"));
+  const realBudgets = budgetIds();
+  for (const budget of realBudgets) {
+    for (const verdict of ["warn", "fail"]) wide = recordEvent(wide, "budget.exceeded", { dimensions: { budget, verdict } }, at("2026-10-04")).state;
+  }
+  assert.equal(wide.series.length, realBudgets.length * 2);
+  assert.equal(wide.folded.dimensionValues, 0, "a declared budget id was folded");
+  assert.ok(wide.series.length <= MAX_SERIES_PER_EVENT, `${realBudgets.length * 2} exceeds the per-event ceiling; the schema is too wide`);
+  // The overflow rung, forced deterministically.
+  let overflowing = setTelemetryConsentPure(createTelemetryState(), true, at("2026-10-01"));
+  // Every combination is a *declared* value; the series count climbs because a
+  // series is per day as well as per dimension tuple, which is exactly how a
+  // long-running installation would reach the ceiling.
+  for (let day = 1; day <= 28; day += 1) {
+    for (const panel of ["lesson", "diagram", "code", "chains", "locate", "review", "notes"]) {
+      overflowing = recordEvent(overflowing, "panel.viewed", { dimensions: { panel } }, at(`2026-10-${String(day).padStart(2, "0")}`)).state;
+    }
+  }
+  // The ceiling is per event *per day*, and it holds: no day carries more than
+  // the ceiling plus its single fold.
+  const byDay = new Map();
+  for (const entry of overflowing.series) byDay.set(entry.day, (byDay.get(entry.day) ?? 0) + 1);
+  assert.ok([...byDay.values()].every((count) => count <= MAX_SERIES_PER_EVENT + 1), JSON.stringify([...byDay.entries()]));
+  // And the absolute backstop holds whatever the per-event rules do.
+  assert.ok(overflowing.series.length <= MAX_TOTAL_SERIES, `${overflowing.series.length} rows exceeds the hard ceiling of ${MAX_TOTAL_SERIES}`);
+  assert.equal(containsOnlyDeclaredValues(overflowing).clean, true);
+  // Forced deterministically: one day, more distinct real combinations than the
+  // per-day ceiling allows.
+  let jammed = setTelemetryConsentPure(createTelemetryState(), true, at("2026-10-04"));
+  for (const budget of budgetIds()) {
+    for (const verdict of ["warn", "fail"]) {
+      for (let repeat = 0; repeat < 4; repeat += 1) jammed = recordEvent(jammed, "budget.exceeded", { dimensions: { budget, verdict } }, at("2026-10-04")).state;
+    }
+  }
+  let jammedSeries = jammed.series.length;
+  for (let extra = 0; extra < 200; extra += 1) {
+    jammed = recordEvent(jammed, "budget.exceeded", { dimensions: { budget: `invented-${extra}`, verdict: "warn" } }, at("2026-10-04")).state;
+  }
+  assert.equal(jammed.series.length, jammedSeries + 1, "a fabricated budget id created a new series instead of folding");
+  assert.equal(jammed.folded.dimensionValues, 200);
+  jammedSeries = jammed.series.length;
+  assert.ok(jammed.series.some((entry) => entry.dimensions.budget === "other"));
+
+  // The absolute backstop: whatever the per-event rules do, the file never
+  // holds more rows than the hard ceiling, and the oldest day goes first.
+  let vast = setTelemetryConsentPure(createTelemetryState(), true, at("2026-10-01"));
+  for (let day = 1; day <= 14; day += 1) {
+    const on = `2026-10-${String(day).padStart(2, "0")}`;
+    for (const panel of ["lesson", "diagram", "code", "chains", "locate", "review", "notes"]) {
+      vast = recordEvent(vast, "panel.viewed", { dimensions: { panel } }, at(on)).state;
+    }
+    for (const budget of budgetIds()) {
+      for (const verdict of ["warn", "fail"]) vast = recordEvent(vast, "budget.exceeded", { dimensions: { budget, verdict } }, at(on)).state;
+    }
+    for (const grade of ["again", "hard", "good", "easy"]) {
+      for (const overdue of ["yes", "no"]) vast = recordEvent(vast, "review.recorded", { dimensions: { grade, overdue } }, at(on)).state;
+    }
+    assert.ok(vast.series.length <= MAX_TOTAL_SERIES, `${vast.series.length} rows on day ${day} exceeds the hard ceiling of ${MAX_TOTAL_SERIES}`);
+  }
+  assert.ok(vast.series.length > MAX_TOTAL_SERIES - 60, `only ${vast.series.length} rows; the fixture never approached the ceiling`);
+  // The oldest days are the ones that went.
+  const survivingDays = [...new Set(vast.series.map((entry) => entry.day))].sort();
+  assert.equal(survivingDays.at(-1), "2026-10-14");
+  assert.ok(survivingDays[0] > "2026-10-01", `the oldest day survived: ${survivingDays.join(",")}`);
+  assert.ok(vast.folded.series > 0, "rows were dropped without being counted");
+  assert.equal(containsOnlyDeclaredValues(vast).clean, true);
+
+  // --- Retention, enforced on read as well as on write --------------------
+  let aged = setTelemetryConsentPure(createTelemetryState(), true, at("2026-01-01"));
+  aged = recordEvent(aged, "panel.viewed", { dimensions: { panel: "lesson" } }, at("2026-01-01")).state;
+  aged = recordEvent(aged, "panel.viewed", { dimensions: { panel: "diagram" } }, at("2026-01-20")).state;
+  assert.equal(aged.series.length, 2);
+  // Writing two months later expires the January rows on the way past.
+  aged = recordEvent(aged, "panel.viewed", { dimensions: { panel: "code" } }, at("2026-03-01")).state;
+  assert.deepEqual(aged.series.map((entry) => entry.dimensions.panel), ["code"], "a January counter survived a 30-day window");
+  // ...and the same rule applies to a state nothing ever wrote to again.
+  const untouched = {
+    ...createTelemetryState(),
+    consent: { granted: true, changedAt: "2026-01-01T00:00:00.000Z" },
+    series: [{ key: "panel.viewed|panel=lesson", event: "panel.viewed", day: "2026-01-01", dimensions: { panel: "lesson" }, count: 4, buckets: {} }],
+  };
+  assert.equal(pruneRetention(untouched, at("2026-01-20")).series.length, 1);
+  assert.equal(pruneRetention(untouched, at("2026-03-10")).series.length, 0);
+  assert.equal(RETENTION_DAYS, 30);
+
+  // --- What a person is shown ---------------------------------------------
+  const summary = summarizeTelemetry(stream, at("2026-10-04"));
+  assert.equal(summary.totalEvents, 20);
+  assert.equal(summary.consent.granted, true);
+  assert.equal(summary.destination, "local-only");
+  assert.equal(summary.retentionDays, 30);
+  assert.deepEqual(summary.events.map((entry) => entry.event), ["review.recorded"]);
+  assert.equal(summary.events[0].what, TELEMETRY_EVENTS["review.recorded"].what);
+  // The declared schema travels with the summary, so "what could this possibly
+  // know about me" is answerable without reading the source.
+  assert.deepEqual(summary.schema.map((entry) => entry.event), telemetryEventNames());
+  assert.ok(summary.schema.every((entry) => entry.what.length > 20));
+  // A summary that does not say how much it is not showing is a summary that
+  // misleads.
+  assert.equal(summarizeTelemetry(crowded, at("2026-10-04")).folded.dimensionValues, MAX_SERIES_PER_EVENT + 30);
+
+  // --- Export is exactly what could be shared -----------------------------
+  const exported = exportTelemetry(stream, at("2026-10-04"));
+  assert.equal(exported.format, "trace-telemetry-v1");
+  assert.match(exported.note, /never transmitted/);
+  assert.equal(exported.totalEvents, 20);
+  assert.equal(JSON.stringify(exported).includes(os.homedir()), false);
+
+  // --- Deletion ------------------------------------------------------------
+  let mixed = setTelemetryConsentPure(createTelemetryState(), true, at("2026-10-04"));
+  mixed = recordEvent(mixed, "panel.viewed", { dimensions: { panel: "lesson" } }, at("2026-10-04")).state;
+  mixed = recordEvent(mixed, "panel.viewed", { dimensions: { panel: "lesson" } }, at("2026-10-04")).state;
+  mixed = recordEvent(mixed, "review.recorded", { dimensions: { grade: "again", overdue: "yes" } }, at("2026-10-04")).state;
+  const onlyPanels = forget(mixed, { event: "panel.viewed" });
+  assert.equal(onlyPanels.deletedSeries, 1);
+  assert.equal(onlyPanels.deletedEvents, 2, "deletion must count events, not series");
+  assert.deepEqual(onlyPanels.state.series.map((entry) => entry.event), ["review.recorded"]);
+  assert.equal(onlyPanels.state.consent.granted, true, "deleting one event must not withdraw consent");
+  const everything = forget(mixed);
+  assert.equal(everything.deletedEvents, 3);
+  assert.deepEqual(everything.state.series, []);
+  // Withdrawal is retroactive. Consent that cannot be taken back for what was
+  // already collected is a notification, not consent.
+  const withdrawn = setTelemetryConsentPure(mixed, false, at("2026-10-05"));
+  assert.equal(withdrawn.consent.granted, false);
+  assert.deepEqual(withdrawn.series, []);
+  assert.deepEqual(withdrawn.folded, { dimensionValues: 0, series: 0 });
+
+  // --- The store, on a real disk ------------------------------------------
+  const directory = path.join(workspace, "telemetry");
+  assert.equal(await telemetryFileExists(directory), false);
+  assert.equal((await loadTelemetry(directory)).consent.granted, false);
+  assert.deepEqual(await record(directory, "panel.viewed", { dimensions: { panel: "lesson" } }), { recorded: false, reason: "no-consent", detail: "Telemetry is off. Nothing was recorded." });
+  assert.equal(await telemetryFileExists(directory), false, "a refused record created a file");
+
+  await setTelemetryConsent(directory, true);
+  assert.equal(await telemetryFileExists(directory), true);
+  for (const panel of ["lesson", "code", "lesson"]) {
+    assert.equal((await record(directory, "panel.viewed", { dimensions: { panel }, measures: { switchMs: 30 } })).recorded, true);
+  }
+  const loaded = await loadTelemetry(directory);
+  assert.equal(summarizeTelemetry(loaded).totalEvents, 3);
+  assert.equal(loaded.series.length, 2);
+  // Written through the durable store, so a crash mid-write cannot lose both
+  // generations.
+  await access(path.join(directory, "telemetry.json"));
+  const onDisk = JSON.parse(await readFile(path.join(directory, "telemetry.json"), "utf8"));
+  assert.equal(onDisk.format, "trace-durable-v1");
+  assert.equal(onDisk.payload.destination, "local-only");
+
+  const deletedOne = await forgetTelemetry(directory, { event: "panel.viewed" });
+  assert.equal(deletedOne.deletedEvents, 3);
+  assert.equal((await loadTelemetry(directory)).series.length, 0);
+  // Deleting everything removes the file rather than blanking it, so there is
+  // nothing left on disk to be recovered.
+  await record(directory, "panel.viewed", { dimensions: { panel: "notes" } });
+  assert.equal(await telemetryFileExists(directory), true);
+  await forgetTelemetry(directory);
+  assert.equal(await telemetryFileExists(directory), false);
+  await access(path.join(directory, "telemetry.json.bak")).then(
+    () => assert.fail("a backup generation survived deletion"),
+    () => {},
+  );
+  // ...and so does withdrawing consent.
+  await setTelemetryConsent(directory, true);
+  await record(directory, "review.recorded", { dimensions: { grade: "good", overdue: "no" } });
+  assert.equal(await telemetryFileExists(directory), true);
+  await setTelemetryConsent(directory, false);
+  assert.equal(await telemetryFileExists(directory), false);
+
+  // Retention applies on load, so a file an old version left behind expires
+  // because time passed rather than because something wrote to it.
+  const stale = path.join(workspace, "stale");
+  await mkdir(stale, { recursive: true });
+  await writeDurable(path.join(stale, "telemetry.json"), {
+    ...createTelemetryState(),
+    consent: { granted: true, changedAt: "2026-01-01T00:00:00.000Z" },
+    series: [{ key: "panel.viewed|panel=lesson", event: "panel.viewed", day: "2026-01-01", dimensions: { panel: "lesson" }, count: 9, buckets: {} }],
+  });
+  assert.equal((await loadTelemetry(stale, at("2026-01-10"))).series.length, 1);
+  assert.equal((await loadTelemetry(stale, at("2026-06-01"))).series.length, 0, "a counter outlived its retention window because nothing wrote to it");
+
+  // --- There is nowhere for any of this to go -----------------------------
+  const telemetrySource = await readFile(path.resolve("electron", "telemetry.mjs"), "utf8");
+  const storeSource = await readFile(path.resolve("electron", "telemetry-store.mjs"), "utf8");
+  for (const [name, source] of [["telemetry.mjs", telemetrySource], ["telemetry-store.mjs", storeSource]]) {
+    assert.equal(/\bfetch\s*\(|XMLHttpRequest|node:https?\b|node:net\b|WebSocket/.test(source), false, `${name} contains a way to transmit`);
+  }
+  // The kinds list duplicated to keep this module free of Node builtins must
+  // stay equal to the real one, or the schema quietly stops matching.
+  assert.deepEqual(TELEMETRY_EVENTS["plugin.ran"].dimensions.kind, PLUGIN_KINDS);
+  assert.deepEqual(TELEMETRY_EVENTS["budget.exceeded"].dimensions.budget, budgetIds());
+  assert.equal(TELEMETRY_VERSION, 1);
+
+  // --- The invariant checker catches a violation --------------------------
+  // Everything above is clean, which proves nothing about the checker.
+  const tampered = {
+    ...stream,
+    series: [
+      { key: "x", event: "panel.viewed", day: "2026-10-04", dimensions: { panel: "/Users/someone/secret.py" }, count: 1, buckets: {} },
+      { key: "y", event: "invented.event", day: "2026-10-04", dimensions: {}, count: 1, buckets: {} },
+      { key: "z", event: "panel.viewed", day: "2026-10-04", dimensions: { panel: "lesson" }, count: 1, buckets: { switchMs: { "exactly 4271ms": 1 } } },
+    ],
+  };
+  const audit = containsOnlyDeclaredValues(tampered);
+  assert.equal(audit.clean, false);
+  assert.equal(audit.offenders.length, 3, JSON.stringify(audit.offenders));
+  assert.ok(audit.offenders.some((offender) => offender.includes("secret.py")));
+  assert.ok(audit.offenders.some((offender) => offender.includes("invented.event")));
+  assert.ok(audit.offenders.some((offender) => offender.includes("exactly 4271ms")));
 });

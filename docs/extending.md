@@ -111,6 +111,14 @@ through the answer-leak guard before the renderer sees them.
   build, with the advisory feed's availability stated.
 - `perf:report` — the performance budgets and this session's measurements.
 - `plugins:list` — installed plugins, refused plugins, and the reason for each.
+- `telemetry:state` — consent, the declared event schema, and what has been
+  counted. Readable without consent, because that is how somebody decides.
+- `telemetry:consent` — grant or withdraw. Withdrawal deletes the file.
+- `telemetry:record` — record one declared event. Refused without consent, and
+  the refusal says so rather than succeeding quietly.
+- `telemetry:forget` — delete everything, or one event's counters, and say how
+  many were deleted.
+- `telemetry:export` — exactly what a learner could hand to somebody else.
 
 ## Contract 2 — Signing subjects
 

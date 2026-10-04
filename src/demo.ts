@@ -26,6 +26,10 @@ const demoActivityLog: Array<Record<string, unknown>> = [];
 const demoStudiedPaths = new Set<string>();
 const demoHints = new Map<string, { count: number; penalty: number }>();
 let demoExperimentState: { consent: { granted: boolean; grantedAt: string | null; revokedAt: string | null; participantId: string | null } | null; observations: Array<{ experimentId: string; arm: string; metric: string; value: number; at: string }> } = { consent: null, observations: [] };
+// Item 60: in memory, off by default, and gone when the tab closes. A browser
+// demo that persisted usage counters would be doing the one thing the desktop
+// application is careful not to do without being asked.
+let demoTelemetryState: Record<string, unknown> = { consent: { granted: false, changedAt: null }, series: [], folded: { dimensionValues: 0, series: 0 } };
 function logDemoActivity(event: Record<string, unknown>) {
   demoActivityLog.push({ id: `demo-${demoActivityLog.length}`, at: new Date().toISOString(), ...event });
 }
@@ -667,7 +671,16 @@ export const browserBridge: TraceBridge = {
   async search(request) {
     const retrieval = await import("../electron/search.mjs");
     demoSearchIndex = demoSearchIndex ?? await retrieval.buildSearchIndex(nanoRepository, { read: (filePath) => nanoSourceByPath[filePath] ?? "" });
-    return { ...retrieval.search(demoSearchIndex, request.query, { limit: request.limit ?? 10 }), indexStats: demoSearchIndex.stats };
+    const started = performance.now();
+    const found = retrieval.search(demoSearchIndex, request.query, { limit: request.limit ?? 10 });
+    // Item 60: the same counter the desktop application records, refused in
+    // exactly the same way when consent is absent. The query never goes in.
+    const telemetry = await import("../electron/telemetry.mjs");
+    demoTelemetryState = telemetry.recordEvent(demoTelemetryState, "search.performed", {
+      dimensions: { strategy: "fused", hadResults: found.results.length ? "yes" : "no" },
+      measures: { latencyMs: performance.now() - started, results: found.results.length },
+    }).state;
+    return { ...found, indexStats: demoSearchIndex.stats };
   },
   async evaluate(request) {
     const [retrieval, evaluation] = await Promise.all([import("../electron/search.mjs"), import("../electron/evaluation.mjs")]);
@@ -849,6 +862,37 @@ export const browserBridge: TraceBridge = {
     const hadConsent = Boolean(demoExperimentState.consent?.granted);
     demoExperimentState = { consent: null, observations: [] };
     return { deletedObservations, hadConsent, state: module.experimentReport(demoExperimentState) };
+  },
+  /*
+   * Item 60. The demo runs the *same* telemetry module the desktop app does,
+   * against in-memory state instead of a file, so the consent rule, the folding
+   * rules, and the bucketing are the real ones rather than a browser imitation
+   * of them. There is nowhere for a browser to send them either.
+   */
+  async telemetry() {
+    const module = await import("../electron/telemetry.mjs");
+    return module.summarize(demoTelemetryState);
+  },
+  async setTelemetryConsent(granted) {
+    const module = await import("../electron/telemetry.mjs");
+    demoTelemetryState = module.setConsent(demoTelemetryState, granted);
+    return module.summarize(demoTelemetryState);
+  },
+  async recordTelemetry(request) {
+    const module = await import("../electron/telemetry.mjs");
+    const outcome = module.recordEvent(demoTelemetryState, request.event, { dimensions: request.dimensions ?? {}, measures: request.measures ?? {} });
+    demoTelemetryState = outcome.state;
+    return { recorded: outcome.recorded, reason: outcome.reason, detail: outcome.detail };
+  },
+  async forgetTelemetry(request) {
+    const module = await import("../electron/telemetry.mjs");
+    const outcome = module.forget(demoTelemetryState, { event: request?.event ?? null });
+    demoTelemetryState = outcome.state;
+    return { deletedSeries: outcome.deletedSeries, deletedEvents: outcome.deletedEvents, state: module.summarize(demoTelemetryState) };
+  },
+  async exportTelemetry() {
+    const module = await import("../electron/telemetry.mjs");
+    return module.exportTelemetry(demoTelemetryState);
   },
   async analytics(request) {
     // The demo keeps its own in-memory event log so the same analytics code

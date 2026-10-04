@@ -2669,6 +2669,24 @@ button { color: inherit; }
 .experiment-actions .danger { padding: 5px 12px; border: 1px solid var(--p185s); border-radius: 8px; background: none; color: var(--p400f); font-size: calc(10px + var(--font-boost)); cursor: pointer; }
 .experiment-actions small { color: var(--p258f); font-size: calc(9px + var(--font-boost)); }
 
+/* Item 60: opt-in local usage counters, shown beside the experiment consent
+   because they answer the same question a learner is actually asking. */
+.telemetry-block { display: flex; flex-direction: column; gap: 8px; padding-top: 10px; border-top: 1px solid var(--p094s); }
+.telemetry-block[data-consent="false"] { opacity: .84; }
+.telemetry-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.telemetry-head span { color: var(--p300f); font-size: calc(9px + var(--font-boost)); letter-spacing: .14em; }
+.telemetry-buttons { display: flex; align-items: center; gap: 6px; letter-spacing: normal; }
+.telemetry-head .ghost { padding: 4px 11px; border: 1px solid var(--p118s); border-radius: 7px; background: none; color: var(--p291f); font-size: calc(10px + var(--font-boost)); cursor: pointer; }
+.telemetry-note { color: var(--p291f); font-size: calc(10px + var(--font-boost)); }
+.telemetry-fields { color: var(--p254f); font-size: calc(9px + var(--font-boost)); }
+.telemetry-actions { display: flex; align-items: center; gap: 9px; }
+.telemetry-actions .danger { padding: 5px 12px; border: 1px solid var(--p185s); border-radius: 8px; background: none; color: var(--p400f); font-size: calc(10px + var(--font-boost)); cursor: pointer; }
+.telemetry-actions small { color: var(--p258f); font-size: calc(9px + var(--font-boost)); }
+.telemetry-schema { display: flex; flex-direction: column; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.telemetry-schema li { display: flex; flex-direction: column; gap: 2px; padding: 6px 9px; border: 1px solid var(--p094s); border-radius: 8px; background: var(--p017s); }
+.telemetry-schema strong { color: var(--p369f); font-size: calc(9px + var(--font-boost)); }
+.telemetry-schema small { color: var(--p258f); font-size: calc(9px + var(--font-boost)); }
+
 /* Item 43: learner goals ranked from real source signals. */
 .goal-panel { padding: 18px 26px 22px; display: flex; flex-direction: column; gap: 9px; }
 .goal-head span { color: var(--p300f); font-size: calc(9px + var(--font-boost)); letter-spacing: .14em; }

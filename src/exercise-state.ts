@@ -1,4 +1,4 @@
-import type { ActivitySet, AnalyticsReport, Architecture, ArchiveImportResult, CourseImportResult, CoursePackage, ExperimentReport, MigrationResult, OfflineArchive, GoalPlan, LearnerGoal, ContrastGrade, DiagnosisReport, EvaluationReport, EvidenceImport, ExecutableQuiz, ExplanationGrade, ExplanationTask, HintRung, HistorySummary, PredictionOutcome, TeachBackGrade, Lesson, ProbeGrade, QuizGrade, ReviewPlan, ReviewResult, SymbolFlow, CallChain, LocalizationExercise, LocalizationHint, LocalizationScore, PredictionExercise, PredictionGrade, RaceReport, RaceTask, TraceRunResult, TraceRuntime } from "./types";
+import type { ActivitySet, AnalyticsReport, Architecture, ArchiveImportResult, CourseImportResult, CoursePackage, ExperimentReport, TelemetrySummary, MigrationResult, OfflineArchive, GoalPlan, LearnerGoal, ContrastGrade, DiagnosisReport, EvaluationReport, EvidenceImport, ExecutableQuiz, ExplanationGrade, ExplanationTask, HintRung, HistorySummary, PredictionOutcome, TeachBackGrade, Lesson, ProbeGrade, QuizGrade, ReviewPlan, ReviewResult, SymbolFlow, CallChain, LocalizationExercise, LocalizationHint, LocalizationScore, PredictionExercise, PredictionGrade, RaceReport, RaceTask, TraceRunResult, TraceRuntime } from "./types";
 
 /**
  * Exercise state shapes.
@@ -160,9 +160,14 @@ export type ExperimentState = {
   report: ExperimentReport | null;
   status: "idle" | "loading" | "ready" | "error";
   lastDeleted: number | null;
+  // Item 60: local telemetry shares this panel because it answers the same
+  // question a learner is asking — "what does this application keep about me" —
+  // and splitting the answer across two screens is how one of them goes unread.
+  telemetry: TelemetrySummary | null;
+  telemetryDeleted: number | null;
 };
 
-export const emptyExperimentState: ExperimentState = { report: null, status: "idle", lastDeleted: null };
+export const emptyExperimentState: ExperimentState = { report: null, status: "idle", lastDeleted: null, telemetry: null, telemetryDeleted: null };
 
 export type GoalState = {
   goal: LearnerGoal;

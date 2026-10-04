@@ -360,6 +360,23 @@ export const IPC_SCHEMAS = {
   // Item 56: what this build is made of. No repository reference, because the
   // answer is a property of the application rather than of anything opened.
   "supply-chain:report": s.object({ scope: s.literal(["all", "runtime"], { optional: true }) }),
+  /*
+   * Item 60: opt-in local telemetry.
+   *
+   * The record channel takes no free-form strings anywhere. Dimensions and
+   * measures are bounded here as well as in `telemetry.mjs`, so a renderer
+   * cannot even attempt to put a file path or a query into a counter — the
+   * schema rejects it before the allow list gets a chance to fold it.
+   */
+  "telemetry:state": s.object({}),
+  "telemetry:consent": s.object({ granted: s.boolean() }),
+  "telemetry:record": s.object({
+    event: s.string({ maxLength: 64, pattern: /^[a-z]+\.[a-z-]+$/ }),
+    dimensions: s.record({ maxKeys: 6, value: s.string({ maxLength: 40 }), optional: true }),
+    measures: s.record({ maxKeys: 6, value: s.number({ min: 0, max: 86_400_000 }), optional: true }),
+  }),
+  "telemetry:forget": s.object({ event: s.string({ maxLength: 64, optional: true, nullable: true }) }),
+  "telemetry:export": s.object({}),
   // Item 58: which extensions are installed, which were refused, and why.
   // No payload can select or run one: a renderer that could name a plugin to
   // execute would be a renderer that could execute code.

@@ -470,6 +470,27 @@ try {
   assert.equal(await experiments.getAttribute("data-consent"), "false");
   await experiments.getByRole("button", { name: "Delete everything" }).click();
   await experiments.locator("[data-deleted]").waitFor();
+
+  /*
+   * Item 60: local usage counters, in the same panel, because a learner asking
+   * "what does this keep about me" is asking one question and splitting the
+   * answer across two screens is how one half goes unread.
+   */
+  const telemetry = page.locator(".telemetry-block");
+  await telemetry.waitFor();
+  assert.equal(await telemetry.getAttribute("data-consent"), "false", "counters were on before anybody agreed");
+  assert.match(await telemetry.locator(".telemetry-note").first().innerText(), /not anonymously, not at all/);
+  // The declared schema is on screen *before* consent, which is how somebody
+  // decides: every event that could ever be recorded, and what it is for.
+  const declared = await telemetry.locator(".telemetry-schema li").evaluateAll((items) => items.map((item) => ({
+    event: item.getAttribute("data-telemetry-event"),
+    what: item.querySelector("small")?.textContent ?? "",
+  })));
+  assert.ok(declared.length >= 8, JSON.stringify(declared));
+  assert.ok(declared.every((entry) => entry.event.includes(".") && entry.what.length > 20), JSON.stringify(declared));
+  assert.ok(declared.some((entry) => entry.event === "search.performed"));
+  assert.equal(await telemetry.getAttribute("data-events"), "0");
+  await auditAccessibility("telemetry consent");
   await page.screenshot({ path: path.join(artifactDirectory, "experiments.png") });
 
   // Item 28: RACE-style review grades three stages against three rubrics.
@@ -613,6 +634,39 @@ try {
   await page.waitForTimeout(400);
   assert.ok(await searchPanel.locator('.search-result[data-path="nanovllm/engine/scheduler.py"]').count() >= 1);
   await searchPanel.locator('.search-result[data-path="nanovllm/engine/scheduler.py"]').first().click();
+
+  /*
+   * Item 60, continued: two real searches have now run with consent off. The
+   * counter must still be zero, which is the assertion that separates "opt-in"
+   * from "opt-in to being shown what we already collected".
+   */
+  await page.locator(".content-tabs").getByRole("tab", { name: "Diagram" }).click();
+  await telemetry.waitFor();
+  await telemetry.getByRole("button", { name: "Refresh" }).click();
+  await page.waitForTimeout(150);
+  assert.equal(await telemetry.getAttribute("data-events"), "0", "searches were counted before consent was given");
+  await telemetry.getByRole("button", { name: "Turn on" }).click();
+  await page.locator('.telemetry-block[data-consent="true"]').waitFor();
+  // Turning it on records nothing by itself.
+  assert.equal(await telemetry.getAttribute("data-events"), "0");
+  await page.locator(".content-tabs").getByRole("tab", { name: "Code" }).click();
+  await page.locator(".explorer-search input").fill("scheduler");
+  await searchPanel.waitFor();
+  await page.waitForTimeout(300);
+  await page.locator(".content-tabs").getByRole("tab", { name: "Diagram" }).click();
+  await telemetry.getByRole("button", { name: "Refresh" }).click();
+  await page.waitForTimeout(150);
+  assert.equal(await telemetry.getAttribute("data-events"), "1", "a search with consent on was not counted");
+  // Nothing about the query survives: not the text, and not an exact duration.
+  const counted = await telemetry.evaluate((node) => node.outerHTML);
+  assert.equal(counted.includes("scheduler"), false, "the query reached the counters");
+  assert.equal(/\b\d+\.\d+ ?ms\b/.test(counted), false, "an exact duration reached the counters");
+  // Withdrawal is retroactive: what was collected is gone, not merely stopped.
+  await telemetry.getByRole("button", { name: "Turn off" }).click();
+  await page.locator('.telemetry-block[data-consent="false"]').waitFor();
+  assert.equal(await telemetry.getAttribute("data-events"), "0");
+  assert.equal(await telemetry.getAttribute("data-series"), "0");
+  await page.screenshot({ path: path.join(artifactDirectory, "telemetry.png") });
   await page.getByText("nanovllm/engine/scheduler.py", { exact: false }).first().waitFor();
   await page.locator(".explorer-search input").fill("");
 

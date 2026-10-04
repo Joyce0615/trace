@@ -2037,6 +2037,80 @@ try {
   });
   assert.equal(pluginRejected, null, "plugins:list must ignore any payload rather than accept one");
 
+  /*
+   * Item 60: local telemetry, against a real main process with a real file.
+   *
+   * The repository above was indexed and searched several times already, with
+   * consent off. That is the assertion that matters: a real run of the real
+   * application, and the counter is still empty.
+   */
+  const telemetryAudit = await page.evaluate(async () => {
+    const before = await window.trace.telemetry();
+    const refusedBeforeConsent = await window.trace.recordTelemetry({ event: "panel.viewed", dimensions: { panel: "lesson" } });
+    const granted = await window.trace.setTelemetryConsent(true);
+    const smuggled = await window.trace.recordTelemetry({
+      event: "search.performed",
+      dimensions: { strategy: "/Users/someone/.aws/credentials", hadResults: "yes" },
+      measures: { latencyMs: 4271, results: 3 },
+    });
+    const undeclaredField = await window.trace.recordTelemetry({ event: "search.performed", dimensions: { query: "a secret query" } });
+    let rejectedShape = null;
+    try {
+      // The IPC schema is the outer wall: a measure that is not a number never
+      // reaches the allow list at all.
+      await window.trace.recordTelemetry({ event: "search.performed", measures: { latencyMs: "a secret query" } });
+    } catch (error) {
+      rejectedShape = error.message;
+    }
+    const unknownEvent = await window.trace.recordTelemetry({ event: "keystroke.captured", dimensions: {} });
+    const after = await window.trace.telemetry();
+    const exported = await window.trace.exportTelemetry();
+    const deleted = await window.trace.forgetTelemetry({});
+    const withdrawn = await window.trace.setTelemetryConsent(false);
+    const refusedAfter = await window.trace.recordTelemetry({ event: "panel.viewed", dimensions: { panel: "lesson" } });
+    return { before, refusedBeforeConsent, granted, smuggled, undeclaredField, rejectedShape, unknownEvent, after, exported, deleted, withdrawn, refusedAfter, text: JSON.stringify(after) + JSON.stringify(exported) };
+  });
+  // Off by default, and off means nothing — after a full session of real work.
+  assert.equal(telemetryAudit.before.consent.granted, false);
+  assert.equal(telemetryAudit.before.totalEvents, 0, "the application counted something before anybody agreed");
+  assert.equal(telemetryAudit.before.destination, "local-only");
+  assert.equal(telemetryAudit.refusedBeforeConsent.recorded, false);
+  assert.equal(telemetryAudit.refusedBeforeConsent.reason, "no-consent");
+  // The declared schema is available without consenting, which is how somebody
+  // decides whether to.
+  assert.ok(telemetryAudit.before.schema.length >= 8, JSON.stringify(telemetryAudit.before.schema.map((entry) => entry.event)));
+  assert.ok(telemetryAudit.before.schema.every((entry) => entry.what.length > 20));
+  // With consent, a path handed in as a dimension becomes four letters and an
+  // exact duration becomes a band.
+  assert.equal(telemetryAudit.granted.consent.granted, true);
+  assert.equal(telemetryAudit.smuggled.recorded, true);
+  assert.equal(telemetryAudit.after.totalEvents, 1);
+  assert.equal(telemetryAudit.after.folded.dimensionValues, 1);
+  assert.equal(telemetryAudit.text.includes("credentials"), false, "a path reached the counters");
+  assert.equal(telemetryAudit.text.includes("4271"), false, "an exact measurement reached the counters");
+  // Two walls, and they refuse different things. A *declared* dimension with an
+  // undeclared name is refused by the allow list; a value of the wrong type
+  // never reaches the allow list because the IPC schema rejects it first.
+  assert.equal(telemetryAudit.undeclaredField.recorded, false);
+  assert.equal(telemetryAudit.undeclaredField.reason, "unknown-dimension");
+  assert.match(telemetryAudit.rejectedShape ?? "", /must be a finite number/, String(telemetryAudit.rejectedShape));
+  assert.equal(telemetryAudit.unknownEvent.recorded, false);
+  assert.equal(telemetryAudit.unknownEvent.reason, "unknown-event");
+  // Deletion counts what it deleted, and withdrawal is retroactive.
+  assert.equal(telemetryAudit.deleted.deletedEvents, 1);
+  assert.equal(telemetryAudit.withdrawn.consent.granted, false);
+  assert.equal(telemetryAudit.withdrawn.totalEvents, 0);
+  assert.equal(telemetryAudit.refusedAfter.reason, "no-consent");
+  assert.match(telemetryAudit.exported.note, /never transmitted/);
+  const telemetryReport = {
+    defaultConsent: telemetryAudit.before.consent.granted,
+    countedBeforeConsent: telemetryAudit.before.totalEvents,
+    declaredEvents: telemetryAudit.before.schema.length,
+    foldedValues: telemetryAudit.after.folded.dimensionValues,
+    deleted: telemetryAudit.deleted.deletedEvents,
+    destination: telemetryAudit.before.destination,
+  };
+
   const startupBudgets = evaluateAll({ "startup.firstWindowMs": firstWindowMs, "startup.interactiveMs": interactiveMs });
   assert.equal(startupBudgets.passed, true, `${startupBudgets.summary}\n${describeBudgets(startupBudgets)}`);
 
@@ -2100,6 +2174,7 @@ try {
     supplyChain: supplyChainReport,
     performance: performanceReport,
     plugins: { installed: plugins.plugins.length, refused: plugins.refused.length, kinds: plugins.kinds.length, capabilities: Object.keys(plugins.capabilities).length },
+    telemetry: telemetryReport,
   }, null, 2));
 } finally {
   await electronApp.close();

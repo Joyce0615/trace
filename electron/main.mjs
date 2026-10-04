@@ -46,6 +46,8 @@ import { forgetEverything, loadExperimentState, recordObservation, setConsent } 
 import { buildSbom, publicSupplyChainReport, scanDependencies } from "./supply-chain.mjs";
 import { BUDGETS, budgetIds, evaluateAll } from "./performance.mjs";
 import { loadPlugins, publicPluginReport } from "./plugins.mjs";
+import { exportTelemetry, summarize as summarizeTelemetry } from "./telemetry.mjs";
+import { forgetTelemetry, loadTelemetry, record as recordTelemetry, setTelemetryConsent, telemetryFileExists } from "./telemetry-store.mjs";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const openedRepositories = new Map();
@@ -166,6 +168,30 @@ function experimentDirectory() {
 
 function signingDirectory() {
   return path.join(app.getPath("userData"), "signing");
+}
+
+function telemetryDirectory() {
+  return path.join(app.getPath("userData"), "telemetry");
+}
+
+/**
+ * Note one thing the application did (item 60).
+ *
+ * Fire and forget, and it must be: a counter is never worth failing a real
+ * operation for, never worth delaying one, and never worth an unhandled
+ * rejection. `record` refuses on its own when consent is absent, so callers do
+ * not check — a call site that had to remember to check is a call site that
+ * eventually will not.
+ */
+function noteTelemetry(event, dimensions = {}, measures = {}) {
+  void recordTelemetry(telemetryDirectory(), event, { dimensions, measures }).catch(() => {});
+}
+
+function sizeBandFor(files) {
+  if (files <= 50) return "tiny";
+  if (files <= 500) return "small";
+  if (files <= 3_000) return "medium";
+  return "large";
 }
 
 function practiceDirectory() {
@@ -446,6 +472,19 @@ const ipcHandlers = {
     const knowledgeGraph = buildKnowledgeGraph(repository, { previous: previousGraph });
     knowledgeGraphs.set(repository.id, knowledgeGraph);
     await saveKnowledgeGraph(graphDirectory, knowledgeGraph);
+    // Item 60: how long it took and how well it worked. Not which repository —
+    // there is no dimension a name or a path could occupy.
+    noteTelemetry("repository.opened", {
+      indexer: repository.stats.indexer,
+      degraded: repository.stats.memory.degraded ? "yes" : "no",
+      size: sizeBandFor(repository.stats.fileCount),
+    }, { durationMs: repository.stats.timing.totalMs, files: repository.stats.fileCount });
+    for (const contribution of repository.stats.plugins?.contributions ?? []) {
+      noteTelemetry("plugin.ran", { kind: "indexer", outcome: "ok" }, { durationMs: contribution.durationMs });
+    }
+    for (const problem of repository.stats.plugins?.problems ?? []) {
+      noteTelemetry("plugin.ran", { kind: "indexer", outcome: problem.reason === "timeout" ? "timeout" : "error" }, {});
+    }
     return { repository, course, skillGraph, learnerState, knowledgeGraph: summarizeGraph(knowledgeGraph) };
   },
 
@@ -651,7 +690,15 @@ const ipcHandlers = {
       ? cached
       : await buildSearchIndex(repository, { read: (filePath) => readRepositoryFile(repository.rootPath, filePath) });
     searchIndexes.set(repository.id, index);
-    return { ...search(index, request.query, { limit: request.limit ?? 10 }), indexStats: index.stats };
+    const started = Date.now();
+    const found = search(index, request.query, { limit: request.limit ?? 10 });
+    // Item 60: that a search happened and how fast it was. Never the query —
+    // there is no dimension it could go in.
+    noteTelemetry("search.performed", {
+      strategy: "fused",
+      hadResults: found.results.length ? "yes" : "no",
+    }, { latencyMs: Date.now() - started, results: found.results.length });
+    return { ...found, indexStats: index.stats };
   },
 
   "eval:run": async (_event, request) => {
@@ -1155,6 +1202,11 @@ const ipcHandlers = {
     const grade = await gradeSubmission(quiz, request.submission);
     const hints = hintsTaken.get(`${repository.id}|${quiz.id}`) ?? { count: 0, penalty: 0 };
     await recordActivity(repository, { kind: "executable-quiz", taskId: quiz.id, path: quiz.path, symbol: quiz.entry, correct: grade.passed, score: grade.score ?? 0, hints: hints.count, hintPenalty: hints.penalty });
+    noteTelemetry("exercise.graded", {
+      kind: "quiz",
+      outcome: grade.passed ? "pass" : (grade.score ?? 0) > 0 ? "partial" : "fail",
+      hinted: hints.count > 0 ? "yes" : "no",
+    }, {});
     return grade;
   },
 
@@ -1322,6 +1374,11 @@ const ipcHandlers = {
       measurements[id] = BUDGETS[id].percentile ? { samples } : Math.max(...samples, 0);
     }
     const report = evaluateAll(measurements, sizes);
+    // Item 60: a budget crossing its line is worth counting, and the budget id
+    // is a declared value rather than free text.
+    for (const result of report.results) {
+      if (result.verdict === "warn" || result.verdict === "fail") noteTelemetry("budget.exceeded", { budget: result.id, verdict: result.verdict }, {});
+    }
     return {
       ...report,
       budgets: Object.fromEntries(budgetIds().map((id) => [id, { label: BUDGETS[id].label, unit: BUDGETS[id].unit, limit: BUDGETS[id].limit, warnAt: BUDGETS[id].warnAt, per: BUDGETS[id].per ?? null, floor: BUDGETS[id].floor ?? null, why: BUDGETS[id].why }])),
@@ -1345,6 +1402,36 @@ const ipcHandlers = {
    * than running, and worse than being told plainly that it will not.
    */
   "plugins:list": async () => publicPluginReport(await loadedPlugins()),
+
+  /*
+   * Item 60: opt-in local telemetry.
+   *
+   * Reading the state is always allowed — a learner who has not consented is
+   * entitled to see the empty result and the full schema, which is how they
+   * decide. Recording is refused without consent and says so, rather than
+   * succeeding quietly and discarding.
+   */
+  "telemetry:state": async () => ({
+    ...summarizeTelemetry(await loadTelemetry(telemetryDirectory())),
+    onDisk: await telemetryFileExists(telemetryDirectory()),
+  }),
+
+  "telemetry:consent": async (_event, request) => {
+    const next = await setTelemetryConsent(telemetryDirectory(), request.granted);
+    return { ...summarizeTelemetry(next), onDisk: await telemetryFileExists(telemetryDirectory()) };
+  },
+
+  "telemetry:record": async (_event, request) => recordTelemetry(telemetryDirectory(), request.event, {
+    dimensions: request.dimensions ?? {},
+    measures: request.measures ?? {},
+  }),
+
+  "telemetry:forget": async (_event, request) => {
+    const result = await forgetTelemetry(telemetryDirectory(), { event: request?.event ?? null });
+    return { ...result, state: summarizeTelemetry(await loadTelemetry(telemetryDirectory())), onDisk: await telemetryFileExists(telemetryDirectory()) };
+  },
+
+  "telemetry:export": async () => exportTelemetry(await loadTelemetry(telemetryDirectory())),
 
   "window:new": async (_event) => {
     const created = createWindow();
