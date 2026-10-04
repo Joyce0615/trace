@@ -20,7 +20,7 @@ import { SECRET_SCANNER_VERSION, anonymizePath, redact, redactValue, scanText, s
 import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
 import { GIT_HISTORY_VERSION, busFactor, detectRenames, historyLessons, historySummary, listFilesAtCommit, parseHistory, readCommits, readFileAtCommit } from "../electron/git-history.mjs";
 import { MISCONCEPTIONS, MISCONCEPTION_VERSION, buildProbe, calibrateSkill, detectMisconceptions, diagnoseLearner, gradeProbe } from "../electron/misconception.mjs";
-import { SIGNING_ALGORITHM, SIGNING_VERSION, anchorPayload, assessmentPayload, canonicalize, createKeyPair, digestOf, keyIdFor, loadOrCreateKeyPair, loadTrustedKeys, packagePayload, publicIdentity, responsePayload, setKeyTrust, signPackage, signPayload, verifyPackageSignature, verifyPayload } from "../electron/signing.mjs";
+import { SIGNABLE_SUBJECTS, SIGNING_ALGORITHM, SIGNING_VERSION, anchorPayload, assessmentPayload, canonicalize, createKeyPair, digestOf, keyIdFor, loadOrCreateKeyPair, loadTrustedKeys, packagePayload, publicIdentity, responsePayload, setKeyTrust, signPackage, signPayload, verifyPackageSignature, verifyPayload } from "../electron/signing.mjs";
 import { COURSE_PACKAGE_FORMAT, detectLicense, importCourse, packageCourse, verifyPackage } from "../electron/course-package.mjs";
 import { CAPABILITIES, createFixtureRepository } from "../scripts/preflight.mjs";
 import { buildRelease } from "../scripts/release.mjs";
@@ -61,6 +61,7 @@ import { BUDGETS, DEFAULT_NOISE, MIN_SAMPLES_FOR_PERCENTILE, PERFORMANCE_VERSION
 import { measurementsFrom, measureWorkspace } from "../scripts/perf-budget.mjs";
 import { PLUGIN_API_VERSION, PLUGIN_CAPABILITIES, PLUGIN_KINDS, entryDigest, filesClaimedBy, inspectPlugin, loadPlugins, publicPluginReport, runPlugin, signPluginManifest } from "../electron/plugins.mjs";
 import { signPluginDirectory } from "../scripts/plugin-tool.mjs";
+import { DOCUMENTS, checkDocumentation, userDataDirectories } from "../scripts/docs-check.mjs";
 
 const execFileAsync = promisify(execFile);
 const round4 = (value) => Number(Number(value).toFixed(4));
@@ -7008,4 +7009,127 @@ test("a plugin runs outside the main process, with only what it was granted, and
   assert.equal(starved.ok, false);
   assert.match(starved.detail, /readFile is not a function/);
   assert.deepEqual(readCalls, ["src/main.zig", "src/util.zig"], "a withheld capability still reached the host");
+});
+
+test("the documentation is checked against the code it describes, in both directions", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-docs-"));
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  const projectRoot = path.resolve(".");
+
+  // --- The real documents, against the real code ---------------------------
+  const result = await checkDocumentation({ projectRoot });
+  assert.deepEqual(result.problems, [], result.problems.join("\n"));
+  assert.equal(result.ok, true);
+  assert.equal(result.counts.channels, Object.keys(IPC_SCHEMAS).length);
+  assert.equal(result.counts.documentedChannels, result.counts.channels, "the contract lists a different number of channels than exist");
+  assert.equal(result.counts.signingSubjects, SIGNABLE_SUBJECTS.length);
+  assert.equal(result.counts.budgets, budgetIds().length);
+  assert.ok(result.counts.citedModules >= 12, `the threat model cites only ${result.counts.citedModules} modules`);
+
+  // The user-data inventory is derived from `main.mjs`, not from a list
+  // somebody maintains, so a new directory cannot be forgotten.
+  assert.ok(result.userDataDirectories.includes("learning"));
+  assert.ok(result.userDataDirectories.includes("plugins"));
+  assert.ok(result.userDataDirectories.length >= 10, JSON.stringify(result.userDataDirectories));
+  const mainSource = await readFile(path.join(projectRoot, "electron", "main.mjs"), "utf8");
+  assert.deepEqual(userDataDirectories(mainSource), result.userDataDirectories);
+
+  // --- The documents say what they do not cover ---------------------------
+  // A confident document is the kind that gets somebody hurt.
+  const threatModel = await readFile(path.join(projectRoot, "docs", "threat-model.md"), "utf8");
+  const privacy = await readFile(path.join(projectRoot, "docs", "privacy.md"), "utf8");
+  const pedagogy = await readFile(path.join(projectRoot, "docs", "pedagogy.md"), "utf8");
+  const extending = await readFile(path.join(projectRoot, "docs", "extending.md"), "utf8");
+  assert.match(threatModel, /^## Residual risks/m);
+  assert.match(privacy, /^## Residual risks/m);
+  assert.match(pedagogy, /^## Limits, stated plainly/m);
+  assert.match(extending, /^## Stability/m);
+  // The carried-forward blockers are stated in the threat model rather than
+  // living only in a development log.
+  for (const blocker of [/unsigned and un-notarized/, /not an OS sandbox/i, /advisory/i, /RLIMIT_AS/, /observed green/]) {
+    assert.match(threatModel, blocker, `the threat model does not mention ${blocker}`);
+  }
+  // Out-of-scope adversaries are named, because a threat model that claims to
+  // cover everything covers nothing.
+  assert.match(threatModel, /out of scope/i);
+  assert.match(threatModel, /already root/);
+
+  // --- The privacy statement matches what the code actually does ----------
+  // "No telemetry" is checkable: nothing in the main process may make an
+  // outbound request other than through git, the shell, or an agent adapter.
+  assert.match(privacy, /There is none/);
+  const electronFiles = (await readdir(path.join(projectRoot, "electron"))).filter((name) => name.endsWith(".mjs"));
+  for (const name of electronFiles) {
+    const source = await readFile(path.join(projectRoot, "electron", name), "utf8");
+    // `fetch`, `https.request`, and `net.connect` would each be a way for this
+    // application to talk to a server, which it claims it never does.
+    assert.equal(/\bfetch\s*\(/.test(source), false, `${name} calls fetch, and privacy.md says nothing is transmitted`);
+    assert.equal(/node:https|node:http\b|node:net\b|node:dgram/.test(source), false, `${name} imports a network module`);
+  }
+  // Redaction really is applied to what is persisted, not only to what is shown.
+  assert.match(await readFile(path.join(projectRoot, "electron", "activity-log.mjs"), "utf8"), /redact/);
+  assert.match(await readFile(path.join(projectRoot, "electron", "context-engine.mjs"), "utf8"), /redact/);
+
+  // --- The checker catches drift, which is the whole point ----------------
+  // Everything above passes today. A checker that could not fail would prove
+  // nothing, so each document is broken on a copy and the failure asserted.
+  const copyProject = async (mutate) => {
+    const root = path.join(workspace, `case-${Math.random().toString(36).slice(2, 8)}`);
+    await mkdir(path.join(root, "docs"), { recursive: true });
+    await mkdir(path.join(root, "plugins"), { recursive: true });
+    await mkdir(path.join(root, "electron"), { recursive: true });
+    const files = {
+      "docs/threat-model.md": threatModel,
+      "docs/privacy.md": privacy,
+      "docs/pedagogy.md": pedagogy,
+      "docs/extending.md": extending,
+      "plugins/README.md": await readFile(path.join(projectRoot, "plugins", "README.md"), "utf8"),
+      "electron/main.mjs": mainSource,
+    };
+    await mutate(files);
+    for (const [relative, contents] of Object.entries(files)) await writeFile(path.join(root, relative), contents);
+    // The module list the threat model is checked against.
+    for (const name of electronFiles) await writeFile(path.join(root, "electron", name), files[`electron/${name}`] ?? "");
+    return root;
+  };
+
+  const drifts = [
+    ["an undocumented channel", (files) => { files["docs/extending.md"] = files["docs/extending.md"].replace("- `search:query`", "- `search:queries`"); }, /IPC channel: search:query is not documented/],
+    ["a channel documented but removed", (files) => { files["docs/extending.md"] += "\n- `repository:delete-everything` — gone.\n"; }, /repository:delete-everything is documented but no longer exists/],
+    ["an undocumented signing subject", (files) => { files["docs/extending.md"] = files["docs/extending.md"].replace("- `provenance` —", "- `provenanceish` —"); }, /signing subject: `provenance` is not documented/],
+    ["an undocumented budget", (files) => { files["docs/extending.md"] = files["docs/extending.md"].replace("- `render.domNodes`", "- `render.domNodeCount`"); }, /performance budget: `render.domNodes` is not documented/],
+    ["an undocumented capability", (files) => { files["plugins/README.md"] = files["plugins/README.md"].replaceAll("list-files", "listing"); }, /plugin capability: list-files is not documented/],
+    ["a new directory nobody inventoried", (files) => { files["electron/main.mjs"] += "\nconst secretDirectory = path.join(app.getPath(\"userData\"), \"undisclosed\");\nvoid secretDirectory;\n"; }, /user-data directory: `undisclosed` is not documented/],
+    ["a control that does not exist", (files) => { files["docs/threat-model.md"] += "\n| Something | Handled | `electron/imaginary.mjs` |\n"; }, /cites electron\/imaginary\.mjs, which does not exist/],
+    ["a document that claims to be complete", (files) => { files["docs/privacy.md"] = files["docs/privacy.md"].replace("## Residual risks", "## Everything is fine"); }, /privacy\.md: has no section stating what it does not cover/],
+    ["a plugin readme with no stated limitation", (files) => { files["plugins/README.md"] = files["plugins/README.md"].replaceAll("Stated limitation", "Note"); }, /README\.md: states no limitation/],
+    ["a pedagogy document with no evidence", (files) => { files["docs/pedagogy.md"] = files["docs/pedagogy.md"].replaceAll("https://arxiv.org", "https://example.invalid"); }, /fewer than three research citations/],
+  ];
+  for (const [label, mutate, expected] of drifts) {
+    const root = await copyProject(mutate);
+    const broken = await checkDocumentation({ projectRoot: root });
+    assert.equal(broken.ok, false, `${label} was not caught`);
+    assert.ok(broken.problems.some((problem) => expected.test(problem)), `${label}: expected ${expected}, got ${JSON.stringify(broken.problems)}`);
+  }
+
+  // A missing document is a failure, not a silent skip.
+  const stripped = path.join(workspace, "stripped");
+  await mkdir(path.join(stripped, "docs"), { recursive: true });
+  const absent = await checkDocumentation({ projectRoot: stripped }).catch((cause) => ({ ok: false, problems: [String(cause.message)] }));
+  assert.equal(absent.ok, false);
+  assert.ok(absent.problems.some((problem) => /missing document|ENOENT/.test(problem)), JSON.stringify(absent.problems));
+
+  // --- The contract documents describe the contract that exists -----------
+  // Spot checks that the text is about the real thing, not a plausible one.
+  assert.match(extending, /4 MB/);
+  assert.match(extending, /depth-bounded \(16\)/);
+  assert.match(extending, /IPC protocol version is 1 and the plugin API version is 1/);
+  assert.equal(IPC_PROTOCOL_VERSION, 1);
+  assert.equal(PLUGIN_API_VERSION, 1);
+  assert.equal(MAX_PAYLOAD_BYTES, 4_000_000);
+  assert.equal(MAX_PAYLOAD_DEPTH, 16);
+  // The README points at the documents, so they are reachable from the front
+  // door rather than discoverable only by listing the directory.
+  const readme = await readFile(path.join(projectRoot, "README.md"), "utf8");
+  for (const relative of Object.values(DOCUMENTS)) assert.ok(readme.includes(relative), `README.md does not link ${relative}`);
 });

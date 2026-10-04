@@ -67,3 +67,29 @@ npm audit
 - `tests/`: repository/course security tests and browser UI smoke tests.
 
 Agent adapters are isolated behind Electron IPC so the renderer never receives shell or filesystem privileges. IPC accepts only repositories previously opened through the trusted host, validates repository-relative paths and symlink targets, and does not use a runtime Monaco CDN.
+
+## Documentation
+
+These four documents are checked against the code by `npm run docs:check`, which
+fails the build when they and the implementation disagree — in either direction.
+
+- [`docs/threat-model.md`](docs/threat-model.md): assets, adversaries, trust
+  boundaries, the module enforcing each one, and the residual risks.
+- [`docs/privacy.md`](docs/privacy.md): every directory written to, what is
+  redacted and when, what is never collected, and how to delete any of it.
+- [`docs/pedagogy.md`](docs/pedagogy.md): why each teaching mechanism is here,
+  what evidence it rests on, and where it stops being able to help.
+- [`docs/extending.md`](docs/extending.md): the four public contracts — IPC
+  channels, signing subjects, the plugin API, and the performance budgets.
+- [`plugins/README.md`](plugins/README.md): how to write, sign, and install a
+  plugin, and what a plugin is not allowed to do.
+
+## Checks
+
+```bash
+npm run docs:check   # documentation against the code it describes
+npm run sbom         # bill of materials and dependency scan
+npm run perf         # performance budgets, enforced
+npm run lint
+npm run coverage
+```
