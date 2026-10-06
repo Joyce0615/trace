@@ -254,13 +254,29 @@ async function loadLanguage(grammar) {
   if (state.unavailable.has(grammar)) return null;
   const Parser = await ensureParser();
   if (!Parser) return null;
+  // Resolving the `.wasm` path and loading it are two different kinds of
+  // failure. A failed *resolve* means this grammar is not shipped by the
+  // installed `tree-sitter-wasms` at all — a fact about what is on disk that
+  // cannot change for the rest of the process, and is safe to remember
+  // permanently. A failed *load* (the file exists but `Parser.Language.load`
+  // threw) can be transient — a half-written file mid-install, momentary
+  // memory/IO pressure, a corrupt read — and caching it the same way silently
+  // and permanently downgrades every later request for that language to the
+  // regex fallback for the rest of this process's life, including in a
+  // long-lived Electron process, with no signal that it happened. Only the
+  // permanent case is cached; a load failure is retried on the next call.
+  let wasmPath;
   try {
-    const wasmPath = require.resolve(`tree-sitter-wasms/out/tree-sitter-${grammar}.wasm`);
+    wasmPath = require.resolve(`tree-sitter-wasms/out/tree-sitter-${grammar}.wasm`);
+  } catch {
+    state.unavailable.add(grammar);
+    return null;
+  }
+  try {
     const language = await Parser.Language.load(wasmPath);
     state.languages.set(grammar, language);
     return language;
   } catch {
-    state.unavailable.add(grammar);
     return null;
   }
 }

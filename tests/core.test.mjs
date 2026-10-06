@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { access, mkdtemp, mkdir, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -17,7 +18,7 @@ import { LINK_POLICY_VERSION, classifyExternalLink, confirmationPrompt, isIntern
 import { PROMPT_ISOLATION_VERSION, buildIsolatedPrompt, createNonce, detectInjection, neutralize } from "../electron/prompt-isolation.mjs";
 import { tutorPrompt } from "../electron/agents.mjs";
 import { SECRET_SCANNER_VERSION, anonymizePath, redact, redactValue, scanText, shannonEntropy, summarizeFindings } from "../electron/secret-scanner.mjs";
-import { analyzeSource, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
+import { analyzeSource, resetTreeSitterCaches, treeSitterSupports } from "../electron/tree-sitter-index.mjs";
 import { GIT_HISTORY_VERSION, busFactor, detectRenames, historyLessons, historySummary, listFilesAtCommit, parseHistory, readCommits, readFileAtCommit } from "../electron/git-history.mjs";
 import { MISCONCEPTIONS, MISCONCEPTION_VERSION, buildProbe, calibrateSkill, detectMisconceptions, diagnoseLearner, gradeProbe } from "../electron/misconception.mjs";
 import { SIGNABLE_SUBJECTS, SIGNING_ALGORITHM, SIGNING_VERSION, anchorPayload, assessmentPayload, canonicalize, createKeyPair, digestOf, keyIdFor, loadOrCreateKeyPair, loadTrustedKeys, packagePayload, publicIdentity, responsePayload, setKeyTrust, signPackage, signPayload, verifyPackageSignature, verifyPayload } from "../electron/signing.mjs";
@@ -67,6 +68,28 @@ import { forgetTelemetry, loadTelemetry, record, setTelemetryConsent, telemetryF
 
 const execFileAsync = promisify(execFile);
 const round4 = (value) => Number(Number(value).toFixed(4));
+
+/**
+ * Build the renderer into a directory the caller owns, instead of any test
+ * reading whatever `dist` happens to already sit next to this file.
+ *
+ * Three tests below need a real `vite build` output to exercise the release
+ * pipeline, the entry-bundle budget, or both. Reading the project's ambient
+ * `dist/` (populated only by a human or a separate `npm run build` having run
+ * first, for an unrelated reason) made those tests pass or fail depending on
+ * whichever command happened to run earlier in the same working tree — a
+ * residue-dependent result a clean clone or a parallel/randomized run does not
+ * reproduce. Each test that needs a build now produces its own, under its own
+ * `context.after`-cleaned temp workspace.
+ */
+async function buildIsolatedDist(outDir, projectRoot = path.resolve(".")) {
+  await execFileAsync(
+    process.execPath,
+    [path.join(projectRoot, "node_modules", "vite", "bin", "vite.js"), "build", "--outDir", outDir, "--emptyOutDir"],
+    { cwd: projectRoot, maxBuffer: 32 * 1024 * 1024 },
+  );
+  return outDir;
+}
 
 test("languageFor recognizes common source formats", () => {
   assert.equal(languageFor("src/App.tsx"), "typescript");
@@ -329,6 +352,40 @@ test("tree-sitter indexing yields definitions, references, and call edges", asyn
   assert.equal(fallback.indexer, "none");
 });
 
+test("a transient grammar load failure does not permanently poison that language for the rest of the process", async () => {
+  // `loadLanguage` in tree-sitter-index.mjs caches a grammar as `unavailable`
+  // the first time `Parser.Language.load` throws, with no distinction between
+  // "this grammar is not shipped at all" (a fact that genuinely never changes)
+  // and "this one attempt to read/parse the .wasm file failed" (a transient
+  // condition — disk pressure, a half-written file during an install, momentary
+  // resource exhaustion). Once poisoned, every later call for that language in
+  // the same process silently falls back to the regex indexer, for the rest of
+  // the process's life, with nothing surfaced to say so. In a long-lived
+  // Electron process this quietly degrades analysis quality after one bad
+  // moment; in a single `node --test` process running every file in this
+  // suite, it means one test's incidental interaction with a transient
+  // failure can leak into every later, unrelated test that touches the same
+  // language — exactly the cross-test residue item 2 is about.
+  const require = createRequire(import.meta.url);
+  const wasmPath = require.resolve("tree-sitter-wasms/out/tree-sitter-swift.wasm");
+  const original = await readFile(wasmPath);
+  resetTreeSitterCaches();
+  await writeFile(wasmPath, Buffer.from("not actually a wasm module"));
+  let duringCorruption;
+  try {
+    duringCorruption = await analyzeSource("a.swift", "swift", "func f() {}\n");
+  } finally {
+    await writeFile(wasmPath, original);
+  }
+  assert.equal(duringCorruption, null, "a genuinely unparsable grammar file must fall back, not throw");
+
+  // The file is back to being perfectly valid, but with no reset the module
+  // still believes, from the one failed attempt above, that this grammar can
+  // never be loaded — even though nothing is actually wrong with it any more.
+  const afterRepairNoReset = await analyzeSource("a.swift", "swift", "func f() {}\n");
+  assert.equal(afterRepairNoReset?.indexer, "tree-sitter", "a transient load failure must not be remembered as permanent once the underlying file is fine again");
+});
+
 test("import resolution degrades from language servers to the static index", async (context) => {
   const rootPath = await mkdtemp(path.join(os.tmpdir(), "trace-lsp-"));
   context.after(async () => {
@@ -488,14 +545,10 @@ test("the knowledge graph is versioned and rebuilds incrementally", async (conte
 });
 
 test("the production entry bundle excludes Monaco and stays inside its budget", async (context) => {
-  const distDirectory = path.resolve("dist");
-  let entryHtml;
-  try {
-    entryHtml = await readFile(path.join(distDirectory, "index.html"), "utf8");
-  } catch {
-    context.skip("Run `npm run build` before this test to check the bundle budget.");
-    return;
-  }
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-bundle-"));
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  const distDirectory = await buildIsolatedDist(path.join(workspace, "dist"));
+  const entryHtml = await readFile(path.join(distDirectory, "index.html"), "utf8");
   const assetDirectory = path.join(distDirectory, "assets");
   const assets = await readdir(assetDirectory);
 
@@ -5948,9 +6001,14 @@ test("an update is refused unless every check passes, and a release is reproduci
 
   // --- A real release build, twice -----------------------------------------
   // The artifacts must be byte-identical across runs, or the digest in the
-  // manifest cannot be checked by anybody but the machine that built it.
-  const first = await buildRelease({ outputDirectory: path.join(workspace, "one"), keyDirectory: path.join(workspace, "keys") });
-  const second = await buildRelease({ outputDirectory: path.join(workspace, "two"), keyDirectory: path.join(workspace, "keys") });
+  // manifest cannot be checked by anybody but the machine that built it. The
+  // renderer is built once into a workspace-owned `dist`, rather than this
+  // test reading whatever `dist` happens to already exist at the project
+  // root — which would make the result depend on an earlier, unrelated
+  // command instead of on what this test itself built.
+  const distDirectory = await buildIsolatedDist(path.join(workspace, "dist"));
+  const first = await buildRelease({ distDirectory, outputDirectory: path.join(workspace, "one"), keyDirectory: path.join(workspace, "keys") });
+  const second = await buildRelease({ distDirectory, outputDirectory: path.join(workspace, "two"), keyDirectory: path.join(workspace, "keys") });
   assert.equal(first.manifest.artifacts.length, 4, "every platform and architecture must be built");
   assert.deepEqual(
     first.manifest.artifacts.map((artifact) => `${artifact.platform}/${artifact.arch}`).sort(),
@@ -6357,8 +6415,14 @@ test("the bill of materials is read off the tree, the scan admits what it did no
   assert.equal(firstByteDifference(Buffer.from("ab"), Buffer.from("abc")).offset, 2);
 
   // --- The release carries all of it, twice, identically -------------------
-  const first = await buildRelease({ outputDirectory: path.join(workspace, "release-one"), keyDirectory: path.join(workspace, "keys") });
-  const second = await buildRelease({ outputDirectory: path.join(workspace, "release-two"), keyDirectory: path.join(workspace, "keys") });
+  // Built once into a workspace-owned `dist`, rather than reading whatever
+  // `dist` happens to already exist at the project root: that ambient
+  // directory is populated only when some earlier, unrelated command ran
+  // `vite build`, and a test that reads it passes or fails depending on that
+  // accident instead of on what it built itself.
+  const releaseDist = await buildIsolatedDist(path.join(workspace, "release-dist"));
+  const first = await buildRelease({ distDirectory: releaseDist, outputDirectory: path.join(workspace, "release-one"), keyDirectory: path.join(workspace, "keys") });
+  const second = await buildRelease({ distDirectory: releaseDist, outputDirectory: path.join(workspace, "release-two"), keyDirectory: path.join(workspace, "keys") });
   assert.equal(compareBuilds(first.manifest.artifacts, second.manifest.artifacts).reproducible, true);
   // The attestation itself is reproducible: only the countersignature's clock
   // differs, and that is metadata beside the signature rather than inside it.
@@ -6398,16 +6462,11 @@ test("the bill of materials is read off the tree, the scan admits what it did no
 
   // --- The renderer build is reproducible too ------------------------------
   // The payload contains `dist`, so an artifact digest is only checkable by a
-  // third party if `vite build` produces the same bytes twice.
-  let distFiles;
-  try {
-    distFiles = await readdir(path.join(projectRoot, "dist", "assets"));
-  } catch {
-    distFiles = null;
-  }
-  if (!distFiles) {
-    context.diagnostic("dist is absent; run `npm run build` to check that the renderer build is reproducible.");
-  } else {
+  // third party if `vite build` produces the same bytes twice. Both builds
+  // are fixtures this test owns — `releaseDist` from the release above, and
+  // a second build into its own workspace directory — rather than comparing
+  // against whatever `dist` happens to exist at the project root.
+  {
     const rebuilt = path.join(workspace, "dist-rebuild");
     await execFileAsync(process.execPath, [path.join(projectRoot, "node_modules", "vite", "bin", "vite.js"), "build", "--outDir", rebuilt, "--emptyOutDir"], { cwd: projectRoot, maxBuffer: 32 * 1024 * 1024 });
     const digestTree = async (directory) => {
@@ -6419,7 +6478,7 @@ test("the bill of materials is read off the tree, the scan admits what it did no
       }
       return digests.sort((left, right) => left[0].localeCompare(right[0]));
     };
-    const original = await digestTree(path.join(projectRoot, "dist"));
+    const original = await digestTree(releaseDist);
     const copy = await digestTree(rebuilt);
     assert.ok(original.length > 20, `only ${original.length} files in dist`);
     const differing = copy.filter(([name, digest]) => (original.find(([candidate]) => candidate === name) ?? [null, null])[1] !== digest);
@@ -6652,7 +6711,13 @@ test("performance budgets scale with the work, refuse to judge too few samples, 
 
   // --- The tool, run for real, in its own process --------------------------
   const reportPath = path.join(workspace, "perf.json");
-  const cleanRun = await execFileAsync(process.execPath, [path.resolve("scripts", "perf-budget.mjs"), `--repo=${fixture}`, `--out=${reportPath}`], { maxBuffer: 32 * 1024 * 1024 });
+  // `--dist` points at a directory this test knows does not exist, so the
+  // entry-bundle budget is deterministically unmeasured here regardless of
+  // whatever `dist` happens to exist (or not) beside the project root from an
+  // unrelated build. Without pinning it, this assertion's pass/fail depended
+  // on ambient state outside the test's control.
+  const noDist = path.join(workspace, "no-dist-here");
+  const cleanRun = await execFileAsync(process.execPath, [path.resolve("scripts", "perf-budget.mjs"), `--repo=${fixture}`, `--out=${reportPath}`, `--dist=${noDist}`], { maxBuffer: 32 * 1024 * 1024 });
   const written = JSON.parse(await readFile(reportPath, "utf8"));
   assert.equal(written.passed, true, `${written.summary}\n${cleanRun.stderr}`);
   assert.equal(written.repository.files, indexed.stats.fileCount);
@@ -6662,7 +6727,7 @@ test("performance budgets scale with the work, refuse to judge too few samples, 
   assert.deepEqual(written.memoryActions, []);
   // Startup and rendering cannot be measured without a window, and the report
   // says which budgets it did not reach rather than implying a clean sheet.
-  assert.deepEqual(written.unmeasured.sort(), ["render.domNodes", "render.longTaskMs", "render.viewSwitchMs", "startup.firstWindowMs", "startup.interactiveMs"]);
+  assert.deepEqual(written.unmeasured.sort(), ["render.domNodes", "render.entryBundleBytes", "render.longTaskMs", "render.viewSwitchMs", "startup.firstWindowMs", "startup.interactiveMs"]);
 
   // ...and it fails the run rather than printing a number, when a baseline says
   // the same measurement used to be far better.
@@ -6671,15 +6736,27 @@ test("performance budgets scale with the work, refuse to judge too few samples, 
     results: written.results.map((result) => (result.id === "index.totalMs" ? { ...result, value: Math.max(1, result.value / 100) } : result)),
   }));
   await assert.rejects(
-    () => execFileAsync(process.execPath, [path.resolve("scripts", "perf-budget.mjs"), `--repo=${fixture}`, `--baseline=${baselinePath}`], { maxBuffer: 32 * 1024 * 1024 }),
+    () => execFileAsync(process.execPath, [path.resolve("scripts", "perf-budget.mjs"), `--repo=${fixture}`, `--baseline=${baselinePath}`, `--dist=${noDist}`], { maxBuffer: 32 * 1024 * 1024 }),
     (error) => {
       assert.equal(error.code, 1, "a regression must fail the run, not merely be printed");
-      assert.match(error.stderr, /regression\(s\): index\.totalMs/);
+      // `index.totalMs` must be named as a regression, but it is not
+      // necessarily the *only* one: `index.peakRssBytes` is measured by
+      // running this same fixture through a real process a second time, and
+      // resident memory on a shared, loaded machine can itself drift by more
+      // than the 20% noise floor between those two runs — a real, independent
+      // regression the tool is right to also report. Regressions are sorted
+      // alphabetically, so `index.peakRssBytes` can legitimately appear before
+      // `index.totalMs` in the summary; anchoring the match to "the very next
+      // token after the colon" made this assertion fail on exactly the
+      // memory noise this test suite already documents elsewhere, without
+      // that noise ever being a problem with the regression detector itself.
+      assert.match(error.stderr, /regression\(s\): /);
+      assert.match(error.stderr, /index\.totalMs \d/);
       return true;
     },
   );
   // An unreadable baseline is reported as unreadable, not as "no regressions".
-  const unreadable = await execFileAsync(process.execPath, [path.resolve("scripts", "perf-budget.mjs"), `--repo=${fixture}`, "--baseline=/nonexistent/baseline.json", `--out=${path.join(workspace, "perf2.json")}`], { maxBuffer: 32 * 1024 * 1024 });
+  const unreadable = await execFileAsync(process.execPath, [path.resolve("scripts", "perf-budget.mjs"), `--repo=${fixture}`, "--baseline=/nonexistent/baseline.json", `--out=${path.join(workspace, "perf2.json")}`, `--dist=${noDist}`], { maxBuffer: 32 * 1024 * 1024 });
   assert.equal(JSON.parse(await readFile(path.join(workspace, "perf2.json"), "utf8")).regression.unavailable, true, unreadable.stdout.slice(0, 200));
 
   // A budget only earns its keep if it fails, so this proves it would.

@@ -106,10 +106,15 @@ function tarball(entries) {
   return Buffer.concat(blocks);
 }
 
-async function collect(projectRoot) {
+// `dist` is resolved separately from the rest of the payload because it is a
+// *build product*, not part of the source tree: the caller (a real `npm run
+// build`, or a test building an isolated fixture) owns where it lives. Every
+// other payload entry is read straight off `projectRoot`, which is always the
+// source tree and never a build output.
+async function collect(projectRoot, distDirectory) {
   const entries = [];
   for (const top of PAYLOAD) {
-    const absolute = path.join(projectRoot, top);
+    const absolute = top === "dist" ? distDirectory : path.join(projectRoot, top);
     const details = await stat(absolute);
     if (details.isDirectory()) {
       for (const relative of await fileList(absolute)) {
@@ -122,10 +127,10 @@ async function collect(projectRoot) {
   return entries.sort((left, right) => left.name.localeCompare(right.name));
 }
 
-async function packageTarget(projectRoot, outputDirectory, version, target, sbom) {
+async function packageTarget(projectRoot, distDirectory, outputDirectory, version, target, sbom) {
   const name = `trace-${version}-${target.platform}-${target.arch}.tar.gz`;
   const destination = path.join(outputDirectory, name);
-  const entries = await collect(projectRoot);
+  const entries = await collect(projectRoot, distDirectory);
   // The bill of materials travels *inside* the artifact (item 56). An SBOM kept
   // only on the build server describes something the person holding the file
   // cannot check; one shipped alongside the bytes it describes can be compared
@@ -149,11 +154,22 @@ async function packageTarget(projectRoot, outputDirectory, version, target, sbom
   };
 }
 
-export async function buildRelease({ projectRoot = path.resolve("."), outputDirectory, channel = "stable", notes = "", minimumFrom = null, keyDirectory, advisories = null } = {}) {
+export async function buildRelease({ projectRoot = path.resolve("."), distDirectory, outputDirectory, channel = "stable", notes = "", minimumFrom = null, keyDirectory, advisories = null } = {}) {
   const manifestPackage = JSON.parse(await readFile(path.join(projectRoot, "package.json"), "utf8"));
   const version = manifestPackage.version;
   const output = outputDirectory ?? path.join(projectRoot, "release");
   await mkdir(output, { recursive: true });
+  // Defaults to `<projectRoot>/dist`, which is what `npm run release` expects
+  // (it runs `vite build` first, see the `release` script). A caller that
+  // wants the payload's renderer build isolated from whatever happens to be
+  // on disk at `projectRoot` — a test, most notably — passes its own
+  // `distDirectory` instead of relying on that ambient directory.
+  const dist = distDirectory ?? path.join(projectRoot, "dist");
+  try {
+    await stat(dist);
+  } catch {
+    throw new Error(`dist directory not found at ${dist}; run \`npm run build\` first, or pass an explicit distDirectory built by the caller.`);
+  }
 
   // Built once and shared by every target, so all four artifacts attest to the
   // same materials rather than to four separate readings of the tree.
@@ -161,7 +177,7 @@ export async function buildRelease({ projectRoot = path.resolve("."), outputDire
   const scan = scanDependencies(sbom, { advisories });
 
   const artifacts = [];
-  for (const target of TARGETS) artifacts.push(await packageTarget(projectRoot, output, version, target, sbom));
+  for (const target of TARGETS) artifacts.push(await packageTarget(projectRoot, dist, output, version, target, sbom));
 
   const manifest = buildUpdateManifest({ product: "trace", releaseVersion: version, channel, notes, minimumFrom, artifacts, releasedAt: "2020-01-01T00:00:00.000Z" });
   const keyPair = await loadOrCreateKeyPair(keyDirectory ?? path.join(output, "keys"));

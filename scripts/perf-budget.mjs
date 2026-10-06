@@ -107,6 +107,11 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const requested = argumentValue("repo", null);
   const outputPath = argumentValue("out", null);
   const baselinePath = argumentValue("baseline", null);
+  // Explicit, so a caller that needs the entry-bundle budget measured against
+  // a fixture it built (rather than whatever `dist` happens to already sit
+  // beside this script) can say so. Defaults to the ambient `./dist`, which is
+  // what `npm run perf` after `npm run build` expects.
+  const distPath = argumentValue("dist", null);
   let rootPath = requested;
   let temporary = null;
   if (!rootPath) {
@@ -119,8 +124,9 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     const measured = await measureWorkspace(rootPath);
     let entryBytes = null;
     try {
-      await readdir(path.resolve("dist", "assets"));
-      entryBytes = await entryBundleBytes(path.resolve("dist"));
+      const distDirectory = path.resolve(distPath ?? "dist");
+      await readdir(path.join(distDirectory, "assets"));
+      entryBytes = await entryBundleBytes(distDirectory);
     } catch {
       entryBytes = null;
     }
