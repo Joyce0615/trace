@@ -5627,7 +5627,12 @@ test("a crash leaves practice worktrees on disk, and the next launch finds them"
     "an orphaned worktree must not be touched; it may hold the only copy of somebody's work");
 
   // --- A record whose worktree is gone is dropped -------------------------
-  await execFileAsync("git", ["-C", rootPath, "worktree", "remove", "--force", "--", session.worktreePath]);
+  // `git worktree remove` is Git 2.17+; deleting the directory and pruning
+  // (what the production code itself does, and what every Git version
+  // supports) is exactly how a crash or an out-of-band `rm -rf` leaves a
+  // worktree gone without the bookkeeping already knowing about it.
+  await rm(session.worktreePath, { recursive: true, force: true });
+  await execFileAsync("git", ["-C", rootPath, "worktree", "prune"]);
   const afterRemoval = await reconcilePracticeSessions(practiceDirectory);
   assert.deepEqual(afterRemoval.restored, []);
   assert.equal(afterRemoval.stale.length, 1);

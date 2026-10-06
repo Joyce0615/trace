@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { access, mkdir, readdir, realpath } from "node:fs/promises";
+import { access, mkdir, readdir, realpath, rm } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { readDurable, writeDurable } from "./durable-store.mjs";
@@ -173,8 +173,14 @@ export async function removePracticeSession(id, discardChanges = false) {
   const session = getSession(id);
   const report = await inspectPracticeSession(id);
   if (!report.clean && !discardChanges) return { removed: false, requiresConfirmation: true, report };
-  await run("git", ["-C", session.repositoryRoot, "worktree", "remove", ...(discardChanges ? ["--force"] : []), "--", session.worktreePath], { timeoutMs: 120_000 });
-  await run("git", ["-C", session.repositoryRoot, "worktree", "prune"]);
+  // `git worktree remove` was only added in Git 2.17. Deleting the worktree
+  // directory and then pruning is what that subcommand does internally once
+  // there are no changes left worth protecting (the only case reached here,
+  // since the guard above already refused a dirty worktree without
+  // `discardChanges`), and it works on every Git version this app supports
+  // rather than failing with "usage: git worktree add..." on an older one.
+  await rm(session.worktreePath, { recursive: true, force: true });
+  await run("git", ["-C", session.repositoryRoot, "worktree", "prune"], { allowFailure: true });
   sessions.delete(id);
   await persistSessions();
   return { removed: true, requiresConfirmation: false };
