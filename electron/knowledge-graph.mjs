@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { analysisSchemaVersion } from "./repository.mjs";
 
 /**
  * Versioned repository knowledge graph.
@@ -111,9 +112,22 @@ function partitionForFile(repository, file) {
 /**
  * Build (or incrementally rebuild) the knowledge graph for a repository index.
  * Pass `previous` to reuse unchanged file partitions.
+ *
+ * A previous graph is only eligible for partition reuse when it was built
+ * under the *same* extraction schema (parser/grammar/query/regex-fallback
+ * version) as this call. A schema change can alter what an unchanged blob
+ * extracts without the blob id itself ever moving, so reusing a partition
+ * across a schema change would make an incremental rebuild diverge from what
+ * a full rebuild produces for the exact same repository state — silently and
+ * permanently, since nothing downstream re-checks a reused partition. When
+ * the schema differs, every partition is rebuilt (as if `previous` were
+ * absent) and the mismatch is reported in `stats` rather than hidden.
  */
 export function buildKnowledgeGraph(repository, options = {}) {
-  const previous = options.previous?.format === GRAPH_FORMAT ? options.previous : null;
+  const currentSchema = analysisSchemaVersion();
+  const schemaMatches = options.previous?.extractionSchema === currentSchema;
+  const previous = options.previous?.format === GRAPH_FORMAT && schemaMatches ? options.previous : null;
+  const invalidatedBySchemaChange = Boolean(options.previous?.format === GRAPH_FORMAT && !schemaMatches);
   const previousPartitions = new Map((previous?.partitions ?? []).map((partition) => [partition.path, partition]));
   const currentPaths = new Set(repository.files.map((file) => file.path));
 
@@ -175,6 +189,7 @@ export function buildKnowledgeGraph(repository, options = {}) {
     repositoryId: repository.id,
     version: repository.versionId,
     previousVersion: previous?.version ?? null,
+    extractionSchema: currentSchema,
     generatedAt: new Date().toISOString(),
     partitions,
     nodes: nodeList,
@@ -186,6 +201,7 @@ export function buildKnowledgeGraph(repository, options = {}) {
       reusedPartitions: reused,
       rebuiltPartitions: rebuilt,
       invalidatedByDependency,
+      invalidatedBySchemaChange,
       removedPartitions: [...previousPartitions.keys()].filter((candidate) => !currentPaths.has(candidate)).length,
       danglingEdges,
       resolvedCallEdges: edges.filter((edge) => edge.kind === "calls" && edge.resolved).length,

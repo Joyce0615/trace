@@ -1,6 +1,16 @@
+import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
+
+// Bump this by hand whenever the *extraction logic* changes in a way that is
+// not already captured by a change to the query tables below — e.g.
+// `enclosingScope`'s scope-attribution rules, `SCOPE_NODE_TYPES`, or how a
+// capture is turned into a definition/reference/call-edge record. The query
+// tables are hashed automatically (edit one and the signature moves on its
+// own); this constant exists for the cases a text diff of the queries cannot
+// see.
+const EXTRACTION_LOGIC_VERSION = 1;
 
 // Repository language id -> tree-sitter grammar file shipped by tree-sitter-wasms.
 const GRAMMAR_BY_LANGUAGE = {
@@ -454,3 +464,51 @@ export function resetTreeSitterCaches() {
   state.queries.clear();
   state.unavailable.clear();
 }
+
+// Installed package versions are read lazily (not at module-eval time) so a
+// test can delete/replace `node_modules` between calls without needing to
+// re-import this module; `require.resolve` + `createRequire` already give us
+// a sandbox-free, Node-native way to read a dependency's own `package.json`
+// without adding a dependency on anything beyond what this module already
+// uses.
+function installedVersion(packageName) {
+  try {
+    return require(`${packageName}/package.json`).version ?? "unknown";
+  } catch {
+    return "absent";
+  }
+}
+
+/**
+ * A content hash over everything that can change what `analyzeSource`
+ * extracts for *unchanged source bytes*: the grammar-selection table, every
+ * definition/call/import query, the extraction-logic version above, and the
+ * installed `tree-sitter-wasms`/`web-tree-sitter` package versions (a grammar
+ * or parser upgrade can change what a query captures even when the query text
+ * itself is byte-identical).
+ *
+ * A cached graph/analysis partition binds to this signature. When it changes,
+ * every partition it covers must be treated as unknown — not merely "maybe
+ * still right" — because nothing here can tell *which* partitions a grammar or
+ * query change actually affected without re-running them, and guessing wrong
+ * in either direction (over-invalidating is wasted work; under-invalidating
+ * is a silently stale lesson) is unacceptable for the error case not taken.
+ */
+export function indexSignature() {
+  const digest = createHash("sha256")
+    .update(JSON.stringify({
+      extractionLogicVersion: EXTRACTION_LOGIC_VERSION,
+      grammarByLanguage: GRAMMAR_BY_LANGUAGE,
+      dialectGrammars: DIALECT_GRAMMARS,
+      definitionQueries: DEFINITION_QUERIES,
+      callQueries: CALL_QUERIES,
+      importQueries: IMPORT_QUERIES,
+      scopeNodeTypes: [...SCOPE_NODE_TYPES].sort(),
+      treeSitterWasms: installedVersion("tree-sitter-wasms"),
+      webTreeSitter: installedVersion("web-tree-sitter"),
+    }))
+    .digest("hex")
+    .slice(0, 16);
+  return `ts1:${digest}`;
+}
+

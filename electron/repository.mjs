@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { access, lstat, mkdir, readdir, readFile, realpath, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { analyzeSource, treeSitterSupports } from "./tree-sitter-index.mjs";
+import { analyzeSource, indexSignature as treeSitterIndexSignature, treeSitterSupports } from "./tree-sitter-index.mjs";
 import { memoryPressureAction, watchMemory } from "./performance.mjs";
 import { runIndexerPlugins } from "./plugins.mjs";
 import { resolveImportsStatically } from "./language-server.mjs";
@@ -408,6 +408,29 @@ function symbolPatterns(language) {
   return [];
 }
 
+// Bump when the *regex* fallback's own extraction rules change (a pattern
+// added/changed/removed in `symbolPatterns`/`regexSymbols`), the same way
+// `tree-sitter-index.mjs`'s `EXTRACTION_LOGIC_VERSION` covers its side. Content
+// a cached partition was derived from is otherwise indistinguishable from
+// content derived under a changed rule — the blob id alone cannot tell them
+// apart, because the *source bytes* did not change, only what this file does
+// with them.
+const REGEX_FALLBACK_VERSION = 1;
+
+/**
+ * The combined signature every cached per-blob analysis and every knowledge-
+ * graph partition is bound to: the tree-sitter grammar/query/parser signature
+ * plus this module's own regex-fallback version. Changing either one must
+ * invalidate every partition derived under the old signature, because
+ * "unchanged blob id" only proves the *source* did not change — it says
+ * nothing about whether the code that turns that source into definitions,
+ * references, and call edges is still the code that produced the cached
+ * result.
+ */
+export function analysisSchemaVersion() {
+  return `${treeSitterIndexSignature()}:regex${REGEX_FALLBACK_VERSION}`;
+}
+
 // Per-blob analysis cache: re-indexing a repository only re-parses files whose
 // content hash changed, which is what makes knowledge-graph rebuilds incremental.
 const ANALYSIS_CACHE_LIMIT = 8_000;
@@ -474,7 +497,15 @@ export async function analyzeFile(rootPath, file, options = {}) {
   if (file.size > 600_000) return empty;
   const canParse = allowTreeSitter && treeSitterSupports(file.language, file.path);
   if (!canParse && !symbolPatterns(file.language).length) return empty;
-  const cacheKey = file.blobId ? `${file.path}:${file.blobId}${allowTreeSitter ? "" : ":regex-only"}` : null;
+  // Binding the cache key to `analysisSchemaVersion()` means a parser, grammar,
+  // query, or regex-fallback upgrade can never serve a result computed under the
+  // *old* extraction logic just because the blob id is unchanged — incremental
+  // re-indexing after such an upgrade must produce exactly what a full rebuild
+  // would, and the only way to guarantee that is to make the stale entries
+  // unaddressable rather than trust something downstream to notice.
+  const cacheKey = file.blobId
+    ? `${file.path}:${file.blobId}:${analysisSchemaVersion()}${allowTreeSitter ? "" : ":regex-only"}`
+    : null;
   if (cacheKey && analysisCache.has(cacheKey)) {
     analysisCacheHits += 1;
     return analysisCache.get(cacheKey);
@@ -786,8 +817,14 @@ export async function inspectRepository(input, repositoriesDirectory, options = 
     .sort()
     .map((changedPath) => `${changedPath}:${fileRecords.find((file) => file.path === changedPath)?.blobId ?? "deleted"}`)
     .join("\n");
+  // The index extraction schema (parser/grammar/query/regex-fallback version) is
+  // folded into the version id itself, not just the per-blob cache key: a
+  // schema bump must look exactly like a repository change to every downstream
+  // consumer keyed on `versionId` (search index, knowledge graph, course
+  // generation), not only to the analysis cache. Otherwise "nothing in git
+  // changed" would make a stale knowledge graph look current forever.
   const versionId = createHash("sha256")
-    .update(`${head}\n${statusText}\n${diffSummary}\n${changedFingerprint}`)
+    .update(`${head}\n${statusText}\n${diffSummary}\n${changedFingerprint}\n${analysisSchemaVersion()}`)
     .digest("hex")
     .slice(0, 20);
   report("finalize", 1, 1, "Index ready");
