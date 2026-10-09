@@ -3017,6 +3017,71 @@ test("executable quizzes hide their oracle and run inside a bounded sandbox", as
     return;
   }
 
+  // --- OS-enforced confinement closes what the static screen cannot see ----
+  // `type(1).__base__.__subclasses__()` reaches a live `FileLoader`/`FileIO`
+  // with no import and no call matching FORBIDDEN_PATTERNS; building the same
+  // dunder names through `chr(95) * 2 + "..."` additionally evades the static
+  // regex screen itself (no literal `__name__`-shaped token appears in the
+  // source), so these submissions are *allowed* by `screenSubmission` and must
+  // still be refused when they actually run, because isolation here comes
+  // from the host OS rather than from recognizing this source text.
+  const dunder = (part) => `getattr(cls_attr, chr(95) * 2 + "${part}" + chr(95) * 2)`;
+  const walkToClassByName = [
+    "    d = chr(95) * 2",
+    "    cls_attr = (1)",
+    `    cls_attr = ${dunder("class")}`,
+    `    base = ${dunder("base")}`,
+    "    stack = [base]",
+    "    found = None",
+    "    seen = set()",
+    "    while stack:",
+    "        c = stack.pop()",
+    "        if id(c) in seen:",
+    "            continue",
+    "        seen.add(id(c))",
+    "        if getattr(c, d + 'name' + d) == target_name:",
+    "            found = c",
+    "            break",
+    "        stack.extend(getattr(c, d + 'subclasses' + d)())",
+  ].join("\n");
+  const introspectionReadEscape = [
+    "def f(path):",
+    "    target_name = 'FileLoader'",
+    walkToClassByName,
+    "    if found is None:",
+    "        return b'not-found'",
+    "    return found('x', path).get_data(path)[:5]",
+  ].join("\n");
+  const introspectionReadScreen = screenSubmission(introspectionReadEscape, { entry: "f" });
+  assert.equal(introspectionReadScreen.allowed, true, "the static screen cannot see this escape, by construction (" + JSON.stringify(introspectionReadScreen) + ")");
+  const homeTarget = os.homedir();
+  const homeRead = await runInSandbox({ moduleSource: introspectionReadEscape, entry: "f", calls: [[homeTarget]] });
+  assert.notEqual(homeRead.enforced.isolation, "none", "a confinement backend must be present on this host for the test to prove anything");
+  assert.equal(homeRead.results[0].ok, false, JSON.stringify(homeRead));
+  assert.match(homeRead.results[0].error, /Operation not permitted|PermissionError/);
+
+  const introspectionWriteEscape = [
+    "def f(path):",
+    "    target_name = 'FileIO'",
+    walkToClassByName,
+    "    if found is None:",
+    "        return 'not-found'",
+    "    fh = found(path, 'w')",
+    "    fh.write(b'x')",
+    "    fh.close()",
+    "    return 'wrote'",
+  ].join("\n");
+  const introspectionWriteScreen = screenSubmission(introspectionWriteEscape, { entry: "f" });
+  assert.equal(introspectionWriteScreen.allowed, true, "the static screen cannot see this escape, by construction (" + JSON.stringify(introspectionWriteScreen) + ")");
+  const outsideWritePath = path.join(os.tmpdir(), `trace-quiz-os-escape-${Date.now()}.txt`);
+  const outsideWrite = await runInSandbox({ moduleSource: introspectionWriteEscape, entry: "f", calls: [[outsideWritePath]] });
+  assert.equal(outsideWrite.results[0].ok, false, JSON.stringify(outsideWrite));
+  await assert.rejects(access(outsideWritePath), "a write outside the sandbox's own scratch directory must not land on disk");
+
+  // Refusing to run unconfined is the fail-closed branch; exercised directly
+  // against the pure, process-free policy builder below (os-sandbox.test.mjs
+  // covers Backend.None end to end without needing to fake out detection here).
+
   // --- The sandbox actually enforces its limits ----------------------------
   const network = await runInSandbox({ moduleSource: "def f(n):\n    import socket\n    return socket.socket()\n", entry: "f", calls: [[1]] });
   assert.equal(network.status, "ok");

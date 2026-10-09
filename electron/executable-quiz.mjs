@@ -5,6 +5,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { detectRuntimes } from "./execution-trace.mjs";
 import { redactValue } from "./secret-scanner.mjs";
+import { Backend, buildConfinedCommand, detectBackend } from "./os-sandbox.mjs";
 
 /**
  * Executable quizzes with hidden tests and a sandboxed runner.
@@ -338,7 +339,29 @@ export async function runInSandbox(request, options = {}) {
   // An empty temporary directory, so relative paths cannot reach the repository.
   const sandboxDirectory = await mkdtemp(path.join(os.tmpdir(), "trace-quiz-sandbox-"));
   try {
-    const result = await runSandboxProcess(runtime.command, ["-I", "-S", "-B", "-c", PYTHON_SANDBOX], {
+    const innerCommand = [runtime.command, "-I", "-S", "-B", "-c", PYTHON_SANDBOX];
+    // OS-enforced confinement (item 5): the Python-level deny-list below is
+    // bypassable from pure Python (`type(1).__base__.__subclasses__()` reaches
+    // `importlib`'s `FileLoader` with no import and no call matching
+    // `FORBIDDEN_PATTERNS`), so filesystem/network isolation is enforced by the
+    // host OS instead — a layer the submission cannot see or route around.
+    // Fails closed: with no confinement backend on this host, the run is
+    // refused rather than silently executed unconfined.
+    const backend = detectBackend();
+    const confined = backend === Backend.None
+      ? null
+      : buildConfinedCommand(backend, { homeDirectory: os.homedir(), writableRoot: sandboxDirectory, innerCommand });
+    if (!confined) {
+      return {
+        supported: true,
+        status: "unavailable",
+        reason: "No OS confinement backend (macOS sandbox-exec or Linux bwrap) is available on this host, " +
+          "so executable quizzes refuse to run rather than execute a learner submission unconfined.",
+        results: [],
+        enforced: { isolation: "none" },
+      };
+    }
+    const result = await runSandboxProcess(confined.command, confined.args, {
       cwd: sandboxDirectory,
       wallClockMs: limits.wallClockMs,
       maxOutputBytes: limits.maxOutputBytes,
@@ -354,19 +377,19 @@ export async function runInSandbox(request, options = {}) {
     });
 
     if (result.timedOut) {
-      return { supported: true, status: "timeout", reason: `The run exceeded ${limits.wallClockMs} ms of wall-clock time and was stopped.`, results: [], enforced: { wallClock: "parent-kill" } };
+      return { supported: true, status: "timeout", reason: `The run exceeded ${limits.wallClockMs} ms of wall-clock time and was stopped.`, results: [], enforced: { wallClock: "parent-kill", isolation: backend } };
     }
     if (/SANDBOX_MEMORY_EXCEEDED/.test(result.stderr) || result.code === 97) {
-      return { supported: true, status: "memory", reason: `The run exceeded the ${Math.round(limits.memoryBytes / 1_048_576)} MB memory cap and was stopped.`, results: [], enforced: { memory: "watchdog" } };
+      return { supported: true, status: "memory", reason: `The run exceeded the ${Math.round(limits.memoryBytes / 1_048_576)} MB memory cap and was stopped.`, results: [], enforced: { memory: "watchdog", isolation: backend } };
     }
     // SIGXCPU (24) and SIGKILL after it both mean the CPU limit fired.
     if (result.signal === "SIGXCPU" || result.code === 152 || result.code === 137) {
-      return { supported: true, status: "cpu", reason: `The run exceeded ${limits.cpuSeconds} s of CPU time and was stopped.`, results: [], enforced: { cpu: "rlimit" } };
+      return { supported: true, status: "cpu", reason: `The run exceeded ${limits.cpuSeconds} s of CPU time and was stopped.`, results: [], enforced: { cpu: "rlimit", isolation: backend } };
     }
 
     const markerLine = result.stdout.split(/\r?\n/).find((line) => line.startsWith(MARKER));
     if (!markerLine) {
-      return { supported: true, status: "failed", reason: "The sandbox produced no result.", results: [], exitCode: result.code, stderr: redactValue(result.stderr.slice(-1_000)) };
+      return { supported: true, status: "failed", reason: "The sandbox produced no result.", results: [], exitCode: result.code, stderr: redactValue(result.stderr.slice(-1_000)), enforced: { isolation: backend } };
     }
     const payload = JSON.parse(markerLine.slice(MARKER.length));
     return redactValue({
@@ -376,6 +399,7 @@ export async function runInSandbox(request, options = {}) {
       stdout: result.stdout.split(/\r?\n/).filter((line) => !line.startsWith(MARKER)).join("\n").slice(-2_000),
       stderr: result.stderr.slice(-1_000),
       outputTruncated: Boolean(result.outputTruncated),
+      enforced: { ...(payload.enforced ?? {}), isolation: backend },
     });
   } finally {
     await rm(sandboxDirectory, { recursive: true, force: true });
