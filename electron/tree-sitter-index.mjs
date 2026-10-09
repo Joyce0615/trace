@@ -10,7 +10,7 @@ const require = createRequire(import.meta.url);
 // tables are hashed automatically (edit one and the signature moves on its
 // own); this constant exists for the cases a text diff of the queries cannot
 // see.
-const EXTRACTION_LOGIC_VERSION = 1;
+const EXTRACTION_LOGIC_VERSION = 2;
 
 // Repository language id -> tree-sitter grammar file shipped by tree-sitter-wasms.
 const GRAMMAR_BY_LANGUAGE = {
@@ -404,9 +404,13 @@ export async function analyzeSource(filePath, language, source, options = {}) {
         const specifiers = capture.name === "module"
           ? [stripQuotes(node.text)]
           : moduleSpecifiersFrom(node.text);
+        // When the capture is only the module-path string (JS/TS/Go/etc.), the
+        // bound names live in the surrounding statement, not in the string itself.
+        const statementText = capture.name === "module" ? (node.parent?.text ?? node.text) : node.text;
+        const boundNames = boundNamesFrom(statementText);
         for (const specifier of specifiers) {
           if (!specifier || specifier.length > 200) continue;
-          imports.push({ path: filePath, line: node.startPosition.row + 1, specifier, statement: node.text.slice(0, 200) });
+          imports.push({ path: filePath, line: node.startPosition.row + 1, specifier, statement: node.text.slice(0, 200), boundNames });
         }
       }
     }
@@ -445,6 +449,75 @@ function moduleSpecifiersFrom(statement) {
       .map((part) => part.trim().split(/\s+as\s+/)[0].trim().replace(/[;{}]/g, ""))
       .filter(Boolean)
       .slice(0, 8);
+  }
+  return [];
+}
+
+/**
+ * Extract the local identifier(s) an import statement binds into the
+ * importing file's scope, e.g. `from pkg import clamp` binds `clamp`,
+ * `import pkg as p` binds `p`, `import { identity, other as o } from './x'`
+ * binds `identity` and `o`. Used to disambiguate which definition a call
+ * site actually reaches, instead of matching any same-named definition
+ * anywhere in the repository (item 4).
+ *
+ * Returns an empty array when the statement's binding shape is not
+ * recognised (e.g. `from pkg import *`, or a language this does not cover) —
+ * callers must treat that as "no information", not "binds nothing".
+ */
+function boundNamesFrom(statement) {
+  const text = statement.trim();
+  // JS/TS: `import def from './x'`, `import * as ns from './x'`,
+  // `import { a, b as c } from './x'`, `import def, { a } from './x'`.
+  // Checked before the Python `import ...` pattern below because both start
+  // with the literal word `import` and this one is the more specific shape.
+  const jsImport = text.match(/^import\s+(.+?)\s+from\s+['"]/);
+  if (jsImport) {
+    const clause = jsImport[1];
+    const names = [];
+    const namespaceMatch = clause.match(/\*\s+as\s+(\w+)/);
+    if (namespaceMatch) names.push(namespaceMatch[1]);
+    const braced = clause.match(/\{([^}]*)\}/);
+    if (braced) {
+      for (const part of braced[1].split(",")) {
+        const bits = part.trim().split(/\s+as\s+/);
+        const bound = (bits[1] ?? bits[0]).trim();
+        if (bound) names.push(bound);
+      }
+    }
+    const beforeBrace = clause.split("{")[0].replace(/\*\s+as\s+\w+/, "").trim();
+    for (const part of beforeBrace.split(",")) {
+      const name = part.trim().replace(/,$/, "");
+      if (name && /^[A-Za-z_$][\w$]*$/.test(name)) names.push(name);
+    }
+    return names;
+  }
+  // Python: `from pkg import a, b as c` / `from .pkg import a`
+  const fromImport = text.match(/^from\s+[.\w]+\s+import\s+(.+)$/);
+  if (fromImport) {
+    const body = fromImport[1].trim();
+    if (body === "*") return [];
+    return body
+      .replace(/^\(|\)$/g, "")
+      .split(",")
+      .map((part) => {
+        const bits = part.trim().split(/\s+as\s+/);
+        return (bits[1] ?? bits[0]).trim();
+      })
+      .filter(Boolean);
+  }
+  // Python: `import pkg` / `import pkg as p` / `import a, b as c`
+  const plainImport = text.match(/^import\s+(.+)$/);
+  if (plainImport && !/[{}]/.test(plainImport[1])) {
+    return plainImport[1]
+      .split(",")
+      .map((part) => {
+        const bits = part.trim().split(/\s+as\s+/);
+        const bound = (bits[1] ?? bits[0]).trim();
+        // `import pkg.sub` with no alias binds the top-level name `pkg`.
+        return bits[1] ? bound : bound.split(".")[0];
+      })
+      .filter(Boolean);
   }
   return [];
 }

@@ -788,27 +788,66 @@ export async function inspectRepository(input, repositoriesDirectory, options = 
   const allCallEdges = analyses.flatMap((analysis) => analysis.callEdges);
   if (allCallEdges.length > limits.maxCallEdges) truncated.push({ limit: "maxCallEdges", value: limits.maxCallEdges, skipped: allCallEdges.length - limits.maxCallEdges });
   const languageByPath = new Map(fileRecords.map((file) => [file.path, file.language]));
+  const allImports = analyses.flatMap((analysis) => analysis.imports ?? []);
+  if (allImports.length > limits.maxImports) truncated.push({ limit: "maxImports", value: limits.maxImports, skipped: allImports.length - limits.maxImports });
+  const imports = resolveImportsStatically({ files: fileRecords }, allImports.slice(0, limits.maxImports));
+  // Per-file map of "local name this file's imports bind" -> the resolved import record,
+  // so a call edge can be grounded in what the *caller's own file* actually imported
+  // instead of matching any same-named definition anywhere in the repository (item 4).
+  // Later imports in source order win, matching how a later rebinding of the same name
+  // shadows an earlier one.
+  const boundImportsByFile = new Map();
+  for (const item of imports) {
+    if (!item.boundNames?.length) continue;
+    if (!boundImportsByFile.has(item.path)) boundImportsByFile.set(item.path, new Map());
+    const perFile = boundImportsByFile.get(item.path);
+    for (const name of item.boundNames) perFile.set(name, item);
+  }
   const callEdges = allCallEdges
     .slice(0, limits.maxCallEdges)
     .map((edge) => {
+      const boundImport = boundImportsByFile.get(edge.path)?.get(edge.callee);
+      if (boundImport) {
+        // The caller's file explicitly imports a binding with this exact name. Trust that
+        // over any other same-named definition elsewhere in the repository.
+        if (!boundImport.targetPath) {
+          // Imported from a module this repository does not contain (third-party, or an
+          // unresolvable relative path). Report honestly as unresolved instead of silently
+          // falling back to an unrelated local definition that merely shares the name.
+          return { ...edge, targetPath: null, targetLine: null, resolved: false, resolutionKind: "unresolved" };
+        }
+        const target = (definitionIndex.get(edge.callee) ?? []).find((candidate) => candidate.path === boundImport.targetPath);
+        if (target) {
+          return { ...edge, targetPath: target.path, targetLine: target.line, resolved: true, resolutionKind: "exact" };
+        }
+        // The import resolved to a real file, but that file does not define a symbol with
+        // this name (e.g. a re-export chain this indexer does not follow). Still honestly
+        // unresolved rather than a name-only guess.
+        return { ...edge, targetPath: null, targetLine: null, resolved: false, resolutionKind: "unresolved" };
+      }
       const targets = definitionIndex.get(edge.callee) ?? [];
-      // A call can only land in the same file or in a file of the same language
-      // family. Without this, a Python `int(...)` call resolves to a C++ `int`
-      // declaration in a header and invents a call chain that cannot exist.
+      // No import binds this name in the caller's file (e.g. same-file helper, or a language
+      // this indexer does not extract import bindings for). Fall back to the pre-existing
+      // heuristic: same file, else same language family. Labeled `heuristic` because, unlike
+      // the import-grounded case above, this is a guess by name alone and can be wrong when
+      // more than one same-named definition exists.
       const family = languageFamily(languageByPath.get(edge.path));
       const target = targets.find((candidate) => candidate.path === edge.path)
         ?? targets.find((candidate) => languageFamily(languageByPath.get(candidate.path)) === family)
         ?? null;
-      return { ...edge, targetPath: target?.path ?? null, targetLine: target?.line ?? null, resolved: Boolean(target) };
+      return {
+        ...edge,
+        targetPath: target?.path ?? null,
+        targetLine: target?.line ?? null,
+        resolved: Boolean(target),
+        resolutionKind: target ? "heuristic" : "unresolved",
+      };
     });
   const indexerCounts = analyses.reduce((counts, analysis) => {
     counts[analysis.indexer] = (counts[analysis.indexer] ?? 0) + 1;
     return counts;
   }, {});
   const indexer = indexerCounts["tree-sitter"] ? "tree-sitter" : indexerCounts.regex ? "regex" : "none";
-  const allImports = analyses.flatMap((analysis) => analysis.imports ?? []);
-  if (allImports.length > limits.maxImports) truncated.push({ limit: "maxImports", value: limits.maxImports, skipped: allImports.length - limits.maxImports });
-  const imports = resolveImportsStatically({ files: fileRecords }, allImports.slice(0, limits.maxImports));
   const languages = {};
   for (const file of fileRecords) languages[file.language] = (languages[file.language] ?? 0) + 1;
   report("link", 1, 1, "Index linked");

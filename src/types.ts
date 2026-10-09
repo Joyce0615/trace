@@ -44,6 +44,19 @@ export interface CallEdge {
   targetPath?: string | null;
   targetLine?: number | null;
   resolved?: boolean;
+  /**
+   * How confident the resolver is that `targetPath`/`targetLine` is the actual
+   * function this call reaches (item 4):
+   * - `exact`: the caller's file imports a binding with this exact name, and
+   *   that import resolved to a repository file defining it.
+   * - `heuristic`: no import binds this name in the caller's file, so the
+   *   edge was matched by name alone (same file, else same language family)
+   *   and can be wrong when more than one same-named definition exists.
+   * - `unresolved`: no definition could be honestly attributed, including
+   *   when the name is imported from a module this repository does not
+   *   contain.
+   */
+  resolutionKind?: "exact" | "heuristic" | "unresolved";
 }
 
 /** Minimal repository identity sent across IPC instead of the full index. */

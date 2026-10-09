@@ -94,6 +94,10 @@ function partitionForFile(repository, file) {
       callee: edge.callee,
       line: edge.line,
       resolved: Boolean(edge.resolved),
+      // Carried through so a graph consumer can tell an import-grounded resolution
+      // apart from a same-name-only guess, instead of treating every resolved edge
+      // as equally trustworthy (item 4).
+      resolutionKind: edge.resolutionKind ?? (edge.resolved ? "heuristic" : "unresolved"),
     });
     if (!edge.resolved) {
       nodes.push({ id: nodeId("unresolved", edge.callee), kind: "unresolved", key: edge.callee, label: edge.callee });

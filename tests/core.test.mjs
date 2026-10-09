@@ -352,6 +352,66 @@ test("tree-sitter indexing yields definitions, references, and call edges", asyn
   assert.equal(fallback.indexer, "none");
 });
 
+test("call-edge resolution respects which definition the caller's file actually imported, instead of guessing by name alone (item 4)", async (context) => {
+  const rootPath = await mkdtemp(path.join(os.tmpdir(), "trace-call-import-"));
+  context.after(() => rm(rootPath, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "app", "legacy"), { recursive: true });
+  await writeFile(path.join(rootPath, "app", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "app", "legacy", "__init__.py"), "");
+  // Two unrelated modules both define a function named `retry`.
+  await writeFile(
+    path.join(rootPath, "app", "retry.py"),
+    "def retry(action, attempts):\n    for _ in range(attempts):\n        result = action()\n        if result:\n            return result\n    return None\n",
+  );
+  await writeFile(path.join(rootPath, "app", "legacy", "retry.py"), "def retry(action):\n    return action()\n");
+  // `client.py` explicitly imports the LEGACY `retry`, not `app.retry`.
+  await writeFile(
+    path.join(rootPath, "app", "client.py"),
+    "from app.legacy.retry import retry\n\n\ndef fetch(action):\n    return retry(action)\n",
+  );
+  // `caller.py` imports `clamp` from a third-party package this repository does not contain,
+  // while an unrelated local module happens to define a function with the same name.
+  await writeFile(path.join(rootPath, "app", "unrelated.py"), "def clamp(x):\n    return x\n");
+  await writeFile(
+    path.join(rootPath, "app", "caller.py"),
+    "from thirdpartylib import clamp\n\n\ndef use(x):\n    return clamp(x)\n",
+  );
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(rootPath, "clones"));
+
+  // The call to `retry` inside `client.py` must resolve to the module `client.py` actually
+  // imports from (`app/legacy/retry.py`), not to the other same-named definition that merely
+  // happens to live in the repository.
+  const retryEdge = repository.callEdges.find((edge) => edge.path === "app/client.py" && edge.callee === "retry");
+  assert.ok(retryEdge, "expected a call edge for retry() in app/client.py");
+  assert.equal(retryEdge.targetPath, "app/legacy/retry.py");
+  assert.equal(retryEdge.resolutionKind, "exact");
+
+  // The call to `clamp` inside `caller.py` is imported from a third-party library this
+  // repository does not contain. It must be reported honestly as unresolved rather than
+  // silently landing on an unrelated local function that merely shares the name.
+  const clampEdge = repository.callEdges.find((edge) => edge.path === "app/caller.py" && edge.callee === "clamp");
+  assert.ok(clampEdge, "expected a call edge for clamp() in app/caller.py");
+  assert.equal(clampEdge.resolved, false);
+  assert.equal(clampEdge.targetPath, null);
+  assert.equal(clampEdge.resolutionKind, "unresolved");
+
+  // A call with no import binding at all for its name still falls back to the pre-existing
+  // same-file/same-language-family heuristic, but is now honestly labeled as a heuristic
+  // rather than claiming the same confidence as an import-grounded resolution.
+  await mkdir(path.join(rootPath, "heuristics"), { recursive: true });
+  await writeFile(path.join(rootPath, "heuristics", "helper.py"), "def helper(x):\n    return x\n");
+  await writeFile(path.join(rootPath, "heuristics", "caller.py"), "def use(x):\n    return helper(x)\n");
+  resetAnalysisCache();
+  const heuristicRepo = await inspectRepository(rootPath, path.join(rootPath, "clones"));
+  const heuristicEdge = heuristicRepo.callEdges.find((edge) => edge.path === "heuristics/caller.py" && edge.callee === "helper");
+  assert.ok(heuristicEdge, "expected a call edge for helper() in heuristics/caller.py");
+  assert.equal(heuristicEdge.resolved, true);
+  assert.equal(heuristicEdge.targetPath, "heuristics/helper.py");
+  assert.equal(heuristicEdge.resolutionKind, "heuristic");
+});
+
 test("a transient grammar load failure does not permanently poison that language for the rest of the process", async () => {
   // `loadLanguage` in tree-sitter-index.mjs caches a grammar as `unavailable`
   // the first time `Parser.Language.load` throws, with no distinction between
@@ -497,6 +557,8 @@ test("the knowledge graph is versioned and rebuilds incrementally", async (conte
   assert.ok(firstGraph.nodes.some((node) => node.kind === "symbol" && node.label === "helper"));
   assert.ok(firstGraph.edges.some((edge) => edge.kind === "imports" && edge.from === "file:app/runner.py" && edge.to === "file:app/core.py" && edge.resolved));
   assert.ok(firstGraph.edges.some((edge) => edge.kind === "calls" && edge.callee === "helper" && edge.resolved));
+  // Every resolved call edge is labeled with how it was resolved, not just that it was (item 4).
+  assert.ok(firstGraph.edges.every((edge) => edge.kind !== "calls" || ["exact", "heuristic", "unresolved"].includes(edge.resolutionKind)));
   assert.equal(firstGraph.stats.danglingEdges, 0);
 
   await saveKnowledgeGraph(graphDirectory, firstGraph);
