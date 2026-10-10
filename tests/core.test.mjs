@@ -3572,6 +3572,32 @@ test("the egress guard blocks answer leaks and the hint ladder never gives one a
   assert.throws(() => guardResponse("quiz:build", { cases: [{ expected: "1" }] }), (error) => error.name === "AnswerLeakError" && /field \.cases/.test(error.message));
   assert.deepEqual(guardResponse("quiz:build", { id: "q", hiddenCases: [{ id: "c", name: "hidden test 1" }] }), { id: "q", hiddenCases: [{ id: "c", name: "hidden test 1" }] });
 
+  // --- Map/Set-nested leaks -------------------------------------------------
+  // `findForbiddenKeys`/`findLeakedValues` walk a response with
+  // `Array.isArray` and `Object.entries`, which is right for the plain
+  // objects/arrays every real response is built from — but Electron's IPC
+  // does not serialize through `JSON.stringify`: `ipcMain.handle` results
+  // cross the structured-clone algorithm, which fully preserves `Map` and
+  // `Set` *contents* to the renderer. `Object.entries(new Map(...))` and
+  // `JSON.stringify(new Map(...))` both silently see an empty object, so a
+  // forbidden key or a registered secret value hidden inside a `Map`/`Set`
+  // anywhere in a response sails through the guard unexamined while still
+  // reaching the renderer intact — the "encoded/nested" oracle item 6 asks
+  // the guard to be proven against.
+  clearAnswerSecrets();
+  registerAnswerSecrets(["TOP-SECRET-ANSWER-VALUE-ABCDEF"]);
+  const nestedInMap = { id: "task-1", prompt: "ok", metadata: new Map([["answerKey", "TOP-SECRET-ANSWER-VALUE-ABCDEF"]]) };
+  assert.deepEqual(findForbiddenKeys(nestedInMap, ["answerKey"]), [".metadata.answerKey"]);
+  assert.equal(auditResponse("quiz:build", nestedInMap).ok, false, JSON.stringify(auditResponse("quiz:build", nestedInMap)));
+  assert.throws(() => guardResponse("quiz:build", nestedInMap), (error) => error.name === "AnswerLeakError" && /field \.metadata\.answerKey/.test(error.message));
+  const nestedValueInSet = { id: "task-2", prompt: "ok", notes: new Set(["TOP-SECRET-ANSWER-VALUE-ABCDEF"]) };
+  assert.ok(findLeakedValues(nestedValueInSet).length >= 1, JSON.stringify(findLeakedValues(nestedValueInSet)));
+  assert.throws(() => guardResponse("quiz:build", nestedValueInSet), /would have leaked an answer: value/);
+  // A Map/Set with nothing forbidden inside it must still be audited cleanly,
+  // so the fix is a real traversal and not a blanket refusal of the type.
+  assert.equal(auditResponse("quiz:build", { id: "task-3", prompt: "ok", tags: new Set(["python", "retry"]) }).ok, true);
+  clearAnswerSecrets();
+
   // --- Value leaks ---------------------------------------------------------
   clearAnswerSecrets();
   registerAnswerSecrets(["`retry` is called from 2 files: app/client.py, app/worker.py.", "short"]);

@@ -122,6 +122,25 @@ export function findForbiddenKeys(value, keys, pointer = "", found = []) {
     value.forEach((item, index) => findForbiddenKeys(item, keys, `${pointer}[${index}]`, found));
     return found;
   }
+  // A `Map` survives Electron's IPC structured clone with its entries intact
+  // -- unlike `JSON.stringify`/`Object.entries`, which both see it as an
+  // empty object -- so it is walked the same way a plain object is: by key,
+  // at the same pointer shape, so a forbidden key hidden inside one is
+  // reported exactly like it would be on a plain object.
+  if (value instanceof Map) {
+    for (const [key, child] of value.entries()) {
+      if (keys.includes(key) && child !== undefined) found.push(`${pointer}.${key}`);
+      findForbiddenKeys(child, keys, `${pointer}.${key}`, found);
+    }
+    return found;
+  }
+  // A `Set` has no keys of its own, but its members are not safe to skip: a
+  // nested object member can still carry a forbidden key, and a bare secret
+  // string member is caught by `findLeakedValues` instead (a value, not a key).
+  if (value instanceof Set) {
+    [...value.values()].forEach((item, index) => findForbiddenKeys(item, keys, `${pointer}[${index}]`, found));
+    return found;
+  }
   if (value && typeof value === "object") {
     for (const [key, child] of Object.entries(value)) {
       // A key explicitly set to `undefined` is how several graders strip an
@@ -133,11 +152,38 @@ export function findForbiddenKeys(value, keys, pointer = "", found = []) {
   return found;
 }
 
+/**
+ * A JSON-compatible mirror of a value, with every `Map` and `Set` unwrapped
+ * to a plain object/array first.
+ *
+ * `JSON.stringify` treats a `Map`/`Set` as an empty object, silently
+ * dropping its contents instead of refusing to serialize them -- which is
+ * exactly the "encoded/nested oracle" shape item 6 asks the guard to be
+ * proven against, since Electron's IPC does carry their contents, intact,
+ * to the renderer.
+ */
+function toScannable(value, seen = new Set()) {
+  if (Array.isArray(value)) return value.map((item) => toScannable(item, seen));
+  if (value instanceof Map || value instanceof Set) {
+    if (seen.has(value)) return null;
+    seen.add(value);
+    return value instanceof Map
+      ? Object.fromEntries([...value.entries()].map(([key, child]) => [String(key), toScannable(child, seen)]))
+      : [...value.values()].map((item) => toScannable(item, seen));
+  }
+  if (value && typeof value === "object" && !(value instanceof Date)) {
+    if (seen.has(value)) return null;
+    seen.add(value);
+    return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, toScannable(child, seen)]));
+  }
+  return value;
+}
+
 /** Registered answer strings that appear anywhere in the serialized response. */
 export function findLeakedValues(payload, secrets = answerSecrets()) {
   let serialized;
   try {
-    serialized = JSON.stringify(payload ?? null);
+    serialized = JSON.stringify(toScannable(payload ?? null));
   } catch {
     return [];
   }
