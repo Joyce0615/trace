@@ -12,6 +12,7 @@ import { loadCourse, saveCourse } from "../electron/course-store.mjs";
 import { createPracticeSession, inspectPracticeSession, reconcilePracticeSessions, removePracticeSession } from "../electron/practice.mjs";
 import { DEFAULT_INDEX_LIMITS, IndexCancelledError, analysisCacheStats, analysisSchemaVersion, analyzeContent, analyzeFile, fileImportance, inspectRepository, languageFamily, languageFor, readRepositoryFile, resetAnalysisCache } from "../electron/repository.mjs";
 import { buildKnowledgeGraph, loadKnowledgeGraph, neighborhood, saveKnowledgeGraph } from "../electron/knowledge-graph.mjs";
+import { CONFIDENCE_BY_RESOLUTION_KIND, REPO_MAP_VERSION, buildRepoMap, pageRank, renderRepoMap } from "../electron/repo-map.mjs";
 import { RemoteSourceError, cloneArguments, cloneDestination, cloneEnvironment, looksRemote, parseRemoteSource, summarizeSubmodules, verifyExistingClone } from "../electron/clone-guard.mjs";
 import { IPC_PROTOCOL_VERSION, IPC_SCHEMAS, MAX_PAYLOAD_BYTES, MAX_PAYLOAD_DEPTH, registerValidatedHandlers, schemaFor, validatePayload } from "../electron/ipc-schema.mjs";
 import { LINK_POLICY_VERSION, classifyExternalLink, confirmationPrompt, isInternalNavigation, repositoryOrigins } from "../electron/link-policy.mjs";
@@ -666,6 +667,92 @@ test("incremental knowledge-graph rebuilds equal a full rebuild after an index-s
   const sortedEdges = (graph) => [...graph.edges].sort((left, right) => `${left.from}>${left.to}>${left.kind}>${left.line ?? ""}`.localeCompare(`${right.from}>${right.to}>${right.kind}>${right.line ?? ""}`));
   assert.deepEqual(sortedNodes(rebuiltAfterSchemaChange), sortedNodes(trueFullRebuild));
   assert.deepEqual(sortedEdges(rebuiltAfterSchemaChange), sortedEdges(trueFullRebuild));
+});
+
+test("the repo map ranks files by import/call structure discounted by resolution confidence, blends in query relevance, and respects a token budget", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-repo-map-"));
+  const rootPath = path.join(workspace, "repo");
+  await mkdir(rootPath, { recursive: true });
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "app"), { recursive: true });
+  await writeFile(path.join(rootPath, "app", "__init__.py"), "");
+  // hub.py is imported by both leaf1.py and leaf2.py: structurally central
+  // with zero outgoing resolved edges of its own (a dangling node for PageRank).
+  await writeFile(path.join(rootPath, "app", "hub.py"), "def helper(value):\n    return value\n");
+  await writeFile(path.join(rootPath, "app", "leaf1.py"), "from app.hub import helper\n\n\ndef run_one(value):\n    return helper(value)\n");
+  await writeFile(path.join(rootPath, "app", "leaf2.py"), "from app.hub import helper\n\n\ndef run_two(value):\n    return helper(value)\n");
+  // isolated.py has no edges at all, resolved or otherwise: a repo map must
+  // still rank it (just low), never drop it from consideration entirely.
+  await writeFile(path.join(rootPath, "app", "isolated.py"), "def alone():\n    return 1\n");
+  await execFileAsync("git", ["init", rootPath]);
+  await execFileAsync("git", ["-C", rootPath, "config", "user.email", "trace@example.com"]);
+  await execFileAsync("git", ["-C", rootPath, "config", "user.name", "Trace Test"]);
+  await execFileAsync("git", ["-C", rootPath, "add", "."]);
+  await execFileAsync("git", ["-C", rootPath, "commit", "-m", "initial"]);
+
+  resetAnalysisCache();
+  const inspected = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const graph = buildKnowledgeGraph(inspected);
+
+  // PageRank's damped-dangling-node redistribution must conserve total rank
+  // mass: a leaf-heavy repository is not "less connected" in aggregate just
+  // because most of its files have no outgoing resolved edge.
+  const fileIds = graph.nodes.filter((node) => node.kind === "file").map((node) => node.id);
+  const edgesByFile = new Map();
+  for (const edge of graph.edges) {
+    if (edge.kind !== "imports") continue;
+    if (!edgesByFile.has(edge.from)) edgesByFile.set(edge.from, []);
+    edgesByFile.get(edge.from).push({ to: edge.to, resolved: edge.resolved, resolutionKind: edge.resolutionKind });
+  }
+  const rank = pageRank(fileIds, edgesByFile);
+  let totalRank = 0;
+  for (const value of rank.values()) totalRank += value;
+  assert.ok(Math.abs(totalRank - 1) < 1e-9, `PageRank must conserve total rank mass across dangling nodes, got ${totalRank}`);
+
+  // hub.py is depended on by two files and must outrank a file nothing
+  // depends on, purely from structure (relevance held equal via the default).
+  const structureOnly = buildRepoMap(graph, { budget: 10_000 });
+  const pathsInOrder = structureOnly.entries.map((entry) => entry.path);
+  assert.ok(pathsInOrder.indexOf("app/hub.py") < pathsInOrder.indexOf("app/isolated.py"), JSON.stringify(pathsInOrder));
+  assert.equal(structureOnly.consideredFiles, fileIds.length);
+  assert.equal(structureOnly.sourceGraphVersion, graph.version);
+  assert.equal(structureOnly.version, REPO_MAP_VERSION);
+
+  // Query relevance can promote a structurally-minor file above a
+  // structurally-major one that the query does not match at all.
+  const relevanceOf = (path) => (path === "app/isolated.py" ? 50 : 0);
+  const relevanceBoosted = buildRepoMap(graph, { budget: 10_000, relevanceOf });
+  const boostedOrder = relevanceBoosted.entries.map((entry) => entry.path);
+  assert.equal(boostedOrder[0], "app/isolated.py", JSON.stringify(boostedOrder));
+
+  // A tight token budget must omit lower-ranked files rather than truncate
+  // silently; every omission is named with a reason.
+  const tightBudget = buildRepoMap(graph, { budget: 1 });
+  assert.ok(tightBudget.entries.length < fileIds.length, "a 1-token budget must exclude most files");
+  assert.ok(tightBudget.estimatedTokens <= 1);
+  assert.ok(tightBudget.omitted.length > 0);
+  assert.ok(tightBudget.omitted.every((entry) => entry.path && entry.reason));
+
+  // Resolution confidence must actually discount PageRank, not just exist as
+  // a label: when one source file has two outgoing edges to competing
+  // targets, the exactly-resolved target must receive more of that source's
+  // rank mass than a same-named-guess (heuristic) target does.
+  const idsTriple = ["file:app/hub.py", "file:app/leaf1.py", "file:app/leaf2.py"];
+  const mixedEdges = new Map([["file:app/leaf1.py", [
+    { to: "file:app/hub.py", resolved: true, resolutionKind: "exact" },
+    { to: "file:app/leaf2.py", resolved: true, resolutionKind: "heuristic" },
+  ]]]);
+  const mixedRank = pageRank(idsTriple, mixedEdges);
+  assert.ok(
+    mixedRank.get("file:app/hub.py") > mixedRank.get("file:app/leaf2.py"),
+    `exact-resolved target (${mixedRank.get("file:app/hub.py")}) must outweigh heuristic-resolved target (${mixedRank.get("file:app/leaf2.py")})`,
+  );
+  assert.equal(CONFIDENCE_BY_RESOLUTION_KIND.unresolved, 0);
+
+  // The rendered block is readable and mentions the budget outcome.
+  const rendered = renderRepoMap(structureOnly);
+  assert.match(rendered, /Repository map/);
+  assert.match(rendered, /app\/hub\.py/);
 });
 
 test("a stale per-blob analysis cache entry from a different extraction schema is never served", async (context) => {
