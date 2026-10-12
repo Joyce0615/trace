@@ -56,6 +56,7 @@ import { CALL_CHAIN_VERSION, buildCallChainExercises, buildCallChains, extractRe
 import { detectLanguageServers, resolveImportsStatically, resolveSymbol, serverForLanguage, shutdownLanguageServers } from "../electron/language-server.mjs";
 import { answerFromLocalIndex, buildContextPack, loadCachedResponse, saveCachedResponse } from "../electron/context-engine.mjs";
 import { buildSkillGraph, createLearnerState, reconcileLearnerState } from "../electron/skill-graph.mjs";
+import { CHANGE_IMPACT_VERSION, analyzeChangeImpact, changedSymbols, isTestPath, renderChangeImpact, tracedCallers, tracedLessons, tracedMasteryEvidence, tracedNotes, tracedQuizzes, tracedTests } from "../electron/change-impact.mjs";
 import { loadLearnerState, loadLearnerStateReport, saveLearnerState } from "../electron/learning-store.mjs";
 import { DURABLE_VERSION, inspectDurable, readDurable, sweepInterruptedWrites, writeDurable } from "../electron/durable-store.mjs";
 import { BUILD_TYPE, DEFAULT_LICENSE_POLICY, IN_TOTO_STATEMENT_TYPE, SBOM_SPEC_VERSION, SLSA_PREDICATE_TYPE, SUPPLY_CHAIN_VERSION, buildProvenance, buildSbom, compareBuilds, describeScan, firstByteDifference, hashesFromIntegrity, importNpmAudit, licenseBreakdown, publicSupplyChainReport, purlFor, runtimeComponents, satisfiesRange, sbomDigest, scanDependencies, scanPasses, signProvenance, verifyProvenance } from "../electron/supply-chain.mjs";
@@ -605,6 +606,131 @@ test("the knowledge graph is versioned and rebuilds incrementally", async (conte
   assert.ok(around.edges.every((edge) => edge.from === "file:app/runner.py" || edge.to === "file:app/runner.py"));
   const callsOnly = neighborhood(changedGraph, "file:app/runner.py", 1, ["imports"]);
   assert.ok(callsOnly.edges.every((edge) => edge.kind === "imports"));
+});
+
+test("change-impact analysis traces a changed symbol to its callers, tests, lessons, notes, and mastery evidence, and ignores pure line shifts", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-change-impact-"));
+  const rootPath = path.join(workspace, "repo");
+  await mkdir(rootPath, { recursive: true });
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "app"), { recursive: true });
+  await writeFile(path.join(rootPath, "app", "__init__.py"), "");
+  const coreV1 = "def helper(value):\n    return value\n";
+  await writeFile(path.join(rootPath, "app", "core.py"), coreV1);
+  const runnerSource = "from app.core import helper\n\n\ndef run(value):\n    return helper(value)\n";
+  await writeFile(path.join(rootPath, "app", "runner.py"), runnerSource);
+  const orchestratorSource = "from app.runner import run\n\n\ndef orchestrate(value):\n    return run(value)\n";
+  await writeFile(path.join(rootPath, "app", "orchestrator.py"), orchestratorSource);
+  await mkdir(path.join(rootPath, "tests"), { recursive: true });
+  const testSource = "from app.core import helper\n\n\ndef test_helper():\n    assert helper(1) == 1\n";
+  await writeFile(path.join(rootPath, "tests", "test_core.py"), testSource);
+  const stableSource = "def untouched():\n    return 7\n";
+  await writeFile(path.join(rootPath, "app", "stable.py"), stableSource);
+  await execFileAsync("git", ["init", rootPath]);
+  await execFileAsync("git", ["-C", rootPath, "config", "user.email", "trace@example.com"]);
+  await execFileAsync("git", ["-C", rootPath, "config", "user.name", "Trace Test"]);
+  await execFileAsync("git", ["-C", rootPath, "add", "."]);
+  await execFileAsync("git", ["-C", rootPath, "commit", "-m", "initial"]);
+
+  resetAnalysisCache();
+  const before = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const beforeSources = {
+    "app/core.py": coreV1,
+    "app/runner.py": runnerSource,
+    "app/orchestrator.py": orchestratorSource,
+    "tests/test_core.py": testSource,
+    "app/stable.py": stableSource,
+  };
+  const beforeSnapshot = buildSymbolSnapshot(before.symbols, beforeSources, { files: before.files.map((file) => file.path) });
+
+  // Changing helper's body is a real change: callers (run, and transitively
+  // orchestrate) and the test that exercises it must all be traced.
+  const coreV2 = "def helper(value):\n    return value + 1\n";
+  await writeFile(path.join(rootPath, "app", "core.py"), coreV2);
+  const after = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const afterGraph = buildKnowledgeGraph(after, { previous: buildKnowledgeGraph(before) });
+  const afterSources = { ...beforeSources, "app/core.py": coreV2 };
+  const afterSnapshot = buildSymbolSnapshot(after.symbols, afterSources, { files: after.files.map((file) => file.path) });
+
+  const symbols = changedSymbols(beforeSnapshot, afterSnapshot);
+  assert.equal(symbols.modified.length, 1, JSON.stringify(symbols));
+  assert.equal(symbols.modified[0].name, "helper");
+  assert.ok(!symbols.all.some((symbol) => symbol.name === "untouched"), "an unrelated file must not be reported as changed");
+
+  const callers = tracedCallers(afterGraph, symbols.all);
+  const callerNames = callers.map((entry) => entry.label);
+  assert.ok(callerNames.includes("run"), JSON.stringify(callerNames));
+  assert.ok(callerNames.includes("orchestrate"), "a two-hop caller must be traced transitively");
+  assert.equal(callers.find((entry) => entry.label === "run").depth, 1);
+  assert.equal(callers.find((entry) => entry.label === "orchestrate").depth, 2);
+
+  const tests = tracedTests(afterGraph, symbols.all);
+  assert.ok(tests.some((entry) => entry.path === "tests/test_core.py"), JSON.stringify(tests));
+  assert.ok(isTestPath("tests/test_core.py"));
+  assert.ok(!isTestPath("app/core.py"));
+
+  const course = {
+    modules: [{
+      id: "module-core",
+      title: "Core",
+      lessons: [
+        { id: "lesson-helper", title: "Helper", anchors: [{ path: "app/core.py", line: 1, symbol: "helper" }], content: [] },
+        { id: "lesson-stable", title: "Stable", anchors: [{ path: "app/stable.py", line: 1, symbol: "untouched" }], content: [] },
+      ],
+    }],
+  };
+  const lessons = tracedLessons(course, symbols.changedFiles, symbols.all);
+  assert.deepEqual(lessons.map((entry) => entry.lessonId), ["lesson-helper"]);
+
+  const notes = [
+    { id: "note-1", lessonId: "lesson-helper", anchor: { path: "app/core.py", line: 1, symbol: "helper" } },
+    { id: "note-2", lessonId: "lesson-stable", anchor: { path: "app/stable.py", line: 1, symbol: "untouched" } },
+  ];
+  assert.deepEqual(tracedNotes(notes, symbols.changedFiles, symbols.all).map((entry) => entry.id), ["note-1"]);
+
+  const quizzes = [{ id: "quiz-1", entry: "helper", anchor: { path: "app/core.py", line: 1, symbol: "helper" } }];
+  assert.deepEqual(tracedQuizzes(quizzes, symbols.changedFiles, symbols.all).map((entry) => entry.id), ["quiz-1"]);
+
+  const skillGraph = {
+    nodes: [
+      { id: "skill-helper", title: "Helper", anchors: [{ path: "app/core.py", line: 1, symbol: "helper" }] },
+      { id: "skill-stable", title: "Stable", anchors: [{ path: "app/stable.py", line: 1, symbol: "untouched" }] },
+    ],
+  };
+  const learnerState = { mastery: { "skill-helper": { mastery: 0.8 }, "skill-stable": { mastery: 0.6 } } };
+  const masteryEvidence = tracedMasteryEvidence(skillGraph, learnerState, symbols.changedFiles);
+  assert.deepEqual(masteryEvidence.map((entry) => entry.skillId), ["skill-helper"]);
+
+  const report = analyzeChangeImpact(beforeSnapshot, afterSnapshot, afterGraph, { course, notes, quizzes, skillGraph, learnerState });
+  assert.equal(report.version, CHANGE_IMPACT_VERSION);
+  assert.equal(report.summary.changedSymbolCount, 1);
+  assert.equal(report.summary.callerCount, callers.length);
+  assert.equal(report.summary.testCount, tests.length);
+  assert.equal(report.summary.lessonCount, 1);
+  assert.equal(report.summary.noteCount, 1);
+  assert.equal(report.summary.quizCount, 1);
+  assert.equal(report.summary.masteryEvidenceCount, 1);
+  const rendered = renderChangeImpact(report);
+  assert.match(rendered, /Change impact/);
+  assert.match(rendered, /caller/);
+
+  // A pure line shift (two blank lines added above helper, nothing semantic)
+  // moves `helper`'s line but must not be reported as a changed symbol: its
+  // body-token fingerprint is identical, which is exactly the signal
+  // `course-migration.mjs` already relies on to tell "moved" apart from
+  // "modified" for anchor repair.
+  const coreV3 = "\n\ndef helper(value):\n    return value + 1\n";
+  await writeFile(path.join(rootPath, "app", "core.py"), coreV3);
+  const shifted = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const shiftedSources = { ...afterSources, "app/core.py": coreV3 };
+  const shiftedSnapshot = buildSymbolSnapshot(shifted.symbols, shiftedSources, { files: shifted.files.map((file) => file.path) });
+  const shiftedSymbols = changedSymbols(afterSnapshot, shiftedSnapshot);
+  assert.ok(!shiftedSymbols.all.some((symbol) => symbol.name === "helper"), JSON.stringify(shiftedSymbols));
+  assert.notEqual(
+    afterSnapshot.symbols.find((symbol) => symbol.name === "helper").line,
+    shiftedSnapshot.symbols.find((symbol) => symbol.name === "helper").line,
+    "the fixture must actually move the line, or the no-op assertion above would be vacuous",
+  );
 });
 
 test("the index signature changes when the tree-sitter grammar/query tables or installed parser packages change, and is stable otherwise", () => {

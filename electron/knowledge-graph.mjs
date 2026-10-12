@@ -55,8 +55,14 @@ function partitionForFile(repository, file) {
   }
   edges.push({ from: parent, to: fileNode, kind: "contains" });
 
+  // Line of first definition per name in this file, so a `calls` edge's `from`
+  // can be built with the same `#name@line` shape every `defines`-created
+  // symbol node id already has (see below) instead of silently never matching
+  // any node in the graph.
+  const lineByName = new Map();
   for (const symbol of repository.symbols.filter((candidate) => candidate.path === file.path)) {
     const symbolNode = nodeId("symbol", `${file.path}#${symbol.name}@${symbol.line}`);
+    if (!lineByName.has(symbol.name)) lineByName.set(symbol.name, symbol.line);
     nodes.push({
       id: symbolNode,
       kind: "symbol",
@@ -85,8 +91,9 @@ function partitionForFile(repository, file) {
   }
 
   for (const edge of (repository.callEdges ?? []).filter((candidate) => candidate.path === file.path)) {
+    const callerLine = edge.caller ? lineByName.get(edge.caller) : null;
     edges.push({
-      from: edge.caller ? nodeId("symbol", `${file.path}#${edge.caller}`) : fileNode,
+      from: edge.caller && callerLine != null ? nodeId("symbol", `${file.path}#${edge.caller}@${callerLine}`) : fileNode,
       to: edge.resolved && edge.targetPath
         ? nodeId("symbol", `${edge.targetPath}#${edge.callee}@${edge.targetLine}`)
         : nodeId("unresolved", edge.callee),
