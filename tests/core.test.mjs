@@ -57,6 +57,7 @@ import { detectLanguageServers, resolveImportsStatically, resolveSymbol, serverF
 import { answerFromLocalIndex, buildContextPack, loadCachedResponse, saveCachedResponse } from "../electron/context-engine.mjs";
 import { buildSkillGraph, createLearnerState, reconcileLearnerState } from "../electron/skill-graph.mjs";
 import { CHANGE_IMPACT_VERSION, analyzeChangeImpact, changedSymbols, isTestPath, renderChangeImpact, tracedCallers, tracedLessons, tracedMasteryEvidence, tracedNotes, tracedQuizzes, tracedTests } from "../electron/change-impact.mjs";
+import { RETRIEVAL_COUNTERFACTUAL_VERSION, evaluateRetrievalCounterfactual, renderRetrievalCounterfactual } from "../electron/retrieval-counterfactual.mjs";
 import { loadLearnerState, loadLearnerStateReport, saveLearnerState } from "../electron/learning-store.mjs";
 import { DURABLE_VERSION, inspectDurable, readDurable, sweepInterruptedWrites, writeDurable } from "../electron/durable-store.mjs";
 import { BUILD_TYPE, DEFAULT_LICENSE_POLICY, IN_TOTO_STATEMENT_TYPE, SBOM_SPEC_VERSION, SLSA_PREDICATE_TYPE, SUPPLY_CHAIN_VERSION, buildProvenance, buildSbom, compareBuilds, describeScan, firstByteDifference, hashesFromIntegrity, importNpmAudit, licenseBreakdown, publicSupplyChainReport, purlFor, runtimeComponents, satisfiesRange, sbomDigest, scanDependencies, scanPasses, signProvenance, verifyProvenance } from "../electron/supply-chain.mjs";
@@ -7975,4 +7976,88 @@ test("local telemetry records nothing without consent, cannot hold free text, is
   assert.ok(audit.offenders.some((offender) => offender.includes("secret.py")));
   assert.ok(audit.offenders.some((offender) => offender.includes("invented.event")));
   assert.ok(audit.offenders.some((offender) => offender.includes("exactly 4271ms")));
+});
+
+test("retrieval counterfactual evaluation compares lexical/symbol/graph/embedding/fused recall, MRR, nDCG, latency, false positives, and grounding lift", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-retrieval-counterfactual-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "engine"), { recursive: true });
+  await writeFile(path.join(rootPath, "engine", "__init__.py"), "");
+  await writeFile(
+    path.join(rootPath, "engine", "planner.py"),
+    "def plan_batch(requests):\n    return sorted(requests)\n\n\ndef estimate_cost(plan):\n    return len(plan)\n",
+  );
+  await writeFile(
+    path.join(rootPath, "engine", "executor.py"),
+    "from engine.planner import plan_batch\n\n\ndef execute_plan(requests):\n    return plan_batch(requests)\n",
+  );
+  await writeFile(path.join(rootPath, "README.md"), "# Planner\n\nBatches requests before execution.\n");
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const index = await buildSearchIndex(repository, { read: (filePath) => readFile(path.join(rootPath, filePath), "utf8") });
+
+  // --- The underlying bug: evaluateRetrieval silently ignored
+  // options.weights, so there was no way to score one retriever in
+  // isolation at all; every "counterfactual" would have been identical to
+  // the fused baseline. ---------------------------------------------------
+  const lexicalOnly = evaluateRetrieval(index, repository, { sampleSize: 3, weights: { lexical: 1, symbol: 0, graph: 0, embedding: 0 } });
+  const symbolOnly = evaluateRetrieval(index, repository, { sampleSize: 3, weights: { lexical: 0, symbol: 1, graph: 0, embedding: 0 } });
+  const ranksOf = (scorecard) => scorecard.samples.map((item) => [item.query, item.rank]);
+  assert.notDeepEqual(ranksOf(lexicalOnly), ranksOf(symbolOnly), "a lexical-only run and a symbol-only run must rank results differently");
+
+  // --- The new module itself ----------------------------------------------
+  assert.equal(RETRIEVAL_COUNTERFACTUAL_VERSION, 1);
+  const report = evaluateRetrievalCounterfactual(index, repository, { sampleSize: 6 });
+  assert.equal(report.kind, "retrieval-counterfactual");
+
+  const strategyNames = report.strategies.map((entry) => entry.name);
+  assert.deepEqual(strategyNames, ["lexical", "symbol", "graph", "embedding", "fused"]);
+
+  // Every strategy scorecard carries the full named metric set.
+  for (const entry of report.strategies) {
+    for (const field of ["recallAt1", "recallAt5", "mrr", "ndcgAt5", "medianLatencyMs", "falsePositiveRate", "falsePositiveQueries"]) {
+      assert.ok(field in entry.metrics, `${entry.name} is missing ${field}`);
+    }
+  }
+
+  // Fused must be at least as good as the best single strategy on recall@5 —
+  // the whole point of fusion is that it should not be worse than every one
+  // of its own inputs.
+  const fused = report.strategies.find((entry) => entry.name === "fused").metrics;
+  const singles = report.strategies.filter((entry) => entry.name !== "fused").map((entry) => entry.metrics.recallAt5);
+  assert.ok(fused.recallAt5 >= Math.max(...singles) - 1e-9, JSON.stringify(report.strategies));
+
+  // Grounding lift: fused recall@5 minus the best single-strategy recall@5,
+  // never negative by construction (that would mean fusion made things
+  // worse, which is itself a signal worth flagging rather than hiding).
+  assert.equal(report.groundingLift, round4(fused.recallAt5 - Math.max(...singles)));
+  assert.ok(report.groundingLift >= 0 - 1e-9);
+
+  // The pure lexical/symbol/graph/embedding strategies behave as weighting
+  // that one strategy to 1 and every other to 0 would, so the module cannot
+  // silently diverge from search.mjs's own fusion math.
+  const direct = evaluateRetrieval(index, repository, { sampleSize: 6, weights: { lexical: 1, symbol: 0, graph: 0, embedding: 0 } });
+  const viaModule = report.strategies.find((entry) => entry.name === "lexical").metrics;
+  assert.equal(viaModule.recallAt5, direct.recallAt5);
+  assert.equal(viaModule.mrr, direct.mrr);
+
+  // Deterministic sampling means two runs over the same index agree exactly.
+  assert.deepEqual(evaluateRetrievalCounterfactual(index, repository, { sampleSize: 6 }), report);
+
+  // Callers can add their own named weight vector (e.g. to score a config
+  // change before shipping it); it is included in the comparison exactly
+  // like the four built-in strategies.
+  const withExtra = evaluateRetrievalCounterfactual(index, repository, {
+    sampleSize: 6,
+    strategies: { "lexical-heavy": { lexical: 3, symbol: 1, graph: 0.2, embedding: 0.2 } },
+  });
+  const extraEntry = withExtra.strategies.find((entry) => entry.name === "lexical-heavy");
+  assert.ok(extraEntry, JSON.stringify(withExtra.strategies.map((entry) => entry.name)));
+  assert.ok("recallAt5" in extraEntry.metrics);
+
+  const rendered = renderRetrievalCounterfactual(report);
+  assert.ok(rendered.includes("fused"));
+  assert.ok(rendered.includes("Grounding lift"));
 });

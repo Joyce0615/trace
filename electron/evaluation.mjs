@@ -45,11 +45,12 @@ function sampleSymbols(repository, size) {
 export function evaluateRetrieval(index, repository, options = {}) {
   const size = options.sampleSize ?? 20;
   const limit = options.limit ?? 5;
+  const searchOptions = options.weights ? { limit, weights: options.weights } : { limit };
   const cases = sampleSymbols(repository, size);
   const results = [];
   for (const symbol of cases) {
     const started = Date.now();
-    const response = search(index, symbol.name, { limit });
+    const response = search(index, symbol.name, searchOptions);
     const ranked = response.results.map((result) => result.path);
     const rank = ranked.findIndex((path) => path === symbol.path);
     results.push({
@@ -69,7 +70,7 @@ export function evaluateRetrieval(index, repository, options = {}) {
   // Single-relevant-document nDCG reduces to 1/log2(rank+1).
   const ndcg = results.reduce((sum, result) => sum + (result.rank ? 1 / Math.log2(result.rank + 1) : 0), 0) / Math.max(1, results.length);
 
-  const falsePositives = NONSENSE_QUERIES.map((query) => ({ query, returned: search(index, query, { limit }).results.length }));
+  const falsePositives = NONSENSE_QUERIES.map((query) => ({ query, returned: search(index, query, searchOptions).results.length }));
   return {
     kind: "retrieval",
     cases: results.length,
