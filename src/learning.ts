@@ -20,10 +20,37 @@ function prerequisitesMet(node: SkillNode, state: LearnerState) {
   return node.prerequisites.every((id) => (state.mastery[id]?.mastery ?? 0) >= 0.6);
 }
 
+/**
+ * Recompute curriculum status (locked/available/recommended/mastered) from raw
+ * mastery and prerequisites.
+ *
+ * This is the single writer for every skill that has *not* yet entered the
+ * spaced-repetition cycle. Once a skill carries a `review` record, ownership of
+ * its status passes to `electron/spaced-repetition.mjs`'s `applyReview` — the
+ * only place that knows about forgetting, lapses, and source-change restarts.
+ * `recommend` runs on every `addEvidence`/`completeDiagnostic` call over the
+ * *whole* graph (because unlocking is a graph-wide effect: finishing one skill
+ * can make several others available), so without this guard, any unrelated
+ * client-side edit — marking a different skill familiar, finishing an unrelated
+ * lesson, answering one diagnostic question — would silently recompute a
+ * reviewed skill's status from its bare mastery number and overwrite whatever
+ * the reviewer had just decided (observed: a skill the reviewer had just
+ * demoted to "active" after a forgotten review was reset to "recommended" by
+ * the very next unrelated evidence call). A skill's own mastery number is still
+ * read by `prerequisitesMet` below, so reviewed skills continue to gate the
+ * skills built on them correctly — only the *status label itself* is left to
+ * its owner.
+ */
 export function recommend(state: LearnerState, graph: SkillGraph): LearnerState {
   const mastery = { ...state.mastery };
   for (const node of graph.nodes) {
     const previous = mastery[node.id] ?? { skillId: node.id, mastery: 0, confidence: 0, status: "locked", evidence: [], sourceFingerprint: node.sourceFingerprint };
+    if (previous.review) {
+      // Owned by the spaced-repetition reviewer; carry its status through
+      // unchanged, exactly like the pre-existing `sourceFingerprint` field.
+      mastery[node.id] = { ...previous, sourceFingerprint: node.sourceFingerprint };
+      continue;
+    }
     let status = previous.status;
     if (previous.status === "stale") status = "stale";
     else if (previous.mastery >= 0.75) status = "mastered";

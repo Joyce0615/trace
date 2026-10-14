@@ -59,6 +59,7 @@ import { buildSkillGraph, createLearnerState, reconcileLearnerState } from "../e
 import { CHANGE_IMPACT_VERSION, analyzeChangeImpact, changedSymbols, isTestPath, renderChangeImpact, tracedCallers, tracedLessons, tracedMasteryEvidence, tracedNotes, tracedQuizzes, tracedTests } from "../electron/change-impact.mjs";
 import { RETRIEVAL_COUNTERFACTUAL_VERSION, evaluateRetrievalCounterfactual, renderRetrievalCounterfactual } from "../electron/retrieval-counterfactual.mjs";
 import { loadLearnerState, loadLearnerStateReport, saveLearnerState } from "../electron/learning-store.mjs";
+import { addEvidence, completeDiagnostic, recommend } from "../src/learning.ts";
 import { DURABLE_VERSION, inspectDurable, readDurable, sweepInterruptedWrites, writeDurable } from "../electron/durable-store.mjs";
 import { BUILD_TYPE, DEFAULT_LICENSE_POLICY, IN_TOTO_STATEMENT_TYPE, SBOM_SPEC_VERSION, SLSA_PREDICATE_TYPE, SUPPLY_CHAIN_VERSION, buildProvenance, buildSbom, compareBuilds, describeScan, firstByteDifference, hashesFromIntegrity, importNpmAudit, licenseBreakdown, publicSupplyChainReport, purlFor, runtimeComponents, satisfiesRange, sbomDigest, scanDependencies, scanPasses, signProvenance, verifyProvenance } from "../electron/supply-chain.mjs";
 import { BUDGETS, DEFAULT_NOISE, MIN_SAMPLES_FOR_PERCENTILE, PERFORMANCE_VERSION, budgetIds, compareToBaseline, describeBudgets, effectiveCeiling, evaluateAll, evaluateBudget, memoryPressureAction, percentile, summarize, watchMemory } from "../electron/performance.mjs";
@@ -274,6 +275,76 @@ test("skill graphs persist mastery and only mark skills stale when their source 
   const changedGraph = buildSkillGraph(changedRepository, course);
   const reconciled = reconcileLearnerState(changedRepository, changedGraph, saved);
   assert.equal(reconciled.mastery[graph.nodes[0].id].status, "stale");
+});
+
+test("the learner-model has one writer: the spaced-repetition reviewer's status survives unrelated client-side evidence", () => {
+  // Item 10: assessment, curriculum, hints, practice, and review must be pure
+  // transitions with one writer per skill. `electron/spaced-repetition.mjs`'s
+  // `applyReview` is the authority for any skill that has entered the review
+  // cycle (it alone decides "mastered"/"active"/"relearning" from forgetting,
+  // lapses, and source staleness). `src/learning.ts`'s `recommend` is the
+  // authority for skills that have not: it unlocks prerequisites and derives
+  // status from raw accumulated evidence strength. Every renderer mutation of
+  // learner state (`addEvidence`, `completeDiagnostic`) funnels through
+  // `recommend` over the *whole* graph, so a bug here is a correctness bug for
+  // every one of those call sites, not just a hypothetical.
+  const graph = {
+    id: "g", repositoryId: "r", diagnostic: [],
+    nodes: [
+      { id: "s-base", title: "Base", prerequisites: [], anchors: [], importance: 60, sourceFingerprint: "fp-base" },
+      { id: "s-other", title: "Other", prerequisites: [], anchors: [], importance: 50, sourceFingerprint: "fp-other" },
+    ],
+  };
+  // `s-base` has already been through at least one spaced review (it carries a
+  // `review` scheduling record) and was most recently graded "again" — forgotten
+  // — by `applyReview`, which demoted it from "mastered" to "active" and halved
+  // its recorded mastery. That is the reviewer's considered judgement about this
+  // skill specifically.
+  const forgotten = {
+    repositoryId: "r", diagnosticCompleted: true, memory: [], updatedAt: "",
+    mastery: {
+      "s-base": {
+        skillId: "s-base", mastery: 0.52, confidence: 0.5, status: "active", evidence: [],
+        sourceFingerprint: "fp-base",
+        review: { stability: 0.6, difficulty: 2.8, reviews: 3, lapses: 1, lastReviewedAt: "2026-06-10T00:00:00.000Z", lastGrade: "again" },
+      },
+      "s-other": { skillId: "s-other", mastery: 0.1, confidence: 0.2, status: "available", evidence: [], sourceFingerprint: "fp-other" },
+    },
+  };
+  // The learner now does something that has nothing to do with `s-base`: they
+  // complete a lesson on the unrelated skill `s-other`. That goes through
+  // `addEvidence`, which — correctly — updates only `s-other`'s own evidence and
+  // mastery, but then calls `recommend` over the entire graph to refresh
+  // locked/available/recommended status.
+  const next = addEvidence(forgotten, graph, "s-other", { kind: "lesson", strength: 0.85, detail: "Completed lesson" });
+  // `s-other` is rightly updated.
+  assert.ok(next.mastery["s-other"].mastery > forgotten.mastery["s-other"].mastery);
+  // `s-base` must be untouched: it belongs to the reviewer once it has a review
+  // record, and recomputing its status from raw mastery here would silently
+  // overwrite "the learner just forgot this" with "the learner has mastered
+  // this" — exactly backwards, and not something the learner did anything to
+  // cause.
+  assert.equal(next.mastery["s-base"].status, "active", "an unrelated edit must not resurrect a skill the reviewer just marked forgotten");
+  assert.deepEqual(next.mastery["s-base"].review, forgotten.mastery["s-base"].review, "the reviewer's scheduling state is untouched by an unrelated client-side edit");
+  assert.equal(next.mastery["s-base"].mastery, forgotten.mastery["s-base"].mastery);
+
+  // The same must hold through `completeDiagnostic`, the other entry point that
+  // calls `recommend` over the whole graph (via repeated `addEvidence`).
+  const diagnosed = completeDiagnostic(forgotten, { ...graph, diagnostic: [{ id: "d1", skillId: "s-other", prompt: "p", options: ["a", "b", "c"], correctIndex: 0 }] }, { d1: 0 });
+  assert.equal(diagnosed.mastery["s-base"].status, "active", "completing a diagnostic about an unrelated skill must not resurrect a reviewed one");
+  assert.deepEqual(diagnosed.mastery["s-base"].review, forgotten.mastery["s-base"].review);
+
+  // A reviewed skill still participates correctly in prerequisite gating for
+  // *other* skills: its own current mastery (not a status recomputed here) is
+  // what `prerequisitesMet` reads, so downstream unlocking is unaffected.
+  const gatedGraph = { ...graph, nodes: [...graph.nodes, { id: "s-downstream", title: "Downstream", prerequisites: ["s-base"], anchors: [], importance: 40, sourceFingerprint: "fp-down" }] };
+  const gatedState = { ...forgotten, mastery: { ...forgotten.mastery, "s-downstream": { skillId: "s-downstream", mastery: 0, confidence: 0, status: "locked", evidence: [], sourceFingerprint: "fp-down" } } };
+  const recommended = recommend(gatedState, gatedGraph);
+  // `s-base`'s mastery (0.52) is below the 0.6 unlock threshold, so the
+  // downstream skill is correctly still locked — reusing the reviewer's own
+  // mastery number, not inventing a second one.
+  assert.equal(recommended.mastery["s-downstream"].status, "locked");
+  assert.equal(recommended.mastery["s-base"].status, "active", "recommend() must never recompute status for a skill the reviewer owns");
 });
 
 test("tree-sitter indexing yields definitions, references, and call edges", async (context) => {
