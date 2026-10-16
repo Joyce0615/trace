@@ -266,6 +266,22 @@ export function buildScaffold(kind, context = {}) {
     ];
   } else if (kind === "localization") {
     rungs = (context.hints ?? []).map((hint, index) => rung(hint.id ?? `locate-${index + 1}`, index + 1, hint.price ?? 0.05 * (index + 1), hint.text));
+  } else if (kind === "misconception") {
+    // Minimum evidence first: name the suspected mistake, then point at where
+    // the counter-evidence lives, then -- only as the strongest and most
+    // expensive rung -- hand over the actual remediation sentence. A learner
+    // who stops after rung one gets a nudge, not the fix; the fix is still
+    // never the *answer* to the task itself (checked below, same as every
+    // other kind), only the misconception's own correction.
+    const finding = context.finding ?? null;
+    if (!finding) {
+      return { kind, available: false, reason: `No hint ladder is defined for ${kind} without a diagnosed finding.`, rungs: [], dropped: [] };
+    }
+    rungs = [
+      rung(`misconception-${finding.id}-named`, 1, 0.05, `A common mistake here: ${finding.title.toLowerCase()}. ${finding.summary}`),
+      rung(`misconception-${finding.id}-evidence`, 2, 0.15, finding.activity ? `The ${finding.activity} view has the evidence that would correct this.` : "Look for evidence that contradicts this assumption before changing anything."),
+      rung(`misconception-${finding.id}-remediation`, 3, 0.25, finding.remediation),
+    ];
   } else {
     return { kind, available: false, reason: `No hint ladder is defined for ${kind}.`, rungs: [], dropped: [] };
   }

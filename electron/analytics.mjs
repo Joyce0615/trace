@@ -390,6 +390,49 @@ export function hintAnalytics(events) {
 }
 
 // ---------------------------------------------------------------------------
+// Misconception-driven hint lift
+// ---------------------------------------------------------------------------
+
+/** How much better (or worse) a misconception-targeted hint does than a generic one. */
+const MISCONCEPTION_LIFT_NO_DIFFERENCE_BAND = 0.2;
+
+/**
+ * Does naming the *specific* misconception actually help more than a generic
+ * hint would have?
+ *
+ * `hintAnalytics` above already compares hinted vs. unhinted success, but that
+ * is silent on *which kind* of hint was given. This measure isolates the
+ * attempt immediately after a hint (`event.followsHint`) and splits it by
+ * whether that hint was misconception-targeted or generic, so the app's claim
+ * that targeted hints work better is checked against real outcomes rather than
+ * assumed from the design. Like every other measure here, a verdict is only
+ * reached once both arms clear the sample floor; otherwise it says so instead
+ * of guessing.
+ */
+export function misconceptionHintAnalytics(events) {
+  const ordered = normalizeEvents(events);
+  const targetedOutcomes = ordered.filter((event) => event.followsHint === "misconception");
+  const genericOutcomes = ordered.filter((event) => event.followsHint === "generic");
+  const targeted = rate(targetedOutcomes.filter((event) => event.correct).length, targetedOutcomes.length);
+  const generic = rate(genericOutcomes.filter((event) => event.correct).length, genericOutcomes.length);
+  const lift = targeted.value === null || generic.value === null ? null : round(targeted.value - generic.value);
+  const verdict = lift === null
+    ? "insufficient-evidence"
+    : lift > MISCONCEPTION_LIFT_NO_DIFFERENCE_BAND
+      ? "targeted-hints-outperform"
+      : lift < -MISCONCEPTION_LIFT_NO_DIFFERENCE_BAND
+        ? "generic-hints-outperform"
+        : "no-measurable-difference";
+  return {
+    kind: "misconception-hint-lift",
+    targeted,
+    generic,
+    lift,
+    verdict,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // The report
 // ---------------------------------------------------------------------------
 
@@ -416,6 +459,7 @@ export function analyticsReport(input = {}) {
     timeOnTask: timeOnTaskAnalytics(events, { sessionGapMs: input.sessionGapMs }),
     hints: hintAnalytics(events),
     delayedTransfer: delayedTransferAnalytics(events, { buckets: input.delayedTransferBuckets }),
+    misconceptionHints: misconceptionHintAnalytics(events),
     warnings: [],
   };
   if (report.retention.successRate.value === null) report.warnings.push({ measure: "retention", reason: "insufficient-evidence", have: report.retention.recalls, need: MIN_SAMPLE });
@@ -423,5 +467,6 @@ export function analyticsReport(input = {}) {
   if (!report.timeOnTask.events) report.warnings.push({ measure: "time-on-task", reason: "no-recorded-activity", have: 0, need: 1 });
   if (report.hints.trend.direction === "unknown") report.warnings.push({ measure: "hint-dependence", reason: "insufficient-evidence", have: report.hints.attempts, need: MIN_SAMPLE * 2 });
   if (!report.delayedTransfer.probes) report.warnings.push({ measure: "delayed-transfer", reason: "no-recorded-activity", have: 0, need: 1 });
+  if (report.misconceptionHints.verdict === "insufficient-evidence") report.warnings.push({ measure: "misconception-hint-lift", reason: "insufficient-evidence", have: Math.min(report.misconceptionHints.targeted.samples, report.misconceptionHints.generic.samples), need: MIN_SAMPLE });
   return report;
 }

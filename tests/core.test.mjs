@@ -38,7 +38,7 @@ import { applyMigration, bodyTokens, buildSymbolSnapshot, courseAnchorSites, cov
 import { GOALS, GOALS_VERSION, goalKeywords, goalPlan, orderLessonsForGoal, rankTargets, resolveGoal } from "../electron/goals.mjs";
 import { EXPERIMENTS, EXPERIMENT_VERSION, OBSERVATION_FIELDS, activeAssignments, analyzeExperiment, assignArm, consentState, experimentReport, hash32, sanitizeObservation, settingsFor } from "../electron/experiments.mjs";
 import { forgetEverything, loadExperimentState, recordObservation, setConsent } from "../electron/experiment-store.mjs";
-import { ANALYTICS_VERSION, MIN_SAMPLE, analyticsReport, hintAnalytics, normalizeEvents, rate, retentionAnalytics, timeOnTaskAnalytics, transferAnalytics } from "../electron/analytics.mjs";
+import { ANALYTICS_VERSION, MIN_SAMPLE, analyticsReport, hintAnalytics, misconceptionHintAnalytics, normalizeEvents, rate, retentionAnalytics, timeOnTaskAnalytics, transferAnalytics } from "../electron/analytics.mjs";
 import { appendEvent, readEvents } from "../electron/activity-log.mjs";
 import { ALWAYS_FORBIDDEN, ANSWER_GUARD_VERSION, MAX_HINT_PENALTY, SCANNED_CHANNELS, answerSecrets, applyScaffold, auditResponse, buildScaffold, clearAnswerSecrets, findForbiddenKeys, findLeakedValues, forbiddenKeysFor, guardResponse, nextHintRung, publicScaffold, registerAnswerSecrets, scaffoldPenalty } from "../electron/answer-guard.mjs";
 import { ACTIVITY_VERSION, buildActivitySet, excerptFor, gradeContrast, gradePrediction, gradeTeachBack, headerParameters, publicActivitySet, restatementRatio, summarizePredictions } from "../electron/activities.mjs";
@@ -4134,14 +4134,28 @@ test("learning analytics report retention, transfer, time, and hints with their 
   assert.equal(hintAnalytics(hintEvents.slice(0, 2)).trend.direction, "unknown");
   assert.equal(hintAnalytics(hintEvents.slice(0, 2)).trend.reason, "insufficient-evidence");
 
-  // --- The report is five measures, never one -------------------------------
+  // --- The report is six measures, never one -------------------------------
   const transferProbeEvents = [
     { at: at(100), kind: "delayed-transfer", path: "app/report.py", correct: true, elapsedDays: 5 },
     { at: at(101), kind: "delayed-transfer", path: "app/archive.py", correct: true, elapsedDays: 6 },
     { at: at(102), kind: "delayed-transfer", path: "app/other.py", correct: false, elapsedDays: 8 },
   ];
+  const misconceptionHintEvents = [
+    { at: at(110), kind: "prediction", correct: false, hints: 1, hintKind: "misconception" },
+    { at: at(111), kind: "prediction", correct: true, hints: 0, hintKind: null, followsHint: "misconception" },
+    { at: at(112), kind: "prediction", correct: false, hints: 1, hintKind: "misconception" },
+    { at: at(113), kind: "prediction", correct: true, hints: 0, hintKind: null, followsHint: "misconception" },
+    { at: at(114), kind: "prediction", correct: false, hints: 1, hintKind: "misconception" },
+    { at: at(115), kind: "prediction", correct: true, hints: 0, hintKind: null, followsHint: "misconception" },
+    { at: at(116), kind: "prediction", correct: false, hints: 1, hintKind: "generic" },
+    { at: at(117), kind: "prediction", correct: false, hints: 0, hintKind: null, followsHint: "generic" },
+    { at: at(118), kind: "prediction", correct: false, hints: 1, hintKind: "generic" },
+    { at: at(119), kind: "prediction", correct: false, hints: 0, hintKind: null, followsHint: "generic" },
+    { at: at(120), kind: "prediction", correct: true, hints: 1, hintKind: "generic" },
+    { at: at(121), kind: "prediction", correct: false, hints: 0, hintKind: null, followsHint: "generic" },
+  ];
   const report = analyticsReport({
-    events: [...recallEvents, ...transferEvents, ...hintEvents, ...transferProbeEvents],
+    events: [...recallEvents, ...transferEvents, ...hintEvents, ...transferProbeEvents, ...misconceptionHintEvents],
     learnerState,
     skillGraph,
     studiedPaths: ["app/queue.py"],
@@ -4151,18 +4165,20 @@ test("learning analytics report retention, transfer, time, and hints with their 
   assert.equal(report.separate, true);
   assert.equal("overall" in report, false, "there is deliberately no combined learning score");
   assert.equal("score" in report, false);
-  assert.equal(report.events, 22);
+  assert.equal(report.events, 34);
   assert.equal(report.retention.kind, "retention");
   assert.equal(report.transfer.kind, "transfer");
   assert.equal(report.timeOnTask.kind, "time-on-task");
   assert.equal(report.hints.kind, "hint-dependence");
   assert.equal(report.delayedTransfer.kind, "delayed-transfer");
   assert.equal(report.delayedTransfer.probes, 3);
+  assert.equal(report.misconceptionHints.kind, "misconception-hint-lift");
+  assert.equal(report.misconceptionHints.verdict, "targeted-hints-outperform");
   assert.deepEqual(report.warnings, [], JSON.stringify(report.warnings));
   // An empty log explains itself instead of rendering a blank panel.
   const empty = analyticsReport({ events: [], learnerState: null, skillGraph, now: at(0) });
   assert.equal(empty.events, 0);
-  assert.deepEqual(empty.warnings.map((warning) => warning.measure).sort(), ["delayed-transfer", "hint-dependence", "retention", "time-on-task", "transfer"]);
+  assert.deepEqual(empty.warnings.map((warning) => warning.measure).sort(), ["delayed-transfer", "hint-dependence", "misconception-hint-lift", "retention", "time-on-task", "transfer"]);
   assert.ok(empty.warnings.every((warning) => warning.reason && warning.need > 0));
   assert.equal(empty.retention.successRate.value, null);
   assert.equal(empty.transfer.gap, null);
@@ -4182,6 +4198,110 @@ test("learning analytics report retention, transfer, time, and hints with their 
   assert.equal((await readEvents(logDirectory, repository.id)).length, 6);
   // Different repositories keep separate logs.
   assert.deepEqual(await readEvents(logDirectory, "another-repository"), []);
+});
+
+test("misconception-driven hints reveal minimum evidence through the existing ladder, and lift is measured separately from generic hints", () => {
+  // --- The hint ladder for a diagnosed misconception --------------------
+  // Reusing `buildScaffold`'s existing rung/penalty/public machinery (rather
+  // than a parallel hint system) is the point: a misconception hint gets the
+  // same "never spells the answer", "one rung at a time", "priced and capped"
+  // guarantees for free, instead of needing its own copy of them.
+  const finding = {
+    id: "single-caller",
+    title: "Assumes a single caller",
+    summary: "Changes the function as if only one call site exists, ignoring fan-in.",
+    remediation: "List every caller before changing a signature; the architecture view reports fan-in.",
+    activity: "architecture",
+  };
+  const ladder = buildScaffold("misconception", { finding, answer: "app/retry.py:1" });
+  assert.equal(ladder.available, true);
+  // Minimum evidence first: the rungs escalate from "a mistake is suspected"
+  // to "here is the fix", never starting with the remediation itself.
+  assert.ok(ladder.rungs.length >= 3, String(ladder.rungs.length));
+  assert.match(ladder.rungs[0].text, /single caller|Assumes a single caller/i);
+  assert.equal(ladder.rungs[0].text.includes(finding.remediation), false, "the first rung must not already hand over the fix");
+  assert.match(ladder.rungs[1].text, /architecture view|evidence/i);
+  assert.match(ladder.rungs[ladder.rungs.length - 1].text, /architecture view|every caller/i);
+  // The answer-spelling invariant applies here exactly as it does elsewhere.
+  for (const rung of ladder.rungs) {
+    assert.equal(rung.text.includes("app/retry.py:1"), false, `rung ${rung.id} spells the answer: ${rung.text}`);
+  }
+  // One rung at a time, same as every other kind.
+  const firstRung = nextHintRung(ladder, []);
+  assert.equal(firstRung.id, ladder.rungs[0].id);
+  const secondRung = nextHintRung(ladder, [firstRung.id]);
+  assert.notEqual(secondRung.id, firstRung.id);
+  assert.ok(scaffoldPenalty(ladder, [firstRung.id]).penalty > 0);
+  assert.ok(scaffoldPenalty(ladder, ladder.rungs.map((rung) => rung.id)).penalty <= MAX_HINT_PENALTY);
+  // A ladder with no diagnosed finding degrades honestly rather than guessing.
+  assert.equal(buildScaffold("misconception", {}).available, false);
+  assert.match(buildScaffold("misconception", {}).reason, /No hint ladder/);
+  // The shipped payload is the existing public shape — no rung text, no
+  // misconception id — and passes the existing egress audit for `hint:next`
+  // exactly like every other kind.
+  const publicLadder = publicScaffold(ladder);
+  assert.equal(JSON.stringify(publicLadder).includes(finding.id), false, "the public payload must not name the misconception either");
+  assert.equal(auditResponse("hint:next", { ...publicLadder, rung: firstRung }).ok, true);
+
+  // --- Proving (or disproving) learning lift -----------------------------
+  // Events after a targeted hint vs. events after a generic (or no) hint, on
+  // the attempt immediately following the hint, following the exact `rate()`
+  // / insufficient-evidence discipline every other analytics measure uses.
+  const now = "2026-06-01T09:00:00.000Z";
+  const at = (minutes) => new Date(Date.parse(now) + minutes * 60_000).toISOString();
+  const liftEvents = [
+    { at: at(0), kind: "prediction", correct: false, hints: 1, hintKind: "misconception", misconceptionId: "single-caller" },
+    { at: at(1), kind: "prediction", correct: true, hints: 0, hintKind: null, misconceptionId: "single-caller", followsHint: "misconception" },
+    { at: at(2), kind: "contrast", correct: false, hints: 1, hintKind: "misconception", misconceptionId: "mutation-vs-copy" },
+    { at: at(3), kind: "contrast", correct: true, hints: 0, hintKind: null, misconceptionId: "mutation-vs-copy", followsHint: "misconception" },
+    { at: at(4), kind: "prediction", correct: false, hints: 1, hintKind: "misconception", misconceptionId: "single-caller" },
+    { at: at(5), kind: "prediction", correct: true, hints: 0, hintKind: null, misconceptionId: "single-caller", followsHint: "misconception" },
+    { at: at(6), kind: "prediction", correct: false, hints: 1, hintKind: "generic" },
+    { at: at(7), kind: "prediction", correct: false, hints: 0, hintKind: null, followsHint: "generic" },
+    { at: at(8), kind: "contrast", correct: false, hints: 1, hintKind: "generic" },
+    { at: at(9), kind: "contrast", correct: false, hints: 0, hintKind: null, followsHint: "generic" },
+    { at: at(10), kind: "prediction", correct: false, hints: 1, hintKind: "generic" },
+    { at: at(11), kind: "prediction", correct: true, hints: 0, hintKind: null, followsHint: "generic" },
+  ];
+  const lift = misconceptionHintAnalytics(liftEvents);
+  assert.equal(lift.kind, "misconception-hint-lift");
+  // Three targeted follow-ups, all correct; three generic follow-ups, one correct.
+  assert.equal(lift.targeted.samples, 3);
+  assert.equal(lift.targeted.value, 1);
+  assert.equal(lift.generic.samples, 3);
+  assert.equal(round4(lift.generic.value), round4(1 / 3));
+  assert.ok(lift.lift > 0, JSON.stringify(lift));
+  assert.equal(lift.verdict, "targeted-hints-outperform");
+  // Below the sample floor, the report says so instead of a false verdict.
+  assert.equal(misconceptionHintAnalytics(liftEvents.slice(0, 2)).verdict, "insufficient-evidence");
+  assert.equal(misconceptionHintAnalytics(liftEvents.slice(0, 2)).lift, null);
+  assert.equal(misconceptionHintAnalytics([]).verdict, "insufficient-evidence");
+  // A targeted hint that performs no better than a generic one says so, rather
+  // than always declaring the targeted arm the winner.
+  const noDifference = misconceptionHintAnalytics([
+    { at: at(0), kind: "prediction", correct: false, hints: 1, hintKind: "misconception" },
+    { at: at(1), kind: "prediction", correct: true, hints: 0, hintKind: null, followsHint: "misconception" },
+    { at: at(2), kind: "prediction", correct: false, hints: 1, hintKind: "misconception" },
+    { at: at(3), kind: "prediction", correct: false, hints: 0, hintKind: null, followsHint: "misconception" },
+    { at: at(4), kind: "prediction", correct: false, hints: 1, hintKind: "misconception" },
+    { at: at(5), kind: "prediction", correct: true, hints: 0, hintKind: null, followsHint: "misconception" },
+    { at: at(6), kind: "prediction", correct: false, hints: 1, hintKind: "generic" },
+    { at: at(7), kind: "prediction", correct: true, hints: 0, hintKind: null, followsHint: "generic" },
+    { at: at(8), kind: "prediction", correct: false, hints: 1, hintKind: "generic" },
+    { at: at(9), kind: "prediction", correct: false, hints: 0, hintKind: null, followsHint: "generic" },
+    { at: at(10), kind: "prediction", correct: false, hints: 1, hintKind: "generic" },
+    { at: at(11), kind: "prediction", correct: true, hints: 0, hintKind: null, followsHint: "generic" },
+  ]);
+  assert.equal(noDifference.verdict, "no-measurable-difference", JSON.stringify(noDifference));
+
+  // --- The sixth measure, still never combined into one score ------------
+  const report = analyticsReport({ events: liftEvents, now });
+  assert.equal(report.misconceptionHints.kind, "misconception-hint-lift");
+  assert.equal(report.misconceptionHints.verdict, "targeted-hints-outperform");
+  assert.equal("overall" in report, false);
+  assert.equal("score" in report, false);
+  const emptyReport = analyticsReport({ events: [], now });
+  assert.ok(emptyReport.warnings.some((warning) => warning.measure === "misconception-hint-lift"), JSON.stringify(emptyReport.warnings));
 });
 
 test("experiments require consent, record only numbers, and refuse to call a winner without evidence", async (context) => {

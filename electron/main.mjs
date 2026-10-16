@@ -737,6 +737,12 @@ const ipcHandlers = {
     if (!probe) throw new Error("That probe is not active for this repository.");
     const grade = gradeProbe(probe, request.choiceId);
     await recordActivity(repository, { kind: "probe", taskId: probe.id, path: probe.anchor?.path ?? null, skillId: probe.skillId, correct: grade.correct, score: grade.correct ? 1 : 0, hints: 0, hintPenalty: 0 });
+    // A wrong choice named a specific misconception: build a targeted ladder
+    // for it now (minimum evidence, strongest rung last) so `hint:next` can
+    // serve it against this same probe id, exactly like every other kind.
+    if (grade.misconception) {
+      scaffolds.set(scaffoldKey(repository.id, "misconception", probe.id), buildScaffold("misconception", { finding: grade.misconception }));
+    }
     return grade;
   },
 

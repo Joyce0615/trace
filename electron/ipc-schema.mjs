@@ -436,7 +436,7 @@ export const IPC_SCHEMAS = {
   }),
   "hint:next": s.object({
     repository: repositoryReference,
-    kind: s.literal(["executable-quiz", "explanation", "contrast", "prediction", "localization"]),
+    kind: s.literal(["executable-quiz", "explanation", "contrast", "prediction", "localization", "misconception"]),
     taskId: s.string({ maxLength: 400 }),
     used: s.array(s.string({ maxLength: 64 }), { maxItems: 12, optional: true }),
   }),

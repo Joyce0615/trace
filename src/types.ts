@@ -1302,6 +1302,13 @@ export interface AnalyticsReport {
     buckets: Array<{ id: string; label: string; observed: AnalyticsRate }>;
     verdict: string;
   };
+  misconceptionHints: {
+    kind: "misconception-hint-lift";
+    targeted: AnalyticsRate;
+    generic: AnalyticsRate;
+    lift: number | null;
+    verdict: string;
+  };
   warnings: Array<{ measure: string; reason: string; have: number; need: number }>;
 }
 
@@ -1315,7 +1322,7 @@ export interface HintRung {
 
 export interface HintResponse {
   version: number;
-  kind: "executable-quiz" | "explanation" | "contrast" | "prediction" | "localization";
+  kind: "executable-quiz" | "explanation" | "contrast" | "prediction" | "localization" | "misconception";
   available: boolean;
   reason?: string;
   total: number;
