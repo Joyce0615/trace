@@ -1,9 +1,11 @@
 import { retention as modelledRetention, reviewStateOf } from "./spaced-repetition.mjs";
+import { DEFAULT_MIN_TRANSFER_DELAY_DAYS } from "./transfer-probe.mjs";
 
 /**
- * Learning analytics: retention, transfer, time-on-task, and hint dependence.
+ * Learning analytics: retention, transfer, time-on-task, hint dependence, and
+ * delayed transfer.
  *
- * Four measures, reported separately and never averaged — for the same reason
+ * Five measures, reported separately and never averaged — for the same reason
  * item 34 refuses a combined quality score. A learner who retains well but
  * cannot transfer, and one who transfers well but has not revisited anything,
  * have different problems, and a single "learning score" would hide both.
@@ -20,6 +22,15 @@ import { retention as modelledRetention, reviewStateOf } from "./spaced-repetiti
  *   - **Time-on-task is time between recorded events**, which is not attention.
  *     It is labelled that way, gaps longer than the session threshold are
  *     excluded rather than counted, and the report says how much was excluded.
+ *   - **Delayed transfer is its own axis, not a restatement of `transfer`
+ *     above.** `transferAnalytics` classifies whatever activities happened to
+ *     occur as near/far by file familiarity alone, with no notion of elapsed
+ *     time; `delayedTransferAnalytics` only scores `kind: "delayed-transfer"`
+ *     events, which `electron/transfer-probe.mjs` only produces once a real
+ *     delay has passed *and* the target file was genuinely unseen. The two
+ *     can disagree (a learner can transfer to unfamiliar files immediately
+ *     but lose that after a delay, or the reverse), and only reporting one of
+ *     them would hide whichever failure mode that learner actually has.
  *
  * The module is Node-free and takes an event log as a parameter, so the browser
  * demo runs the same analytics.
@@ -41,7 +52,28 @@ export const RETENTION_BUCKETS = [
   { id: "months", maxDays: Number.POSITIVE_INFINITY, label: "over a month" },
 ];
 
-const GRADED_KINDS = new Set(["executable-quiz", "explanation", "teach-back", "prediction", "contrast", "call-chain", "localization", "race", "probe", "review"]);
+const GRADED_KINDS = new Set(["executable-quiz", "explanation", "teach-back", "prediction", "contrast", "call-chain", "localization", "race", "probe", "review", "delayed-transfer"]);
+
+/**
+ * Immediate-quiz kinds: every graded kind except the two that already carry
+ * their own time axis (`review`, scored against the spaced-repetition curve,
+ * and `delayed-transfer`, scored against this module's own delay buckets
+ * below). This is the baseline `delayedTransferAnalytics` compares a delayed
+ * probe against — the accuracy a quiz taken right after the lesson gets,
+ * with no delay and no novel-file requirement at all.
+ */
+const IMMEDIATE_QUIZ_KINDS = new Set([...GRADED_KINDS].filter((kind) => kind !== "review" && kind !== "delayed-transfer"));
+
+/** Delay buckets, in days, for a delayed-transfer probe's own curve. Mirrors
+ * `RETENTION_BUCKETS`'s shape so the two reports read the same way, but kept
+ * separate: retention buckets a *recall*, transfer buckets a *novel
+ * application*, and conflating them would hide which one degrades first. */
+export const DELAYED_TRANSFER_BUCKETS = [
+  { id: "immediate", maxDays: DEFAULT_MIN_TRANSFER_DELAY_DAYS, label: `under ${DEFAULT_MIN_TRANSFER_DELAY_DAYS} day(s)` },
+  { id: "days", maxDays: 7, label: "1-7 days" },
+  { id: "weeks", maxDays: 30, label: "1-4 weeks" },
+  { id: "months", maxDays: Number.POSITIVE_INFINITY, label: "over a month" },
+];
 
 function round(value, places = 4) {
   return Number(Number(value).toFixed(places));
@@ -186,6 +218,65 @@ export function transferAnalytics(events, learnerState, options = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// Delayed transfer
+// ---------------------------------------------------------------------------
+
+/**
+ * How well does a delayed probe against unseen related code go, as a
+ * function of the delay, and how does that compare to immediate-quiz
+ * accuracy on the same material?
+ *
+ * This is deliberately not merged into `transferAnalytics` above:
+ * `transferAnalytics` classifies whatever activities happened to occur as
+ * near/far after the fact and has no time axis, while a `kind:
+ * "delayed-transfer"` event only exists because `electron/transfer-probe.mjs`
+ * actively planned it against a file the learner had genuinely never opened
+ * and a delay that had already elapsed. Conflating the two would hide the one
+ * number this item exists to produce: whether transfer survives time, not
+ * just distance from the lesson.
+ */
+export function delayedTransferAnalytics(events, options = {}) {
+  const probes = normalizeEvents(events).filter((event) => event.kind === "delayed-transfer" && typeof event.correct === "boolean");
+  const buckets = (options.buckets ?? DELAYED_TRANSFER_BUCKETS).map((bucket, index, all) => {
+    const lower = index === 0 ? 0 : all[index - 1].maxDays;
+    const inBucket = probes.filter((event) => (event.elapsedDays ?? 0) >= lower && (event.elapsedDays ?? 0) < bucket.maxDays);
+    return {
+      id: bucket.id,
+      label: bucket.label,
+      observed: rate(inBucket.filter((event) => event.correct).length, inBucket.length),
+    };
+  });
+
+  const immediate = normalizeEvents(events).filter((event) => IMMEDIATE_QUIZ_KINDS.has(event.kind) && typeof event.correct === "boolean");
+  const immediateRate = rate(immediate.filter((event) => event.correct).length, immediate.length);
+  const delayedRate = rate(probes.filter((event) => event.correct).length, probes.length);
+  const measured = buckets.filter((bucket) => bucket.observed.value !== null);
+
+  return {
+    kind: "delayed-transfer",
+    probes: probes.length,
+    novelFiles: new Set(probes.map((event) => event.path)).size,
+    immediateAccuracy: immediateRate,
+    delayedAccuracy: delayedRate,
+    // Positive means the learner does *worse* once a delay and an unseen file
+    // are both in play than they do on an immediate quiz; this is the decay
+    // this module exists to surface, not the near/far gap `transferAnalytics`
+    // already reports.
+    decay: immediateRate.value === null || delayedRate.value === null ? null : round(immediateRate.value - delayedRate.value),
+    buckets,
+    verdict: immediateRate.value === null || delayedRate.value === null
+      ? "insufficient-evidence"
+      : !measured.length
+        ? "insufficient-evidence"
+        : immediateRate.value - delayedRate.value > 0.3
+          ? "fades-with-delay"
+          : delayedRate.value >= immediateRate.value - 0.1
+            ? "transfers-across-delay"
+            : "transfers-with-effort",
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Time on task
 // ---------------------------------------------------------------------------
 
@@ -324,11 +415,13 @@ export function analyticsReport(input = {}) {
     }),
     timeOnTask: timeOnTaskAnalytics(events, { sessionGapMs: input.sessionGapMs }),
     hints: hintAnalytics(events),
+    delayedTransfer: delayedTransferAnalytics(events, { buckets: input.delayedTransferBuckets }),
     warnings: [],
   };
   if (report.retention.successRate.value === null) report.warnings.push({ measure: "retention", reason: "insufficient-evidence", have: report.retention.recalls, need: MIN_SAMPLE });
   if (report.transfer.gap === null) report.warnings.push({ measure: "transfer", reason: "insufficient-evidence", have: report.transfer.activities, need: MIN_SAMPLE * 2 });
   if (!report.timeOnTask.events) report.warnings.push({ measure: "time-on-task", reason: "no-recorded-activity", have: 0, need: 1 });
   if (report.hints.trend.direction === "unknown") report.warnings.push({ measure: "hint-dependence", reason: "insufficient-evidence", have: report.hints.attempts, need: MIN_SAMPLE * 2 });
+  if (!report.delayedTransfer.probes) report.warnings.push({ measure: "delayed-transfer", reason: "no-recorded-activity", have: 0, need: 1 });
   return report;
 }

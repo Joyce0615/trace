@@ -1292,6 +1292,16 @@ export interface AnalyticsReport {
     penaltyCarried: number;
     trend: { direction: string; reason: string | null; early: number | null; late: number | null };
   };
+  delayedTransfer: {
+    kind: "delayed-transfer";
+    probes: number;
+    novelFiles: number;
+    immediateAccuracy: AnalyticsRate;
+    delayedAccuracy: AnalyticsRate;
+    decay: number | null;
+    buckets: Array<{ id: string; label: string; observed: AnalyticsRate }>;
+    verdict: string;
+  };
   warnings: Array<{ measure: string; reason: string; have: number; need: number }>;
 }
 

@@ -58,6 +58,8 @@ import { answerFromLocalIndex, buildContextPack, loadCachedResponse, saveCachedR
 import { buildSkillGraph, createLearnerState, reconcileLearnerState } from "../electron/skill-graph.mjs";
 import { CHANGE_IMPACT_VERSION, analyzeChangeImpact, changedSymbols, isTestPath, renderChangeImpact, tracedCallers, tracedLessons, tracedMasteryEvidence, tracedNotes, tracedQuizzes, tracedTests } from "../electron/change-impact.mjs";
 import { RETRIEVAL_COUNTERFACTUAL_VERSION, evaluateRetrievalCounterfactual, renderRetrievalCounterfactual } from "../electron/retrieval-counterfactual.mjs";
+import { DEFAULT_MIN_TRANSFER_DELAY_DAYS, DEFAULT_TRANSFER_PROBE_DEPTH, TRANSFER_PROBE_VERSION, elapsedSinceStudy, planDelayedTransferProbe, unseenRelatedFiles } from "../electron/transfer-probe.mjs";
+import { DELAYED_TRANSFER_BUCKETS, delayedTransferAnalytics } from "../electron/analytics.mjs";
 import { loadLearnerState, loadLearnerStateReport, saveLearnerState } from "../electron/learning-store.mjs";
 import { addEvidence, completeDiagnostic, recommend } from "../src/learning.ts";
 import { DURABLE_VERSION, inspectDurable, readDurable, sweepInterruptedWrites, writeDurable } from "../electron/durable-store.mjs";
@@ -4132,9 +4134,14 @@ test("learning analytics report retention, transfer, time, and hints with their 
   assert.equal(hintAnalytics(hintEvents.slice(0, 2)).trend.direction, "unknown");
   assert.equal(hintAnalytics(hintEvents.slice(0, 2)).trend.reason, "insufficient-evidence");
 
-  // --- The report is four measures, never one ------------------------------
+  // --- The report is five measures, never one -------------------------------
+  const transferProbeEvents = [
+    { at: at(100), kind: "delayed-transfer", path: "app/report.py", correct: true, elapsedDays: 5 },
+    { at: at(101), kind: "delayed-transfer", path: "app/archive.py", correct: true, elapsedDays: 6 },
+    { at: at(102), kind: "delayed-transfer", path: "app/other.py", correct: false, elapsedDays: 8 },
+  ];
   const report = analyticsReport({
-    events: [...recallEvents, ...transferEvents, ...hintEvents],
+    events: [...recallEvents, ...transferEvents, ...hintEvents, ...transferProbeEvents],
     learnerState,
     skillGraph,
     studiedPaths: ["app/queue.py"],
@@ -4144,16 +4151,18 @@ test("learning analytics report retention, transfer, time, and hints with their 
   assert.equal(report.separate, true);
   assert.equal("overall" in report, false, "there is deliberately no combined learning score");
   assert.equal("score" in report, false);
-  assert.equal(report.events, 19);
+  assert.equal(report.events, 22);
   assert.equal(report.retention.kind, "retention");
   assert.equal(report.transfer.kind, "transfer");
   assert.equal(report.timeOnTask.kind, "time-on-task");
   assert.equal(report.hints.kind, "hint-dependence");
+  assert.equal(report.delayedTransfer.kind, "delayed-transfer");
+  assert.equal(report.delayedTransfer.probes, 3);
   assert.deepEqual(report.warnings, [], JSON.stringify(report.warnings));
   // An empty log explains itself instead of rendering a blank panel.
   const empty = analyticsReport({ events: [], learnerState: null, skillGraph, now: at(0) });
   assert.equal(empty.events, 0);
-  assert.deepEqual(empty.warnings.map((warning) => warning.measure).sort(), ["hint-dependence", "retention", "time-on-task", "transfer"]);
+  assert.deepEqual(empty.warnings.map((warning) => warning.measure).sort(), ["delayed-transfer", "hint-dependence", "retention", "time-on-task", "transfer"]);
   assert.ok(empty.warnings.every((warning) => warning.reason && warning.need > 0));
   assert.equal(empty.retention.successRate.value, null);
   assert.equal(empty.transfer.gap, null);
@@ -8131,4 +8140,167 @@ test("retrieval counterfactual evaluation compares lexical/symbol/graph/embeddin
   const rendered = renderRetrievalCounterfactual(report);
   assert.ok(rendered.includes("fused"));
   assert.ok(rendered.includes("Grounding lift"));
+});
+
+test("delayed transfer probes plan against unseen graph-related code only after a real delay, and are measured separately from near/far transfer", () => {
+  assert.equal(TRANSFER_PROBE_VERSION, 1);
+  assert.equal(DEFAULT_MIN_TRANSFER_DELAY_DAYS, 1);
+  assert.equal(DEFAULT_TRANSFER_PROBE_DEPTH, 3);
+
+  // app/queue.py -> app/worker.py -> app/report.py -> app/archive.py, a chain
+  // of import edges, plus an unrelated app/unrelated.py with no edge at all.
+  const graph = {
+    nodes: [
+      { id: "file:app/queue.py", kind: "file", key: "app/queue.py" },
+      { id: "file:app/worker.py", kind: "file", key: "app/worker.py" },
+      { id: "file:app/report.py", kind: "file", key: "app/report.py" },
+      { id: "file:app/archive.py", kind: "file", key: "app/archive.py" },
+      { id: "file:app/unrelated.py", kind: "file", key: "app/unrelated.py" },
+    ],
+    edges: [
+      { from: "file:app/worker.py", to: "file:app/queue.py", kind: "imports" },
+      { from: "file:app/report.py", to: "file:app/worker.py", kind: "imports" },
+      { from: "file:app/archive.py", to: "file:app/report.py", kind: "imports" },
+    ],
+  };
+
+  // --- unseenRelatedFiles: nearest hop wins, anchors/studied are excluded ---
+  const related = unseenRelatedFiles(graph, ["app/queue.py"], [], { depth: 3 });
+  assert.deepEqual(related.map((entry) => entry.path), ["app/worker.py", "app/report.py", "app/archive.py"]);
+  assert.equal(related.find((entry) => entry.path === "app/worker.py").hops, 1);
+  assert.equal(related.find((entry) => entry.path === "app/report.py").hops, 2);
+  assert.equal(related.find((entry) => entry.path === "app/archive.py").hops, 3);
+  assert.ok(!related.some((entry) => entry.path === "app/unrelated.py"), "a file with no graph path is not related");
+  assert.ok(!related.some((entry) => entry.path === "app/queue.py"), "the anchor itself is excluded");
+
+  // A file the learner has already opened is studied ground, not unseen,
+  // even though it is still graph-related.
+  const withStudied = unseenRelatedFiles(graph, ["app/queue.py"], ["app/worker.py"], { depth: 3 });
+  assert.deepEqual(withStudied.map((entry) => entry.path), ["app/report.py", "app/archive.py"]);
+
+  // Depth really limits the search.
+  const shallow = unseenRelatedFiles(graph, ["app/queue.py"], [], { depth: 1 });
+  assert.deepEqual(shallow.map((entry) => entry.path), ["app/worker.py"]);
+
+  // --- elapsedSinceStudy: most recent of review or evidence wins ----------
+  const now = "2026-06-10T00:00:00.000Z";
+  assert.equal(elapsedSinceStudy(null, now), null, "never studied has no elapsed time at all");
+  assert.equal(elapsedSinceStudy({ evidence: [] }, now), null);
+  assert.equal(
+    elapsedSinceStudy({ evidence: [{ createdAt: "2026-06-05T00:00:00.000Z" }] }, now),
+    5,
+  );
+  assert.equal(
+    elapsedSinceStudy({
+      evidence: [{ createdAt: "2026-06-01T00:00:00.000Z" }],
+      review: { lastReviewedAt: "2026-06-08T00:00:00.000Z" },
+    }, now),
+    2,
+    "the more recent of evidence and review wins",
+  );
+
+  // --- planDelayedTransferProbe: every unavailable outcome names why ------
+  const skill = { id: "skill-queue", anchors: [{ path: "app/queue.py", line: 1, symbol: "enqueue" }] };
+
+  const neverStudied = planDelayedTransferProbe(skill, null, graph, [], { now });
+  assert.equal(neverStudied.available, false);
+  assert.equal(neverStudied.reason, "not-studied-yet");
+  assert.equal(neverStudied.elapsedDays, null);
+  assert.equal(neverStudied.candidate, null);
+
+  const tooSoon = planDelayedTransferProbe(
+    skill,
+    { evidence: [{ createdAt: "2026-06-09T18:00:00.000Z" }] },
+    graph,
+    [],
+    { now, minDelayDays: 1 },
+  );
+  assert.equal(tooSoon.available, false);
+  assert.equal(tooSoon.reason, "too-soon");
+  assert.ok(tooSoon.elapsedDays < 1, String(tooSoon.elapsedDays));
+
+  const everythingSeen = planDelayedTransferProbe(
+    skill,
+    { evidence: [{ createdAt: "2026-06-01T00:00:00.000Z" }] },
+    graph,
+    ["app/worker.py", "app/report.py", "app/archive.py"],
+    { now, minDelayDays: 1 },
+  );
+  assert.equal(everythingSeen.available, false);
+  assert.equal(everythingSeen.reason, "no-unseen-related-code");
+
+  const ready = planDelayedTransferProbe(
+    skill,
+    { evidence: [{ createdAt: "2026-06-01T00:00:00.000Z" }] },
+    graph,
+    [],
+    { now, minDelayDays: 1 },
+  );
+  assert.equal(ready.available, true);
+  assert.equal(ready.reason, null);
+  assert.equal(ready.elapsedDays, 9);
+  assert.equal(ready.candidate.path, "app/worker.py", "nearest unseen related file is offered first");
+  assert.deepEqual(ready.candidates.map((entry) => entry.path), ["app/worker.py", "app/report.py", "app/archive.py"]);
+
+  // maxCandidates really narrows the list, not just display truncation elsewhere.
+  const capped = planDelayedTransferProbe(skill, { evidence: [{ createdAt: "2026-06-01T00:00:00.000Z" }] }, graph, [], { now, minDelayDays: 1, maxCandidates: 1 });
+  assert.equal(capped.candidates.length, 1);
+
+  // --- delayedTransferAnalytics: separate curve from transferAnalytics ----
+  assert.deepEqual(DELAYED_TRANSFER_BUCKETS.map((bucket) => bucket.id), ["immediate", "days", "weeks", "months"]);
+
+  const base = Date.parse("2026-06-01T09:00:00.000Z");
+  const at = (minutes) => new Date(base + minutes * 60_000).toISOString();
+
+  // Three immediate quizzes, all correct; three delayed transfer probes
+  // against novel files weeks later, all wrong — a learner who answers
+  // immediate questions fine but cannot apply the material to new code once
+  // time has passed.
+  const events = [
+    { at: at(0), kind: "prediction", path: "app/queue.py", correct: true },
+    { at: at(1), kind: "prediction", path: "app/queue.py", correct: true },
+    { at: at(2), kind: "contrast", path: "app/queue.py", correct: true },
+    { at: at(3), kind: "delayed-transfer", path: "app/archive.py", correct: false, elapsedDays: 20 },
+    { at: at(4), kind: "delayed-transfer", path: "app/report.py", correct: false, elapsedDays: 22 },
+    { at: at(5), kind: "delayed-transfer", path: "app/worker.py", correct: false, elapsedDays: 25 },
+  ];
+  const decayed = delayedTransferAnalytics(events);
+  assert.equal(decayed.kind, "delayed-transfer");
+  assert.equal(decayed.probes, 3);
+  assert.equal(decayed.novelFiles, 3);
+  assert.equal(decayed.immediateAccuracy.value, 1);
+  assert.equal(decayed.delayedAccuracy.value, 0);
+  assert.equal(decayed.decay, 1);
+  assert.equal(decayed.verdict, "fades-with-delay");
+  const weeksBucket = decayed.buckets.find((bucket) => bucket.id === "weeks");
+  assert.equal(weeksBucket.observed.value, 0);
+
+  // A learner who transfers across the delay just as well as immediately.
+  const steady = delayedTransferAnalytics([
+    ...events.slice(0, 3),
+    { at: at(3), kind: "delayed-transfer", path: "app/archive.py", correct: true, elapsedDays: 20 },
+    { at: at(4), kind: "delayed-transfer", path: "app/report.py", correct: true, elapsedDays: 22 },
+    { at: at(5), kind: "delayed-transfer", path: "app/worker.py", correct: true, elapsedDays: 25 },
+  ]);
+  assert.equal(steady.verdict, "transfers-across-delay");
+  assert.equal(steady.decay, 0);
+
+  // Too few probes to say anything at all.
+  assert.equal(delayedTransferAnalytics([]).verdict, "insufficient-evidence");
+  assert.equal(delayedTransferAnalytics([]).probes, 0);
+  assert.equal(delayedTransferAnalytics(events.slice(0, 2)).verdict, "insufficient-evidence");
+
+  // delayed-transfer is its own fifth measure in the top-level report, never
+  // folded into transferAnalytics's near/far split — two different time axes,
+  // reported separately, same discipline as every other pair of measures here.
+  const skillGraphForReport = { nodes: [] };
+  const report = analyticsReport({ events, skillGraph: skillGraphForReport, now: at(10) });
+  assert.equal(report.events, 6);
+  assert.equal(report.delayedTransfer.kind, "delayed-transfer");
+  assert.equal(report.delayedTransfer.probes, 3);
+  assert.equal(report.delayedTransfer.verdict, "fades-with-delay");
+  assert.equal("overall" in report, false, "still no combined learning score with a fifth measure in the mix");
+  assert.ok(report.warnings.some((warning) => warning.measure === "delayed-transfer") === false, "three probes is enough evidence here");
+  const noProbes = analyticsReport({ events: events.slice(0, 3), skillGraph: skillGraphForReport, now: at(10) });
+  assert.ok(noProbes.warnings.some((warning) => warning.measure === "delayed-transfer"), "no delayed-transfer probes at all is worth explaining");
 });
