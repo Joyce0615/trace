@@ -71,6 +71,7 @@ import { signPluginDirectory } from "../scripts/plugin-tool.mjs";
 import { DOCUMENTS, checkDocumentation, userDataDirectories } from "../scripts/docs-check.mjs";
 import { LADDERS, MAX_SERIES_PER_EVENT, MAX_TOTAL_SERIES, RETENTION_DAYS, TELEMETRY_EVENTS, TELEMETRY_VERSION, bucketFor, containsOnlyDeclaredValues, createTelemetryState, exportTelemetry, forget, pruneRetention, recordEvent, setConsent as setTelemetryConsentPure, summarize as summarizeTelemetry, telemetryEventNames } from "../electron/telemetry.mjs";
 import { forgetTelemetry, loadTelemetry, record, setTelemetryConsent, telemetryFileExists } from "../electron/telemetry-store.mjs";
+import { SCALE_TIERS, SCALE_TIERS_VERSION, TIER_BUDGETS, buildScaleFixture, describeTierScaling, evaluateTierMeasurement, measureTier, runTierSuite, tierBudgetIds, tierFor, tierIds } from "../electron/scale-tiers.mjs";
 
 const execFileAsync = promisify(execFile);
 const round4 = (value) => Number(Number(value).toFixed(4));
@@ -8423,4 +8424,194 @@ test("delayed transfer probes plan against unseen graph-related code only after 
   assert.ok(report.warnings.some((warning) => warning.measure === "delayed-transfer") === false, "three probes is enough evidence here");
   const noProbes = analyticsReport({ events: events.slice(0, 3), skillGraph: skillGraphForReport, now: at(10) });
   assert.ok(noProbes.warnings.some((warning) => warning.measure === "delayed-transfer"), "no delayed-transfer probes at all is worth explaining");
+});
+
+test("repository-scale performance tiers benchmark cold/incremental indexing, memory, search, graph construction, and course generation through monorepo scale", async (context) => {
+  // --- The tier catalog itself ---------------------------------------------
+  assert.deepEqual(tierIds(), ["small", "medium", "large", "monorepo"]);
+  assert.equal(SCALE_TIERS_VERSION, 1);
+  for (const tier of SCALE_TIERS) {
+    assert.ok(tier.files > 0, `${tier.id} has no file count`);
+    assert.ok(tier.label.length > 5, `${tier.id} has no human-readable label`);
+    assert.ok(tier.graphNodes > 0, `${tier.id} has no rendering-tier node count`);
+  }
+  // Monotonic: each tier is a real step up from the one before, through
+  // "monorepo scale" as the item names it, or the catalog is not actually
+  // exercising a range.
+  for (let index = 1; index < SCALE_TIERS.length; index += 1) {
+    assert.ok(SCALE_TIERS[index].files > SCALE_TIERS[index - 1].files, `${SCALE_TIERS[index].id} is not larger than ${SCALE_TIERS[index - 1].id}`);
+  }
+  assert.ok(SCALE_TIERS.at(-1).files >= 5_000, "the largest tier does not reach monorepo scale");
+  assert.throws(() => tierFor("huge"), /Unknown scale tier/);
+
+  // --- Every tier budget is declared with a reason, same discipline as the
+  // --- per-repository budgets in performance.mjs -------------------------
+  for (const id of tierBudgetIds()) {
+    const budget = TIER_BUDGETS[id];
+    assert.ok(budget.why && budget.why.length > 30, `${id} has no reason recorded`);
+    assert.ok(budget.warnAt < budget.limit, `${id} warns at or above the point it fails`);
+    if (budget.per) assert.ok(budget.floor > 0, `${id} scales with ${budget.per} but has no floor`);
+  }
+  // Declared separately from the application's own BUDGETS, so a tier-fixture
+  // rate is never mistaken for a ceiling on the real application a user runs,
+  // and docs-check's budgetIds() count (asserted elsewhere in this file) is
+  // not perturbed by this item.
+  assert.equal(Object.keys(BUDGETS).some((id) => id in TIER_BUDGETS), false, "tier budgets must not collide with application budgets");
+
+  // --- A synthetic fixture at the smallest tier has real, resolved imports
+  // --- and call edges, not just files on disk -----------------------------
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-scale-tiers-"));
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  const small = tierFor("small");
+  const fixturePath = path.join(workspace, "small-fixture");
+  const builtPath = await buildScaleFixture(small, { destination: fixturePath });
+  assert.equal(builtPath, fixturePath);
+  resetAnalysisCache();
+  const repositoriesDirectory = path.join(workspace, "repos");
+  const repository = await inspectRepository(builtPath, repositoriesDirectory);
+  // One `mod*.py` per declared module, one `__init__.py` per package
+  // directory, and one README -- the fixture's own, exact shape, not an
+  // approximation of it.
+  const directoryCount = Math.max(1, Math.ceil(small.files / Math.max(1, small.filesPerDirectory)));
+  assert.equal(repository.stats.fileCount, small.files + directoryCount + 1, "the fixture's file count must equal module files plus one __init__.py per directory plus the README");
+  assert.ok(repository.imports.some((item) => item.resolved), "the fixture must contain real, resolvable imports, not just files");
+  assert.ok(repository.callEdges.some((edge) => edge.resolved), "the fixture must contain real, resolvable call edges");
+
+  // --- Measuring one tier runs every named stage and reports a real shape -
+  const measuredFixturePath = path.join(workspace, "measured-fixture");
+  const measured = await measureTier(small, { repositoriesDirectory, cleanup: true, destination: measuredFixturePath });
+  assert.equal(measured.tier, "small");
+  assert.equal(measured.files, small.files + directoryCount + 1);
+  for (const stage of ["index", "graph", "search", "course", "render"]) {
+    assert.ok(stage in measured, `measureTier did not report the ${stage} stage`);
+  }
+  assert.ok(measured.index.coldMs >= 0);
+  assert.ok(measured.index.incrementalMs >= 0);
+  assert.ok(measured.index.peakRssBytes > 0, "memory must be measured, not merely zero by omission");
+  assert.ok(measured.graph.nodeCount > 0);
+  assert.ok(measured.graph.reusedPartitions > 0, "an incremental rebuild that changed one file should reuse the rest");
+  assert.ok(measured.search.indexedFiles > 0);
+  assert.ok(measured.course.buildMs >= 0);
+  assert.equal(measured.render.nodeCount, small.graphNodes);
+  assert.ok(measured.render.shown <= measured.render.nodeCount);
+  // `cleanup: true` must actually remove the fixture it built.
+  await assert.rejects(() => readFile(path.join(measuredFixturePath, "README.md")));
+
+  // --- Judging a measurement against the tier budgets ---------------------
+  const evaluation = evaluateTierMeasurement(measured);
+  assert.equal(evaluation.tier, "small");
+  assert.equal(evaluation.results.length, tierBudgetIds().length);
+  assert.ok(["passed", "notPassed"].includes(evaluation.passed ? "passed" : "notPassed"));
+  assert.ok(typeof evaluation.summary === "string" && evaluation.summary.length > 10);
+  for (const result of evaluation.results) {
+    assert.ok(["pass", "warn", "fail", "insufficient-data"].includes(result.verdict), `${result.id} has an unrecognised verdict`);
+    assert.ok(result.ceiling > 0, `${result.id} has no ceiling`);
+  }
+
+  // A measurement with a budget deliberately blown must fail, by the same
+  // mechanism `evaluateBudget` uses: this is not a parallel pass/fail rule.
+  const slow = { ...measured, index: { ...measured.index, coldMs: measured.index.coldMs * 10_000 } };
+  const slowEvaluation = evaluateTierMeasurement(slow);
+  assert.equal(slowEvaluation.passed, false);
+  assert.ok(slowEvaluation.failures.includes("index.coldMsPerFile"));
+  assert.match(slowEvaluation.summary, /index\.coldMsPerFile/);
+
+  // --- Running the whole suite reports every tier, in order, and reports
+  // --- (rather than silently swallowing) a tier that could not be measured -
+  const smallAndMedium = await runTierSuite({ tiers: ["small", "medium"], repositoriesDirectory });
+  assert.equal(SCALE_TIERS_VERSION, smallAndMedium.version);
+  assert.deepEqual(smallAndMedium.tiers, ["small", "medium"]);
+  assert.equal(smallAndMedium.measurements.length, 2);
+  assert.equal(smallAndMedium.evaluations.length, 2);
+  assert.deepEqual(smallAndMedium.skipped, []);
+  assert.equal(smallAndMedium.passed, smallAndMedium.evaluations.every((evaluation) => evaluation.passed));
+  assert.equal(smallAndMedium.measurements[0].tier, "small");
+  assert.equal(smallAndMedium.measurements[1].tier, "medium");
+  assert.ok(smallAndMedium.measurements[1].files > smallAndMedium.measurements[0].files);
+
+  // Every tier reaches "monorepo scale" when the full catalog is run — this
+  // is the one assertion in the file that is intentionally slow, because
+  // reaching the scale this item names (monorepo) has no shortcut.
+  const full = await runTierSuite({ repositoriesDirectory });
+  assert.equal(full.measurements.length, SCALE_TIERS.length);
+  assert.equal(full.measurements.at(-1).tier, "monorepo");
+  // The repository's own discovery-time file limit (`DEFAULT_INDEX_LIMITS`)
+  // truncates what actually gets indexed well before 8,000 files -- which is
+  // itself the right, honest behaviour for a real monorepo, and is reported
+  // in `truncated` rather than silently applied. The scale claim this test
+  // makes is about what was *attempted*, not what survived that limit.
+  assert.ok(SCALE_TIERS.find((tier) => tier.id === "monorepo").files >= 5_000, "the monorepo tier was not declared at monorepo scale");
+  assert.ok(full.measurements.at(-1).truncated.some((entry) => entry.limit === "maxFiles" && entry.discovered >= 5_000), "the monorepo-scale fixture did not actually produce enough files to hit the repository's own file-count limit");
+  for (const evaluation of full.evaluations) {
+    assert.equal(evaluation.passed, true, evaluation.summary);
+  }
+  // Every stage's rate must not blow up super-linearly across the full range
+  // of measured tiers -- the actual claim behind "benchmark ... through
+  // monorepo scale" rather than merely "ran without crashing at scale".
+  for (const field of ["index.coldMs", "index.incrementalMs", "graph.coldMs", "search.indexBuildMs"]) {
+    const scaling = describeTierScaling(full.measurements, field);
+    assert.ok(scaling.ratePerFile.length === full.measurements.length);
+    // A measurement too small to trust (dominated by timer noise, same floor
+    // discipline as `summarize`'s `reliable` flag) is reported as such rather
+    // than scored -- but every field here must be *resolved* one way or the
+    // other, not silently absent.
+    assert.ok("reliable" in scaling, `${field} did not report whether its scaling trend is reliable`);
+    if (scaling.reliable) assert.equal(scaling.superlinear, false, `${field}: ${scaling.detail}`);
+  }
+
+  // An empty tier request has nothing to measure and nothing to fail.
+  const emptySuite = await runTierSuite({ tiers: [], repositoriesDirectory });
+  assert.deepEqual(emptySuite.measurements, []);
+  assert.deepEqual(emptySuite.tiers, []);
+  assert.equal(emptySuite.passed, true, "an empty tier request has nothing to fail");
+
+  // A tier whose fixture cannot be built (here: by pointing Node's temp
+  // directory resolution at a path that is a file, not a directory) is
+  // reported in `skipped`, not thrown out of the suite -- the same
+  // discipline `preflight.mjs` applies to a missing capability.
+  const blockedTmpFile = path.join(workspace, "blocked-tmp-file");
+  await writeFile(blockedTmpFile, "not a directory");
+  const originalTmpdir = process.env.TMPDIR;
+  process.env.TMPDIR = blockedTmpFile;
+  let blockedSuite;
+  try {
+    blockedSuite = await runTierSuite({ tiers: ["small"] });
+  } finally {
+    if (originalTmpdir === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = originalTmpdir;
+  }
+  assert.deepEqual(blockedSuite.measurements, []);
+  assert.equal(blockedSuite.skipped.length, 1);
+  assert.equal(blockedSuite.skipped[0].tier, "small");
+  assert.ok(blockedSuite.skipped[0].reason.length > 0);
+  assert.equal(blockedSuite.passed, false, "a tier that could not be measured must not report a passing suite");
+  assert.match(blockedSuite.summary, /could not be measured/);
+
+  // --- describeTierScaling's own edge cases --------------------------------
+  const tooFew = describeTierScaling([measured], "index.coldMs");
+  assert.equal(tooFew.superlinear, false);
+  assert.equal(tooFew.reliable, false);
+  assert.deepEqual(tooFew.ratePerFile, []);
+  assert.match(tooFew.detail, /fewer than two tiers/i);
+
+  const synthetic = [
+    { tier: "small", files: 10, index: { coldMs: 10 } },
+    { tier: "monorepo", files: 1_000, index: { coldMs: 50_000 } },
+  ];
+  const regressed = describeTierScaling(synthetic, "index.coldMs");
+  assert.equal(regressed.reliable, true);
+  assert.equal(regressed.superlinear, true, regressed.detail);
+  assert.match(regressed.detail, /faster than the file count itself grew/);
+
+  // A measurement too small to trust is reported as unreliable, not scored.
+  const tooSmallToTrust = describeTierScaling(
+    [
+      { tier: "small", files: 10, index: { coldMs: 0.5 } },
+      { tier: "monorepo", files: 1_000, index: { coldMs: 40 } },
+    ],
+    "index.coldMs",
+  );
+  assert.equal(tooSmallToTrust.reliable, false);
+  assert.equal(tooSmallToTrust.superlinear, false, "an unreliable measurement must not be scored as superlinear");
+  assert.match(tooSmallToTrust.detail, /below the 2 ms floor/);
 });
