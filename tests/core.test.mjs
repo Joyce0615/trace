@@ -72,6 +72,7 @@ import { DOCUMENTS, checkDocumentation, userDataDirectories } from "../scripts/d
 import { LADDERS, MAX_SERIES_PER_EVENT, MAX_TOTAL_SERIES, RETENTION_DAYS, TELEMETRY_EVENTS, TELEMETRY_VERSION, bucketFor, containsOnlyDeclaredValues, createTelemetryState, exportTelemetry, forget, pruneRetention, recordEvent, setConsent as setTelemetryConsentPure, summarize as summarizeTelemetry, telemetryEventNames } from "../electron/telemetry.mjs";
 import { forgetTelemetry, loadTelemetry, record, setTelemetryConsent, telemetryFileExists } from "../electron/telemetry-store.mjs";
 import { SCALE_TIERS, SCALE_TIERS_VERSION, TIER_BUDGETS, buildScaleFixture, describeTierScaling, evaluateTierMeasurement, measureTier, runTierSuite, tierBudgetIds, tierFor, tierIds } from "../electron/scale-tiers.mjs";
+import { MODEL_FINGERPRINT_VERSION, NETWORK_PRIMITIVE_PATTERN, REQUIRED_CAPABILITIES, assessCompatibility, fingerprintModel, proveOfflineMode, sameFingerprint, scanElectronDirectoryForNetworkCapability, scanForNetworkCapability } from "../electron/model-fingerprint.mjs";
 
 const execFileAsync = promisify(execFile);
 const round4 = (value) => Number(Number(value).toFixed(4));
@@ -8614,4 +8615,166 @@ test("repository-scale performance tiers benchmark cold/incremental indexing, me
   assert.equal(tooSmallToTrust.reliable, false);
   assert.equal(tooSmallToTrust.superlinear, false, "an unreliable measurement must not be scored as superlinear");
   assert.match(tooSmallToTrust.detail, /below the 2 ms floor/);
+});
+
+test("local model/provider compatibility is fingerprinted, and offline mode is proven rather than claimed", async (context) => {
+  assert.equal(MODEL_FINGERPRINT_VERSION, 1);
+
+  // --- fingerprintModel is stable, order-independent, and field-selective ---
+  const codexConfig = { provider: "codex", command: "codex", version: "1.2.0", sandbox: "read-only", tools: ["Read"] };
+  assert.equal(fingerprintModel(codexConfig), fingerprintModel({ ...codexConfig }), "the same configuration must fingerprint the same way twice");
+  // Key order on the input object must not matter.
+  const reordered = { tools: ["Read"], sandbox: "read-only", version: "1.2.0", command: "codex", provider: "codex" };
+  assert.equal(fingerprintModel(codexConfig), fingerprintModel(reordered), "key order on the input must not change the fingerprint");
+  // Tool array order must not matter either.
+  const toolsReordered = { ...codexConfig, tools: ["Grep", "Read"] };
+  const toolsSameSet = { ...codexConfig, tools: ["Read", "Grep"] };
+  assert.equal(fingerprintModel(toolsReordered), fingerprintModel(toolsSameSet), "tool list order must not change the fingerprint");
+  // An irrelevant extra field must not change the fingerprint.
+  assert.equal(fingerprintModel(codexConfig), fingerprintModel({ ...codexConfig, requestId: "abc-123", timestamp: Date.now() }), "an unrelated field changed the fingerprint");
+  // A field that does matter must change it.
+  assert.notEqual(fingerprintModel(codexConfig), fingerprintModel({ ...codexConfig, version: "1.3.0" }));
+  assert.notEqual(fingerprintModel(codexConfig), fingerprintModel({ ...codexConfig, sandbox: "workspace-write" }));
+  assert.notEqual(fingerprintModel(codexConfig), fingerprintModel({ ...codexConfig, provider: "claude" }));
+  assert.match(fingerprintModel(codexConfig), /^model-fp:[0-9a-f]{8}$/);
+
+  // sameFingerprint is exactly fingerprint equality, not reference equality.
+  assert.equal(sameFingerprint(codexConfig, { ...codexConfig }), true);
+  assert.equal(sameFingerprint(codexConfig, { ...codexConfig, version: "9.9.9" }), false);
+
+  // --- assessCompatibility: present vs capable are different failure modes --
+  assert.deepEqual(REQUIRED_CAPABILITIES.codex, { sandbox: "read-only", tools: ["Read"] });
+  assert.deepEqual(REQUIRED_CAPABILITIES.claude, { permissionMode: "plan", tools: ["Read", "Grep", "Glob"] });
+
+  const fullyCompatibleCodex = assessCompatibility({ provider: "codex", available: true, sandbox: "read-only", tools: ["Read"] });
+  assert.equal(fullyCompatibleCodex.compatible, true);
+  assert.deepEqual(fullyCompatibleCodex.reasons, []);
+  assert.deepEqual(fullyCompatibleCodex.missingCapabilities, []);
+
+  const fullyCompatibleClaude = assessCompatibility({ provider: "claude", available: true, permissionMode: "plan", tools: ["Read", "Grep", "Glob"] });
+  assert.equal(fullyCompatibleClaude.compatible, true);
+
+  // Not installed: a distinct reason from "installed but misconfigured".
+  const notInstalled = assessCompatibility({ provider: "codex", available: false });
+  assert.equal(notInstalled.compatible, false);
+  assert.match(notInstalled.reasons[0], /not installed/);
+  assert.deepEqual(notInstalled.missingCapabilities, [], "a provider that is not installed has no capability gap to name, only an installation gap");
+
+  // Installed but wrong sandbox mode: named specifically, and every gap is
+  // reported, not just the first one found.
+  const wrongSandboxAndTools = assessCompatibility({ provider: "codex", available: true, sandbox: "workspace-write", tools: [] });
+  assert.equal(wrongSandboxAndTools.compatible, false);
+  assert.equal(wrongSandboxAndTools.reasons.length, 2, JSON.stringify(wrongSandboxAndTools));
+  assert.match(wrongSandboxAndTools.reasons[0], /sandbox "read-only", not "workspace-write"/);
+  assert.match(wrongSandboxAndTools.reasons[1], /missing required tool access: Read/);
+  assert.deepEqual(wrongSandboxAndTools.missingCapabilities, ["sandbox", "tools"]);
+
+  // Claude missing permission mode and one tool.
+  const claudeMissingTool = assessCompatibility({ provider: "claude", available: true, permissionMode: "plan", tools: ["Read", "Grep"] });
+  assert.equal(claudeMissingTool.compatible, false);
+  assert.match(claudeMissingTool.reasons[0], /missing required tool access: Glob/);
+
+  // An unsupported provider is its own failure mode, with no capability list to check against.
+  const unsupported = assessCompatibility({ provider: "gemini", available: true });
+  assert.equal(unsupported.compatible, false);
+  assert.match(unsupported.reasons[0], /Unsupported provider: gemini/);
+  assert.deepEqual(unsupported.missingCapabilities, []);
+
+  // No provider at all names "(none)" rather than throwing.
+  assert.match(assessCompatibility({}).reasons[0], /Unsupported provider: \(none\)/);
+
+  // --- scanForNetworkCapability: direct primitives, every kind -------------
+  for (const [label, snippet] of [
+    ["fetch", "export function f() { return fetch('https://example.com'); }"],
+    ["XMLHttpRequest", "export function f() { return new XMLHttpRequest(); }"],
+    ["WebSocket", "export function f() { return new WebSocket('wss://example.com'); }"],
+    ["node:https", "import https from 'node:https';"],
+    ["node:http", "import http from 'node:http';"],
+    ["node:net", "import net from 'node:net';"],
+    ["node:dgram", "import dgram from 'node:dgram';"],
+    ["node:dns", "import dns from 'node:dns';"],
+    ["node:tls", "import tls from 'node:tls';"],
+  ]) {
+    const findings = scanForNetworkCapability([{ name: `${label}.mjs`, source: snippet }]);
+    assert.equal(findings.length, 1, `${label} was not detected: ${JSON.stringify(findings)}`);
+    assert.equal(findings[0].name, `${label}.mjs`);
+    assert.deepEqual(findings[0].via, [`${label}.mjs`]);
+  }
+  // A clean source produces no finding.
+  assert.deepEqual(scanForNetworkCapability([{ name: "clean.mjs", source: "export function add(a, b) { return a + b; }" }]), []);
+  // `node:fs` and `node:child_process` are Node-only, not network: not flagged.
+  assert.deepEqual(scanForNetworkCapability([{ name: "io.mjs", source: "import { readFile } from 'node:fs/promises';\nimport { spawn } from 'node:child_process';" }]), []);
+
+  // --- scanForNetworkCapability: through a sibling import closure ----------
+  const chainEntries = [
+    { name: "adapter.mjs", source: "import { helper } from \"./helper.mjs\";\nexport function run() { return helper(); }" },
+    { name: "helper.mjs", source: "import { deeper } from \"./deeper.mjs\";\nexport function helper() { return deeper(); }" },
+    { name: "deeper.mjs", source: "export function deeper() { return fetch('https://example.com'); }" },
+  ];
+  const chainLookup = new Map(chainEntries.map((entry) => [entry.name, entry.source]));
+  const chainFindings = scanForNetworkCapability([chainEntries[0]], { resolveImport: (name) => chainLookup.get(name) ?? null });
+  assert.equal(chainFindings.length, 1);
+  assert.equal(chainFindings[0].name, "adapter.mjs");
+  assert.deepEqual(chainFindings[0].via, ["adapter.mjs", "helper.mjs", "deeper.mjs"]);
+  assert.equal(chainFindings[0].primitive, "fetch");
+  // Without a resolver, only the entry's own direct source is checked —
+  // the transitive import is invisible, and that limit is structural, not a bug.
+  assert.deepEqual(scanForNetworkCapability([chainEntries[0]]), []);
+  // A cycle in the import graph must terminate rather than loop forever.
+  const cyclic = [
+    { name: "a.mjs", source: "import \"./b.mjs\";\nexport const a = 1;" },
+    { name: "b.mjs", source: "import \"./a.mjs\";\nexport const b = 1;" },
+  ];
+  const cyclicLookup = new Map(cyclic.map((entry) => [entry.name, entry.source]));
+  assert.deepEqual(scanForNetworkCapability([cyclic[0]], { resolveImport: (name) => cyclicLookup.get(name) ?? null }), []);
+
+  // --- proveOfflineMode: the sealed verdict, with its own stated limit -----
+  const safeVerdict = proveOfflineMode([{ name: "clean.mjs", source: "export const x = 1;" }]);
+  assert.equal(safeVerdict.offlineModeSafe, true);
+  assert.deepEqual(safeVerdict.findings, []);
+  assert.match(safeVerdict.caveat, /Cannot see a network call reached only through eval/);
+
+  const unsafeVerdict = proveOfflineMode([{ name: "leaky.mjs", source: "export function f() { return fetch('https://example.com'); }" }]);
+  assert.equal(unsafeVerdict.offlineModeSafe, false);
+  assert.equal(unsafeVerdict.findings.length, 1);
+  assert.equal(unsafeVerdict.findings[0].primitive, "fetch");
+  // The caveat is present on *every* verdict, safe or not — a verdict that
+  // dropped its own limit on the "good news" branch would be worse than one
+  // that never claimed the limit at all.
+  assert.equal(unsafeVerdict.caveat, safeVerdict.caveat);
+
+  // --- The real sweep: every file actually under electron/ is clean --------
+  const realFindings = await scanElectronDirectoryForNetworkCapability(path.resolve("electron"));
+  assert.deepEqual(realFindings, [], `the real electron/ tree is not offline-mode-safe:\n${realFindings.map((finding) => `${finding.via.join(" -> ")}: ${finding.primitive}`).join("\n")}`);
+  const realVerdict = proveOfflineMode(
+    await Promise.all(
+      (await readdir(path.resolve("electron")))
+        .filter((name) => name.endsWith(".mjs"))
+        .map(async (name) => ({ name, source: await readFile(path.join("electron", name), "utf8") })),
+    ),
+  );
+  assert.equal(realVerdict.offlineModeSafe, true, JSON.stringify(realVerdict.findings));
+
+  // The checker really would catch a violation: a copy of a real, clean file
+  // with one network primitive spliced in must be caught, proving the real
+  // sweep above passing is not because the checker cannot fail.
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-model-fingerprint-"));
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  const realHashingSource = await readFile(path.resolve("electron", "hashing.mjs"), "utf8");
+  await writeFile(path.join(workspace, "hashing.mjs"), `${realHashingSource}\nexport function callOut() { return fetch("https://example.com"); }\n`);
+  const injectedFindings = await scanElectronDirectoryForNetworkCapability(workspace);
+  assert.equal(injectedFindings.length, 1);
+  assert.equal(injectedFindings[0].name, "hashing.mjs");
+  assert.equal(injectedFindings[0].primitive, "fetch");
+
+  // --- NETWORK_PRIMITIVE_PATTERN is exported, matching the live test regex --
+  for (const [sample, expected] of [
+    ["fetch('x')", true],
+    ["new XMLHttpRequest()", true],
+    ["from 'node:https'", true],
+    ["from 'node:fs/promises'", false],
+    ["const fetched = 1;", false],
+  ]) {
+    assert.equal(NETWORK_PRIMITIVE_PATTERN.test(sample), expected, sample);
+  }
 });
