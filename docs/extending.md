@@ -134,6 +134,9 @@ artifact to another.
 - `update-manifest` — a release the updater may install.
 - `provenance` — an in-toto attestation binding artifacts to their materials.
 - `plugin` — a plugin manifest, which pins its entry file's digest.
+- `learning-effectiveness-bundle` — tasks, pre/post/delayed/transfer
+  effectiveness, calibration, and private telemetry, with a reproducibility
+  digest over content that carries no wall-clock field.
 
 Validity and trust are separate. An intact signature from an unknown key is
 `untrusted`, which is a warning for a course package and a **refusal** for

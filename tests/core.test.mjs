@@ -73,6 +73,7 @@ import { LADDERS, MAX_SERIES_PER_EVENT, MAX_TOTAL_SERIES, RETENTION_DAYS, TELEME
 import { forgetTelemetry, loadTelemetry, record, setTelemetryConsent, telemetryFileExists } from "../electron/telemetry-store.mjs";
 import { SCALE_TIERS, SCALE_TIERS_VERSION, TIER_BUDGETS, buildScaleFixture, describeTierScaling, evaluateTierMeasurement, measureTier, runTierSuite, tierBudgetIds, tierFor, tierIds } from "../electron/scale-tiers.mjs";
 import { MODEL_FINGERPRINT_VERSION, NETWORK_PRIMITIVE_PATTERN, REQUIRED_CAPABILITIES, assessCompatibility, fingerprintModel, proveOfflineMode, sameFingerprint, scanElectronDirectoryForNetworkCapability, scanForNetworkCapability } from "../electron/model-fingerprint.mjs";
+import { LEARNING_EFFECTIVENESS_BUNDLE_SUBJECT, LEARNING_EFFECTIVENESS_BUNDLE_VERSION, buildBundleContent, buildLearningEffectivenessBundle, bundleDigest, collectSampleSizes, renderLearningEffectivenessBundle, summarizeCalibration, summarizeTasks, verifyLearningEffectivenessBundle } from "../electron/learning-effectiveness-bundle.mjs";
 
 const execFileAsync = promisify(execFile);
 const round4 = (value) => Number(Number(value).toFixed(4));
@@ -8777,4 +8778,164 @@ test("local model/provider compatibility is fingerprinted, and offline mode is p
   ]) {
     assert.equal(NETWORK_PRIMITIVE_PATTERN.test(sample), expected, sample);
   }
+});
+
+test("learning-effectiveness bundle packages tasks, pre/post/delayed/transfer, calibration, telemetry, and a reproducible digest", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-effectiveness-bundle-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "app"), { recursive: true });
+  await writeFile(path.join(rootPath, "app", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "app", "queue.py"), "def enqueue(job):\n    return job\n");
+  await writeFile(path.join(rootPath, "app", "worker.py"), "from app.queue import enqueue\n\n\ndef work(job):\n    return enqueue(job)\n");
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const skillGraph = buildSkillGraph(repository, generateStarterCourse(repository));
+  assert.equal(LEARNING_EFFECTIVENESS_BUNDLE_VERSION, 1);
+  assert.equal(LEARNING_EFFECTIVENESS_BUNDLE_SUBJECT, "learning-effectiveness-bundle");
+
+  const base = Date.parse("2026-06-01T09:00:00.000Z");
+  const at = (minutes) => new Date(base + minutes * 60_000).toISOString();
+
+  // --- summarizeTasks: grouped by kind, each with its own sample size ------
+  const events = [
+    { at: at(0), kind: "prediction", path: "app/queue.py", correct: true },
+    { at: at(1), kind: "prediction", path: "app/queue.py", correct: true },
+    { at: at(2), kind: "prediction", path: "app/worker.py", correct: false },
+    { at: at(3), kind: "contrast", path: "app/worker.py", correct: true },
+    { at: at(4), kind: "review", correct: true, elapsedDays: 2, stability: 10 },
+    { at: at(5), kind: "review", correct: true, elapsedDays: 3, stability: 10 },
+    { at: at(6), kind: "review", correct: true, elapsedDays: 4, stability: 10 },
+    { at: at(1000), kind: "delayed-transfer", path: "app/worker.py", correct: true, elapsedDays: 5 },
+    { at: at(1001), kind: "delayed-transfer", path: "app/queue.py", correct: true, elapsedDays: 6 },
+    { at: at(1002), kind: "delayed-transfer", path: "app/other.py", correct: false, elapsedDays: 8 },
+  ];
+  const tasks = summarizeTasks(events);
+  assert.equal(tasks.totalTasks, events.length);
+  assert.deepEqual(tasks.kinds.map((kind) => kind.kind), ["contrast", "delayed-transfer", "prediction", "review"], "kinds are sorted and distinct");
+  const predictionKind = tasks.kinds.find((kind) => kind.kind === "prediction");
+  assert.equal(predictionKind.total, 3);
+  assert.equal(predictionKind.graded, 3);
+  assert.equal(predictionKind.accuracy, round4(2 / 3));
+  // A task with no graded entries reports a null accuracy rather than zero.
+  assert.deepEqual(summarizeTasks([{ at: at(0), kind: "navigate" }]).kinds[0], { kind: "navigate", total: 1, graded: 0, accuracy: null });
+  assert.deepEqual(summarizeTasks([]), { totalTasks: 0, kinds: [] });
+
+  // --- The learner state carries real evidence, so calibration is non-trivial
+  const learnerState = {
+    repositoryId: repository.id,
+    diagnosticCompleted: true,
+    mastery: Object.fromEntries(skillGraph.nodes.map((node, index) => [node.id, {
+      skillId: node.id,
+      mastery: 0.5,
+      confidence: 0.5,
+      status: index === 0 ? "active" : "available",
+      evidence: index === 0
+        ? [
+          { id: "e1", skillId: node.id, kind: "quiz", strength: 0.8, detail: "", createdAt: "" },
+          { id: "e2", skillId: node.id, kind: "practice", strength: 0.85, detail: "", createdAt: "" },
+          { id: "e3", skillId: node.id, kind: "review", strength: 0.9, detail: "", createdAt: "" },
+        ]
+        : [],
+    }])),
+    memory: [],
+    updatedAt: "",
+  };
+
+  // --- buildBundleContent: deterministic, no wall-clock field inside -------
+  const inputA = { events, learnerState, skillGraph, repository, studiedPaths: ["app/queue.py"], now: at(2000) };
+  const inputB = { events: [...events], learnerState: JSON.parse(JSON.stringify(learnerState)), skillGraph, repository, studiedPaths: ["app/queue.py"], now: at(3000) };
+  const contentA = buildBundleContent(inputA);
+  const contentB = buildBundleContent(inputB);
+  assert.deepEqual(contentA, contentB, "identical inputs (differing only in `now`, which is outside the digested content) must produce identical content");
+  assert.equal("generatedAt" in contentA, false, "the digested content must carry no wall-clock field");
+  assert.equal(bundleDigest(contentA), bundleDigest(contentB));
+
+  // A content-affecting change (a different event log) must change the digest.
+  const contentC = buildBundleContent({ ...inputA, events: events.slice(0, 3) });
+  assert.notEqual(bundleDigest(contentA), bundleDigest(contentC));
+
+  // --- The four required sections are present and are not re-derived -------
+  assert.equal(contentA.tasks.totalTasks, events.length);
+  assert.equal(contentA.effectiveness.retention.kind, "retention");
+  assert.equal(contentA.effectiveness.transfer.kind, "transfer");
+  assert.equal(contentA.effectiveness.delayedTransfer.kind, "delayed-transfer");
+  assert.equal(contentA.effectiveness.delayedTransfer.probes, 3);
+  assert.ok(contentA.calibration.assessed >= 1, "at least the one skill with evidence must be assessed");
+  assert.ok(contentA.calibration.perSkill.every((skill) => skill.interval[0] <= skill.mastery && skill.mastery <= skill.interval[1]));
+  assert.deepEqual(contentA.sampleSizes, collectSampleSizes(
+    { ...contentA.effectiveness, events: events.length },
+    contentA.calibration,
+  ));
+  // Telemetry defaults to not-included when no telemetry state is supplied.
+  assert.deepEqual(contentA.privateTelemetry, { included: false, export: null });
+
+  // --- Private telemetry: included only with consent, carried unmodified --
+  const consented = recordEvent(setTelemetryConsentPure(createTelemetryState(), true, new Date(at(0))), "exercise.graded", { dimensions: { kind: "quiz", outcome: "pass", hinted: "no" }, measures: { durationMs: 1200 } }, new Date(at(0)));
+  const withTelemetry = buildBundleContent({ ...inputA, telemetryState: consented.state });
+  assert.equal(withTelemetry.privateTelemetry.included, true);
+  assert.deepEqual(withTelemetry.privateTelemetry.export, exportTelemetry(consented.state, inputA.now));
+
+  const withdrawnState = setTelemetryConsentPure(consented.state, false, new Date(at(0)));
+  const withoutConsent = buildBundleContent({ ...inputA, telemetryState: withdrawnState });
+  assert.deepEqual(withoutConsent.privateTelemetry, { included: false, export: null });
+
+  // --- Signing and verification: reuses signPayload/verifyPayload exactly --
+  const keyPair = createKeyPair();
+  const bundle = buildLearningEffectivenessBundle({ ...inputA, keyPair });
+  assert.equal(bundle.version, LEARNING_EFFECTIVENESS_BUNDLE_VERSION);
+  assert.ok(bundle.digest);
+  assert.ok(bundle.generatedAt);
+  assert.equal(bundle.signature.subject, LEARNING_EFFECTIVENESS_BUNDLE_SUBJECT);
+  assert.ok(SIGNABLE_SUBJECTS.includes(LEARNING_EFFECTIVENESS_BUNDLE_SUBJECT));
+
+  const verified = verifyLearningEffectivenessBundle(bundle, { trustedKeyIds: [keyPair.keyId] });
+  assert.equal(verified.digestOk, true);
+  assert.equal(verified.reproducible, true);
+  assert.equal(verified.seal.verified, true);
+  assert.equal(verified.seal.trust, "trusted");
+  assert.equal(verified.verdict, "verified");
+
+  // Untrusted key: the signature is intact but the signer is not trusted here.
+  const untrusted = verifyLearningEffectivenessBundle(bundle, {});
+  assert.equal(untrusted.seal.verified, true);
+  assert.equal(untrusted.seal.trust, "untrusted");
+  assert.equal(untrusted.verdict, "untrusted-signer");
+
+  // A bundle built with no key pair is unsigned, not a thrown error.
+  const unsigned = buildLearningEffectivenessBundle(inputA);
+  assert.equal(unsigned.signature, null);
+  const unsignedVerdict = verifyLearningEffectivenessBundle(unsigned, {});
+  assert.equal(unsignedVerdict.digestOk, true);
+  assert.equal(unsignedVerdict.seal.verified, false);
+  assert.equal(unsignedVerdict.seal.reason, "not-signed");
+  assert.equal(unsignedVerdict.verdict, "unsigned-or-unverifiable");
+
+  // Tampering after signing breaks the digest, independent of the signature.
+  const tampered = { ...bundle, tasks: { ...bundle.tasks, totalTasks: bundle.tasks.totalTasks + 1 } };
+  const tamperedVerdict = verifyLearningEffectivenessBundle(tampered, { trustedKeyIds: [keyPair.keyId] });
+  assert.equal(tamperedVerdict.digestOk, false);
+  assert.equal(tamperedVerdict.verdict, "altered");
+
+  // --- Reproducibility across two independently built bundles --------------
+  const rebuilt = buildLearningEffectivenessBundle({ ...inputB, keyPair });
+  assert.equal(bundle.digest, rebuilt.digest, "two bundles from equivalent inputs must share a digest even though generatedAt differs");
+  assert.notEqual(bundle.generatedAt, rebuilt.generatedAt);
+
+  // --- An empty log still produces a bundle that explains itself -----------
+  const emptyBundle = buildLearningEffectivenessBundle({ events: [], learnerState: null, skillGraph, now: at(0) });
+  assert.equal(emptyBundle.tasks.totalTasks, 0);
+  assert.ok(emptyBundle.effectiveness.warnings.length > 0);
+  assert.equal(emptyBundle.calibration.assessed, 0);
+
+  // --- Rendering produces readable text that names the real numbers --------
+  const rendered = renderLearningEffectivenessBundle(bundle);
+  assert.match(rendered, /Learning-effectiveness bundle/);
+  assert.match(rendered, new RegExp(`Tasks: ${events.length} `));
+  assert.match(rendered, /Reproducibility digest:/);
+  assert.match(rendered, new RegExp(bundle.digest));
+
+  // --- summarizeCalibration with no diagnosis is the honest empty shape ----
+  assert.deepEqual(summarizeCalibration(null), { skills: 0, assessed: 0, meanConfidence: 0, meanBrier: null, overconfidentSkills: 0, underconfidentSkills: 0 });
 });
