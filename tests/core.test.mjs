@@ -45,6 +45,7 @@ import { ACTIVITY_VERSION, buildActivitySet, excerptFor, gradeContrast, gradePre
 import { EXPLANATION_GRADER_VERSION, buildExplanationTask, checkCitations, claimsFailure, gradeExplanation, mentionedSymbols, publicExplanationTask } from "../electron/explanation-grader.mjs";
 import { EXECUTABLE_QUIZ_VERSION, buildExecutableQuiz, candidateValues, gradeSubmission, parseSignature, probeArguments, publicQuiz, runInSandbox, screenSubmission, selfContainedFunctions } from "../electron/executable-quiz.mjs";
 import { DEFAULT_SCHEDULER, REVIEW_GRADE_IDS, SPACED_REPETITION_VERSION, applyReview, decayedMastery, forgettingCurve, gradeReview, intervalForRetention, retention, reviewPlan, scheduleSkill } from "../electron/spaced-repetition.mjs";
+import { FSRS_CALIBRATION_VERSION, reconcileInitialState, unifiedMasteryState } from "../electron/fsrs-calibration.mjs";
 import { EVALUATION_VERSION, evaluateLessons, evaluateRetrieval, evaluateTutorAnswer, runEvaluation } from "../electron/evaluation.mjs";
 import { EMBEDDING_DIMENSIONS, SEARCH_VERSION, buildSearchIndex, cosine, editDistance, embed, search, similarityScore, subsequenceScore, tokenize } from "../electron/search.mjs";
 import { EVIDENCE_VERSION, evidenceByPath, evidenceForSkills, importEvidence } from "../electron/evidence-import.mjs";
@@ -3218,6 +3219,160 @@ test("spaced repetition decays mastery and schedules reviews on the forgetting c
   await saveLearnerState(learningDirectory, { ...realReviewed.learnerState, repositoryId: repository.id });
   const reloaded = await loadLearnerState(learningDirectory, repository.id);
   assert.deepEqual(reloaded.mastery[realPlan.queue[0].skillId].review, realReviewed.learnerState.mastery[realPlan.queue[0].skillId].review);
+});
+
+test("FSRS-6 calibration reconciles noisy-OR/Beta-Bernoulli evidence into the review curve's first exposure, with explicit difficulty/stability/retrievability and no data loss across the migration", () => {
+  const now = "2026-06-01T00:00:00.000Z";
+
+  assert.equal(FSRS_CALIBRATION_VERSION, 1);
+
+  // reconcileInitialState is exported directly for callers (and other tests
+  // in this suite) that want the reconciled stability/difficulty without
+  // going through a full gradeReview call; gradeReview below is proven to
+  // delegate to this exact function, not a parallel reimplementation.
+  const directBaseline = { baselineStability: 1, baselineDifficulty: 2.2, difficultyFloor: DEFAULT_SCHEDULER.difficultyFloor, difficultyCeiling: DEFAULT_SCHEDULER.difficultyCeiling, minimumStabilityDays: DEFAULT_SCHEDULER.minimumStabilityDays, maximumStabilityDays: DEFAULT_SCHEDULER.maximumStabilityDays };
+  const directNone = reconcileInitialState({ skillId: "x", evidence: [] }, directBaseline);
+  assert.equal(directNone.source, "none");
+  assert.equal(directNone.stability, 1);
+  assert.equal(directNone.difficulty, 2.2);
+  const directReconciled = reconcileInitialState({ skillId: "x", evidence: [{ kind: "lesson", strength: 0.85, detail: "" }, { kind: "lesson", strength: 0.85, detail: "" }] }, directBaseline);
+  assert.equal(directReconciled.source, "reconciled");
+  assert.ok(directReconciled.stability > directBaseline.baselineStability);
+  assert.ok(directReconciled.difficulty < directBaseline.baselineDifficulty);
+
+  // --- The bug item 10's investigation found but did not fix --------------
+  // Three lesson-evidence items of strength 0.85 (the exact repro quoted in
+  // ideas/codebase-learning-studio/ITEMS.md's item-10 investigation) already
+  // calibrate to a high, fairly confident mastery via calibrateSkill.
+  const studiedMastery = {
+    skillId: "studied", mastery: 0, confidence: 0, status: "available",
+    evidence: [
+      { kind: "lesson", strength: 0.85, detail: "" },
+      { kind: "lesson", strength: 0.85, detail: "" },
+      { kind: "lesson", strength: 0.85, detail: "" },
+    ],
+  };
+  const neverStudiedMastery = { skillId: "fresh", mastery: 0, confidence: 0, status: "available", evidence: [] };
+
+  // Before this item: gradeReview's first-exposure branch ignores evidence
+  // entirely, so a thoroughly-studied skill and a never-opened one start
+  // their forgetting curve from the identical number on the identical grade.
+  const withoutReconciliation = {
+    studied: gradeReview(null, { grade: "good", now }),
+    fresh: gradeReview(null, { grade: "good", now }),
+  };
+  assert.equal(withoutReconciliation.studied.state.stability, withoutReconciliation.fresh.state.stability, "calling gradeReview with no priorMastery reproduces the pre-item-16 blindness");
+  assert.equal(withoutReconciliation.studied.reconciliation, undefined, "no priorMastery means no reconciliation field at all, not a null one");
+
+  // After this item: passing the accumulated evidence as `priorMastery`
+  // reconciles the starting point. The studied skill gets a longer first
+  // interval and an easier starting difficulty than the never-studied one on
+  // the same grade; the never-studied one is completely unaffected (its
+  // evidenceCount is 0, so reconcileInitialState returns the untouched
+  // baseline).
+  const studiedFirst = gradeReview(null, { grade: "good", now, priorMastery: studiedMastery });
+  const freshFirst = gradeReview(null, { grade: "good", now, priorMastery: neverStudiedMastery });
+  assert.ok(studiedFirst.state.stability > freshFirst.state.stability, `${studiedFirst.state.stability} > ${freshFirst.state.stability}`);
+  assert.ok(studiedFirst.state.difficulty < freshFirst.state.difficulty, `${studiedFirst.state.difficulty} < ${freshFirst.state.difficulty}`);
+  assert.equal(freshFirst.state.stability, withoutReconciliation.fresh.state.stability, "zero prior evidence reconciles to the exact unscaled baseline, not a different number");
+  assert.equal(freshFirst.reconciliation.source, "none");
+  assert.equal(freshFirst.reconciliation.priorMastery, null);
+  assert.equal(studiedFirst.reconciliation.source, "reconciled");
+  assert.ok(studiedFirst.reconciliation.priorMastery > 0.6, String(studiedFirst.reconciliation.priorMastery));
+  assert.ok(studiedFirst.reconciliation.priorConfidence > 0);
+  // Bounded: even maximal prior confidence/mastery cannot blow the stability
+  // ceiling or push difficulty below the floor.
+  const maximal = calibrateSkill({ skillId: "max", evidence: Array.from({ length: 40 }, () => ({ kind: "practice", strength: 1, detail: "" })) });
+  assert.ok(maximal.confidence > 0.9 && maximal.mastery > 0.95, JSON.stringify(maximal));
+  const maximalFirst = gradeReview(null, { grade: "easy", now, priorMastery: { skillId: "max", evidence: Array.from({ length: 40 }, () => ({ kind: "practice", strength: 1, detail: "" })) } });
+  assert.ok(maximalFirst.state.stability <= DEFAULT_SCHEDULER.maximumStabilityDays);
+  assert.ok(maximalFirst.state.difficulty >= DEFAULT_SCHEDULER.difficultyFloor);
+
+  // Reconciliation only ever applies to the *first* review: a skill already in
+  // the review cycle takes `priorMastery` with no effect, because the
+  // non-first-exposure branches of gradeReview never read it.
+  const secondReviewWithPrior = gradeReview(
+    { stability: 10, difficulty: 2.2, reviews: 1, lapses: 0, lastReviewedAt: now, lastGrade: "good" },
+    { grade: "good", elapsedDays: 10, now, priorMastery: studiedMastery },
+  );
+  const secondReviewWithoutPrior = gradeReview(
+    { stability: 10, difficulty: 2.2, reviews: 1, lapses: 0, lastReviewedAt: now, lastGrade: "good" },
+    { grade: "good", elapsedDays: 10, now },
+  );
+  assert.deepEqual(secondReviewWithPrior.state, secondReviewWithoutPrior.state, "priorMastery is a first-exposure-only input");
+  assert.equal(secondReviewWithPrior.reconciliation, undefined);
+
+  // --- The migration path: applyReview is where a pre-item-16 learner-state
+  // record (evidence accumulated by addEvidence/calibrateSkill, no `review`
+  // field yet) crosses into FSRS semantics for the first time -----------------
+  const graph = {
+    id: "g", repositoryId: "r", diagnostic: [],
+    nodes: [{ id: "skill-studied", title: "Studied", prerequisites: [], anchors: [], importance: 50, sourceFingerprint: "fp" }],
+  };
+  const legacyState = {
+    repositoryId: "r", diagnosticCompleted: true, memory: [{ id: "m1", text: "a note", source: "learner", createdAt: now }], updatedAt: now,
+    mastery: {
+      "skill-studied": {
+        skillId: "skill-studied", mastery: 0.6909, confidence: 0.3011, status: "active", sourceFingerprint: "fp",
+        evidence: [
+          { id: "e1", skillId: "skill-studied", kind: "lesson", strength: 0.85, detail: "read", createdAt: now },
+          { id: "e2", skillId: "skill-studied", kind: "lesson", strength: 0.85, detail: "read again", createdAt: now },
+          { id: "e3", skillId: "skill-studied", kind: "lesson", strength: 0.85, detail: "read a third time", createdAt: now },
+        ],
+        // Deliberately no `review` field: this is a record written entirely by
+        // the pre-item-16 noisy-OR/calibration path, exactly what a learner who
+        // never clicked "review" would have on disk.
+      },
+    },
+  };
+  const migrated = applyReview(legacyState, graph, { skillId: "skill-studied", grade: "good", now });
+  // Its first review used the accumulated evidence, not a blind baseline.
+  assert.ok(migrated.learnerState.mastery["skill-studied"].review.stability > freshFirst.state.stability, "the migrated skill's first interval benefits from its pre-item-16 evidence");
+  assert.equal(migrated.review.reconciliation.source, "reconciled");
+  // Nothing else about the record was touched: all three lesson evidence
+  // items survive, plus the one newly appended review event -- no data loss.
+  const migratedEvidence = migrated.learnerState.mastery["skill-studied"].evidence;
+  assert.equal(migratedEvidence.length, 4);
+  for (const id of ["e1", "e2", "e3"]) assert.ok(migratedEvidence.some((item) => item.id === id), `${id} was lost in the migration`);
+  assert.equal(migratedEvidence.at(-1).kind, "review");
+  assert.deepEqual(migrated.learnerState.memory, legacyState.memory, "unrelated learner-state fields are untouched by the migration");
+  assert.equal(migrated.learnerState.diagnosticCompleted, true);
+
+  // --- unifiedMasteryState: one explicit snapshot regardless of which system
+  // last wrote the record --------------------------------------------------
+  // 1. A skill now owned by the reviewer (post-migration) reads back exactly
+  //    the reviewer's own numbers, with retrievability computed the same way
+  //    scheduleSkill's own math does.
+  const reviewedSnapshot = unifiedMasteryState(migrated.learnerState.mastery["skill-studied"], { now });
+  assert.equal(reviewedSnapshot.source, "review");
+  assert.equal(reviewedSnapshot.difficulty, migrated.learnerState.mastery["skill-studied"].review.difficulty);
+  assert.equal(reviewedSnapshot.stability, migrated.learnerState.mastery["skill-studied"].review.stability);
+  assert.equal(reviewedSnapshot.retrievability, 1, "queried at the moment of the review itself, retrievability is 1");
+  const laterSnapshot = unifiedMasteryState(migrated.learnerState.mastery["skill-studied"], { now: new Date(Date.parse(now) + migrated.learnerState.mastery["skill-studied"].review.stability * 86_400_000).toISOString() });
+  assert.equal(round4(laterSnapshot.retrievability), DEFAULT_SCHEDULER.targetRetention, "at exactly one stability period later, retrievability equals the target");
+
+  // 2. A skill with calibration evidence but not yet reviewed: an explicit
+  //    difficulty/retrievability derived from calibrateSkill's own numbers,
+  //    no stability yet because there is no curve to report one from.
+  const calibratedOnlySnapshot = unifiedMasteryState(studiedMastery, { now });
+  assert.equal(calibratedOnlySnapshot.source, "calibration");
+  assert.equal(calibratedOnlySnapshot.stability, null, "no review curve exists yet, so no stability is fabricated");
+  assert.ok(calibratedOnlySnapshot.retrievability > 0.6 && calibratedOnlySnapshot.retrievability <= 1);
+  assert.ok(calibratedOnlySnapshot.difficulty >= DEFAULT_SCHEDULER.difficultyFloor && calibratedOnlySnapshot.difficulty <= DEFAULT_SCHEDULER.difficultyCeiling);
+
+  // 3. A truly untouched skill: every field is honestly null, not zero.
+  const untouchedSnapshot = unifiedMasteryState(neverStudiedMastery, { now });
+  assert.equal(untouchedSnapshot.source, "none");
+  assert.equal(untouchedSnapshot.difficulty, null);
+  assert.equal(untouchedSnapshot.stability, null);
+  assert.equal(untouchedSnapshot.retrievability, null);
+  assert.equal(unifiedMasteryState(null, { now }).source, "none");
+
+  // Deterministic: the same record snapshotted twice at the same instant
+  // produces byte-identical output (no hidden randomness or clock read
+  // beyond the explicit `now`).
+  assert.deepEqual(unifiedMasteryState(studiedMastery, { now }), unifiedMasteryState(studiedMastery, { now }));
+  assert.deepEqual(unifiedMasteryState(migrated.learnerState.mastery["skill-studied"], { now }), reviewedSnapshot);
 });
 
 test("executable quizzes hide their oracle and run inside a bounded sandbox", async (context) => {

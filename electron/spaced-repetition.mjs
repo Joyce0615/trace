@@ -57,6 +57,8 @@ export const REVIEW_GRADES = {
 
 export const REVIEW_GRADE_IDS = Object.keys(REVIEW_GRADES);
 
+import { reconcileInitialState } from "./fsrs-calibration.mjs";
+
 const DAY_MS = 86_400_000;
 
 function clamp(value, low, high) {
@@ -132,6 +134,19 @@ export function reviewStateOf(mastery, options = {}) {
  * after learning it barely extends the interval while recalling it when it had
  * nearly faded extends it a lot. That is the spacing effect, and without it a
  * scheduler just rewards clicking.
+ *
+ * `request.priorMastery` (item 16) is the optional `SkillMastery` record a
+ * skill accumulated via lessons/quizzes/practice/self-reports *before* ever
+ * entering the review cycle. When this is the skill's first review
+ * (`previous.reviews === 0`) and that evidence exists,
+ * `fsrs-calibration.mjs`'s `reconcileInitialState` scales the grade-only
+ * starting stability/difficulty by what that evidence already calibrated —
+ * so a skill read ten times and quizzed three times does not start its
+ * forgetting curve from the same point as a skill never seen before, which
+ * is what every call site did before this item. With no `priorMastery` (every
+ * existing call site that does not pass it) or no evidence on it, the
+ * reconciliation returns the exact unscaled baseline, so this is additive,
+ * not a behavior change for any caller that does not opt in.
  */
 export function gradeReview(state, request = {}) {
   const parameters = withDefaults(request.parameters);
@@ -145,12 +160,29 @@ export function gradeReview(state, request = {}) {
       ? Math.max(0, (nowTime - toTime(previous.lastReviewedAt, nowTime)) / DAY_MS)
       : 0;
   const retrievability = previous.reviews > 0 ? retention(elapsedDays, previous.stability, parameters) : null;
-  const difficulty = clamp(previous.difficulty + grade.difficultyDelta, parameters.difficultyFloor, parameters.difficultyCeiling);
+  const difficultyFromGrade = clamp(previous.difficulty + grade.difficultyDelta, parameters.difficultyFloor, parameters.difficultyCeiling);
 
   let stability;
+  let difficulty = difficultyFromGrade;
+  let reconciliation = null;
   if (previous.reviews === 0) {
-    // First exposure: the grade itself sets the starting interval.
-    stability = grade.firstStabilityDays * (parameters.initialStabilityDays / DEFAULT_SCHEDULER.initialStabilityDays);
+    // First exposure: the grade itself sets the starting interval, reconciled
+    // against any prior non-review evidence for this skill (item 16).
+    const baselineStability = grade.firstStabilityDays * (parameters.initialStabilityDays / DEFAULT_SCHEDULER.initialStabilityDays);
+    if (request.priorMastery) {
+      reconciliation = reconcileInitialState(request.priorMastery, {
+        baselineStability,
+        baselineDifficulty: difficultyFromGrade,
+        difficultyFloor: parameters.difficultyFloor,
+        difficultyCeiling: parameters.difficultyCeiling,
+        minimumStabilityDays: parameters.minimumStabilityDays,
+        maximumStabilityDays: parameters.maximumStabilityDays,
+      });
+      stability = reconciliation.stability;
+      difficulty = reconciliation.difficulty;
+    } else {
+      stability = baselineStability;
+    }
   } else if (!grade.recalled) {
     // A lapse costs interval but keeps a relearning head start; repeated lapses cost more.
     stability = previous.stability * parameters.lapseStabilityFactor * 0.9 ** previous.lapses;
@@ -179,6 +211,10 @@ export function gradeReview(state, request = {}) {
     state: nextState,
     intervalDays: round(stability),
     dueAt: new Date(nowTime + stability * DAY_MS).toISOString(),
+    // Present only on a first exposure that supplied `priorMastery`; absent
+    // (not merely `null`) in every other case so existing callers that never
+    // destructure it see no shape change at all.
+    ...(reconciliation ? { reconciliation } : {}),
   };
 }
 
@@ -415,7 +451,7 @@ export function applyReview(learnerState, skillGraph, request = {}) {
   const startingState = sourceChanged
     ? { ...reviewStateOf(previous, parameters), reviews: 0, stability: parameters.minimumStabilityDays }
     : reviewStateOf(previous, parameters);
-  const graded = gradeReview(startingState, { grade: request.grade, now, parameters });
+  const graded = gradeReview(startingState, { grade: request.grade, now, parameters, priorMastery: sourceChanged ? null : previous });
 
   const recorded = clamp(Number(previous.mastery) || 0, 0, 1);
   const nextMastery = clamp(recorded + (graded.strength - recorded) * parameters.masteryLearningRate, 0, 1);
