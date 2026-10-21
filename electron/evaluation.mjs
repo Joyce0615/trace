@@ -28,8 +28,14 @@ function round(value, digits = 4) {
   return Number.isFinite(value) ? Number(value.toFixed(digits)) : 0;
 }
 
-/** Deterministic sample: every run over the same index evaluates the same cases. */
-function sampleSymbols(repository, size) {
+/**
+ * Deterministic sample: every run over the same index evaluates the same
+ * cases. Exported so a caller needing the identical gold-symbol sample
+ * (e.g. a RAG evaluation suite comparing model families on exactly the
+ * same questions `evaluateRetrieval` itself scores) can reuse it rather
+ * than reimplementing the same stride-sampling rule with a chance to drift.
+ */
+export function sampleSymbols(repository, size) {
   const candidates = (repository.symbols ?? [])
     .filter((symbol) => symbol.name.length >= 4 && /^[A-Za-z_]\w+$/.test(symbol.name))
     .filter((symbol, index, all) => all.findIndex((other) => other.name === symbol.name) === index);

@@ -55,10 +55,11 @@ import { RACE_GRADER_VERSION, buildRaceTask, gradeRaceSubmission, publicRaceTask
 import { LOCALIZATION_VERSION, buildLocalizationExercise, nextHint, publicLocalizationExercise, scoreLocalization } from "../electron/localization.mjs";
 import { CALL_CHAIN_VERSION, buildCallChainExercises, buildCallChains, extractReturnExpressions, gradeCallChainAnswer, publicExercise, symbolBodyRange } from "../electron/call-chain.mjs";
 import { detectLanguageServers, resolveImportsStatically, resolveSymbol, serverForLanguage, shutdownLanguageServers } from "../electron/language-server.mjs";
-import { answerFromLocalIndex, buildContextPack, loadCachedResponse, saveCachedResponse } from "../electron/context-engine.mjs";
+import { answerFromLocalIndex, buildContextPack, CONTEXT_PACK_BUDGETS, loadCachedResponse, saveCachedResponse } from "../electron/context-engine.mjs";
 import { buildSkillGraph, createLearnerState, reconcileLearnerState } from "../electron/skill-graph.mjs";
 import { CHANGE_IMPACT_VERSION, analyzeChangeImpact, changedSymbols, isTestPath, renderChangeImpact, tracedCallers, tracedLessons, tracedMasteryEvidence, tracedNotes, tracedQuizzes, tracedTests } from "../electron/change-impact.mjs";
 import { RETRIEVAL_COUNTERFACTUAL_VERSION, evaluateRetrievalCounterfactual, renderRetrievalCounterfactual } from "../electron/retrieval-counterfactual.mjs";
+import { RAG_EVAL_VERSION, estimateCostUsd, evaluateRagQuestion, renderRagEvaluationSuite, runRagEvaluationSuite, verifyFixedIngestionSnapshot } from "../electron/rag-eval.mjs";
 import { DEFAULT_MIN_TRANSFER_DELAY_DAYS, DEFAULT_TRANSFER_PROBE_DEPTH, TRANSFER_PROBE_VERSION, elapsedSinceStudy, planDelayedTransferProbe, unseenRelatedFiles } from "../electron/transfer-probe.mjs";
 import { DELAYED_TRANSFER_BUCKETS, delayedTransferAnalytics } from "../electron/analytics.mjs";
 import { loadLearnerState, loadLearnerStateReport, saveLearnerState } from "../electron/learning-store.mjs";
@@ -8418,6 +8419,139 @@ test("retrieval counterfactual evaluation compares lexical/symbol/graph/embeddin
   const rendered = renderRetrievalCounterfactual(report);
   assert.ok(rendered.includes("fused"));
   assert.ok(rendered.includes("Grounding lift"));
+});
+
+test("a local code-RAG evaluation suite benchmarks model families, context budgets, grounding, latency, and cost over one fixed ingestion snapshot", async (context) => {
+  assert.equal(RAG_EVAL_VERSION, 1);
+
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-rag-eval-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "engine"), { recursive: true });
+  await writeFile(path.join(rootPath, "engine", "__init__.py"), "");
+  await writeFile(
+    path.join(rootPath, "engine", "planner.py"),
+    "def plan_batch(requests):\n    return sorted(requests)\n",
+  );
+  await writeFile(path.join(rootPath, "README.md"), "# Planner\n\nBatches requests before execution.\n");
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const index = await buildSearchIndex(repository, { read: (filePath) => readFile(path.join(rootPath, filePath), "utf8") });
+
+  // --- The fixed-snapshot guard: a mismatched index/repository pairing must
+  // refuse to run rather than silently benchmark incomparable configurations.
+  const staleIndex = { ...index, sourceVersion: "not-the-real-version" };
+  await assert.rejects(
+    () => runRagEvaluationSuite({ index: staleIndex, repository, questions: [], providers: [], modes: ["lean"] }),
+    /Fixed ingestion snapshot required/,
+  );
+  assert.equal(verifyFixedIngestionSnapshot(index, repository).valid, true);
+  assert.equal(verifyFixedIngestionSnapshot(staleIndex, repository).valid, false);
+  assert.equal(verifyFixedIngestionSnapshot({}, {}).valid, false);
+
+  const questionCase = {
+    id: "q1",
+    question: "Where is plan_batch defined?",
+    scope: { selection: false, currentFile: false, lesson: true, dependencies: false },
+    lesson: { id: "planner", title: "Planner", objective: "Trace planning", summary: "", anchors: [{ path: "engine/planner.py", line: 1, symbol: "plan_batch" }] },
+    openFile: null,
+    memory: [],
+  };
+
+  const groundedProvider = {
+    id: "codex-grounded",
+    family: "codex",
+    answer: async ({ question }) => ({ text: `${question} It is defined at engine/planner.py:1.`, tookMs: 120 }),
+  };
+  const ungroundedProvider = {
+    id: "claude-vague",
+    family: "claude",
+    answer: async () => ({ text: "It is defined somewhere in the engine module, probably.", tookMs: 340 }),
+  };
+  const localIndexProvider = {
+    id: "local-index",
+    family: "local-index",
+    answer: () => ({ text: "plan_batch is defined at engine/planner.py:1." }),
+  };
+
+  // --- One question, one provider, one budget: the unit the suite composes ---
+  const singleCase = await evaluateRagQuestion({ repository, provider: groundedProvider, mode: "lean", questionCase });
+  assert.equal(singleCase.questionId, "q1");
+  assert.equal(singleCase.family, "codex");
+  assert.equal(singleCase.mode, "lean");
+  assert.ok(singleCase.contextTokens > 0);
+  assert.ok(singleCase.grounding.citations >= 1, JSON.stringify(singleCase.grounding));
+  assert.equal(singleCase.tookMs, 120, "a provider-reported tookMs is used verbatim rather than re-measured");
+  // codex has no entry in DEFAULT_COST_CATALOG: unknown, not a fabricated zero.
+  assert.equal(singleCase.costUsd, null);
+
+  // The free, no-model local-index path is priced at a true zero, not unknown.
+  const localCase = await evaluateRagQuestion({ repository, provider: localIndexProvider, mode: "lean", questionCase });
+  assert.equal(localCase.costUsd, 0);
+
+  // estimateCostUsd itself: unknown family -> null; a caller-supplied catalog entry prices it.
+  assert.equal(estimateCostUsd("codex", 1000, 200), null);
+  const customCatalog = { codex: { context: 0.01, completion: 0.03 } };
+  assert.equal(estimateCostUsd("codex", 1000, 1000, customCatalog), 0.01 + 0.03);
+  assert.equal(estimateCostUsd("codex", 0, 0, customCatalog), 0);
+
+  // --- The full suite: two providers x two budgets x one question ---------
+  const suite = await runRagEvaluationSuite({
+    index,
+    repository,
+    questions: [questionCase],
+    providers: [groundedProvider, ungroundedProvider],
+    modes: ["lean", "balanced"],
+  });
+  assert.equal(suite.kind, "rag-eval");
+  assert.equal(suite.ingestionSnapshot.repositoryId, repository.id);
+  assert.equal(suite.ingestionSnapshot.versionId, repository.versionId);
+  assert.equal(suite.cases.length, 4, "2 providers x 2 modes x 1 question");
+  assert.equal(suite.summary.length, 4, "grouped by family x mode, one row per combination here");
+
+  // Every summary row carries the full named metric set the backlog item asks for.
+  for (const row of suite.summary) {
+    for (const field of ["family", "mode", "questions", "averageGrounding", "latency", "totalCostUsd"]) {
+      assert.ok(field in row, `${row.family}/${row.mode} is missing ${field}`);
+    }
+  }
+
+  // Grounding actually distinguishes the two providers: the grounded answer
+  // must score strictly higher than the vague, uncited one at the same budget.
+  const codexLean = suite.summary.find((row) => row.family === "codex" && row.mode === "lean");
+  const claudeLean = suite.summary.find((row) => row.family === "claude" && row.mode === "lean");
+  assert.ok(codexLean.averageGrounding > claudeLean.averageGrounding, JSON.stringify([codexLean, claudeLean]));
+
+  // Latency is a real percentile summary (performance.mjs's own `summarize`),
+  // not a bare average, and is correctly marked unreliable with one sample.
+  assert.equal(codexLean.latency.count, 1);
+  assert.equal(codexLean.latency.reliable, false);
+
+  // No real pricing was supplied for codex/claude: every cost in this run is
+  // honestly unknown, never a fabricated number.
+  assert.equal(codexLean.totalCostUsd, null);
+  assert.equal(codexLean.costUnknownCount, 1);
+
+  // Modes defaults to exactly the three context-pack budgets this
+  // application actually enforces, reused rather than re-declared.
+  const defaultModeSuite = await runRagEvaluationSuite({ index, repository, questions: [questionCase], providers: [localIndexProvider] });
+  assert.deepEqual(defaultModeSuite.modes.sort(), Object.keys(CONTEXT_PACK_BUDGETS).sort());
+
+  // The retrieval-strategy comparison is the real retrieval-counterfactual
+  // module, not a reimplementation — same shape, same strategy names.
+  assert.deepEqual(suite.retrieval.strategies.map((entry) => entry.name), ["lexical", "symbol", "graph", "embedding", "fused"]);
+
+  // Deterministic: an empty question set still produces a valid, empty-cased suite.
+  const emptySuite = await runRagEvaluationSuite({ index, repository, questions: [], providers: [groundedProvider], modes: ["lean"] });
+  assert.equal(emptySuite.cases.length, 0);
+  assert.equal(emptySuite.summary.length, 0);
+
+  const rendered = renderRagEvaluationSuite(suite);
+  assert.ok(rendered.includes("codex"));
+  assert.ok(rendered.includes("claude"));
+  assert.ok(rendered.includes("Retrieval strategies"));
+  assert.ok(rendered.includes("unknown"), "an unpriced family's cost column must say unknown, not $0");
 });
 
 test("delayed transfer probes plan against unseen graph-related code only after a real delay, and are measured separately from near/far transfer", () => {

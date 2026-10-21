@@ -5,7 +5,14 @@ import { readRepositoryFile } from "./repository.mjs";
 import { detectInjection } from "./prompt-isolation.mjs";
 import { redactValue, scanContextPack, summarizeFindings } from "./secret-scanner.mjs";
 
-const BUDGETS = { lean: 2_400, balanced: 5_200, deep: 10_000 };
+const CONTEXT_BUDGETS = { lean: 2_400, balanced: 5_200, deep: 10_000 };
+// Exported read-only so other modules (e.g. a RAG evaluation suite comparing
+// context budgets) can name the same three budgets this module actually
+// enforces, rather than re-declaring their own copy that could silently drift.
+// Named distinctly from `performance.mjs`'s own `BUDGETS` export (a different
+// concept: per-repository performance ceilings, not context-token budgets) so
+// the two never collide under a single default import alias.
+export const CONTEXT_PACK_BUDGETS = Object.freeze({ ...CONTEXT_BUDGETS });
 const excerptCache = new Map();
 
 export function estimateTokens(value) {
@@ -71,8 +78,8 @@ export function answerFromLocalIndex(repository, question) {
 }
 
 export async function buildContextPack(repository, context) {
-  const mode = BUDGETS[context.mode] ? context.mode : "balanced";
-  const budget = BUDGETS[mode];
+  const mode = CONTEXT_BUDGETS[context.mode] ? context.mode : "balanced";
+  const budget = CONTEXT_BUDGETS[mode];
   const intent = classifyIntent(context.question);
   const candidates = [];
   candidates.push(section("instruction", "Tutor contract", "Keeps the answer source-grounded and read-only.", "Teach the learner in concise English. Cite repository-relative source locations. End with one concrete next observation. Never modify files.", 100));
