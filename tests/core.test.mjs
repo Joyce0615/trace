@@ -47,6 +47,7 @@ import { EXECUTABLE_QUIZ_VERSION, buildExecutableQuiz, candidateValues, gradeSub
 import { DEFAULT_SCHEDULER, REVIEW_GRADE_IDS, SPACED_REPETITION_VERSION, applyReview, decayedMastery, forgettingCurve, gradeReview, intervalForRetention, retention, reviewPlan, scheduleSkill } from "../electron/spaced-repetition.mjs";
 import { FSRS_CALIBRATION_VERSION, reconcileInitialState, unifiedMasteryState } from "../electron/fsrs-calibration.mjs";
 import { EVALUATION_VERSION, evaluateLessons, evaluateRetrieval, evaluateTutorAnswer, runEvaluation } from "../electron/evaluation.mjs";
+import { FAITHFULNESS_GUARD_VERSION, Verdict, extractCallClaims, verifyAnchorClaim, verifyAnswerFaithfulness, verifyCallClaim, verifyCitationClaim, verifyCourseFaithfulness, verifyHintFaithfulness, verifyLessonFaithfulness, verifyQuizFaithfulness, verifyVersionPin } from "../electron/faithfulness-guard.mjs";
 import { EMBEDDING_DIMENSIONS, SEARCH_VERSION, buildSearchIndex, cosine, editDistance, embed, search, similarityScore, subsequenceScore, tokenize } from "../electron/search.mjs";
 import { EVIDENCE_VERSION, evidenceByPath, evidenceForSkills, importEvidence } from "../electron/evidence-import.mjs";
 import { ARCHITECTURE_VERSION, architectureDiagramBlock, buildArchitecture, dataFlow, moduleFor, symbolNeighborhood } from "../electron/architecture.mjs";
@@ -9371,4 +9372,174 @@ test("adversarial offline/privacy verification proves no network at runtime, fin
     dynamicVerdict: { offlineAtRuntime: true },
   };
   assert.equal(disagreeing.staticOfflineModeSafe === disagreeing.dynamicVerdict.offlineAtRuntime, false, "sanity: the two halves can structurally disagree");
+});
+
+test("explanation-to-source faithfulness checks verify lesson, hint, quiz, and answer claims against exact symbols/edges/versions and abstain on insufficient evidence", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-faithfulness-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "engine"), { recursive: true });
+  await writeFile(path.join(rootPath, "engine", "__init__.py"), "");
+  await writeFile(
+    path.join(rootPath, "engine", "planner.py"),
+    "def plan_batch(requests):\n    return sorted(requests)\n\n\ndef estimate_cost(plan):\n    return len(plan)\n",
+  );
+  await writeFile(
+    path.join(rootPath, "engine", "executor.py"),
+    "from engine.planner import plan_batch\n\n\ndef execute_plan(requests):\n    return plan_batch(requests)\n",
+  );
+  await writeFile(path.join(rootPath, "README.md"), "# Planner\n\nBatches requests before execution.\n");
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const realDefinitionLine = repository.symbols.find((symbol) => symbol.name === "plan_batch" && symbol.path === "engine/planner.py").line;
+  const realEdge = repository.callEdges.find((edge) => edge.caller === "execute_plan" && edge.callee === "plan_batch");
+  assert.ok(realEdge?.resolved, "fixture must produce a real resolved call edge to check against");
+
+  assert.equal(FAITHFULNESS_GUARD_VERSION, 1);
+  assert.deepEqual(Object.values(Verdict).sort(), ["abstain", "faithful", "unfaithful"]);
+
+  // --- verifyAnchorClaim: the gap evaluateLessons' name-only symbolAccuracy
+  // misses — a real symbol name at the WRONG line in the same file. ---------
+  const exactAnchor = verifyAnchorClaim({ path: "engine/planner.py", line: realDefinitionLine, symbol: "plan_batch" }, repository);
+  assert.equal(exactAnchor.status, Verdict.FAITHFUL);
+  const staleLineAnchor = verifyAnchorClaim({ path: "engine/planner.py", line: realDefinitionLine + 50, symbol: "plan_batch" }, repository);
+  assert.equal(staleLineAnchor.status, Verdict.UNFAITHFUL);
+  assert.equal(staleLineAnchor.evidence.actualLine, realDefinitionLine);
+  // The same mismatch would score symbolAccuracy: 1 under evaluateLessons'
+  // name-only check, which is exactly the gap this module closes.
+  const nameOnlyCourse = {
+    sourceVersion: repository.versionId,
+    modules: [{ lessons: [{ id: "stale", anchors: [{ path: "engine/planner.py", line: realDefinitionLine + 50, symbol: "plan_batch" }], quiz: { question: "A real question about this code in detail?", hint: "" }, content: [] }] }],
+  };
+  assert.equal(evaluateLessons(nameOnlyCourse, repository, null).symbolAccuracy, 1, "sanity: evaluateLessons really does miss this");
+  // A symbol real elsewhere but not in the claimed file is distinguished from
+  // an entirely unknown symbol.
+  const wrongFileAnchor = verifyAnchorClaim({ path: "engine/executor.py", line: 1, symbol: "plan_batch" }, repository);
+  assert.equal(wrongFileAnchor.status, Verdict.UNFAITHFUL);
+  assert.deepEqual(wrongFileAnchor.evidence.actualPaths, ["engine/planner.py"]);
+  const unknownSymbolAnchor = verifyAnchorClaim({ path: "engine/planner.py", line: 1, symbol: "totally_invented" }, repository);
+  assert.equal(unknownSymbolAnchor.status, Verdict.UNFAITHFUL);
+  assert.equal("actualPaths" in unknownSymbolAnchor.evidence, false);
+  // A file-only anchor (no symbol claimed) is faithful once the file is real.
+  assert.equal(verifyAnchorClaim({ path: "README.md", line: 1, symbol: null }, repository).status, Verdict.FAITHFUL);
+  assert.equal(verifyAnchorClaim({ path: "NOPE.md", line: 1, symbol: null }, repository).status, Verdict.UNFAITHFUL);
+  assert.equal(verifyAnchorClaim({ path: null }, repository).status, Verdict.ABSTAIN);
+
+  // --- verifyCitationClaim: path:line prose citations ----------------------
+  const lineCounts = { "engine/planner.py": 6 };
+  assert.equal(verifyCitationClaim({ path: "engine/planner.py", line: 1 }, repository, lineCounts).status, Verdict.FAITHFUL);
+  assert.equal(verifyCitationClaim({ path: "engine/planner.py", line: 900 }, repository, lineCounts).status, Verdict.UNFAITHFUL);
+  assert.equal(verifyCitationClaim({ path: "engine/nowhere.py", line: 1 }, repository, lineCounts).status, Verdict.UNFAITHFUL);
+  // A real file with no supplied line count cannot be checked, honestly.
+  assert.equal(verifyCitationClaim({ path: "engine/executor.py", line: 1 }, repository, lineCounts).status, Verdict.ABSTAIN);
+
+  // --- verifyCallClaim: the gap evaluateTutorAnswer misses — a fabricated
+  // relational claim between two individually-real symbol names. -----------
+  const realCall = verifyCallClaim({ caller: "execute_plan", callee: "plan_batch" }, repository);
+  assert.equal(realCall.status, Verdict.FAITHFUL);
+  assert.equal(realCall.evidence.targetPath, "engine/planner.py");
+  const fabricatedCall = verifyCallClaim({ caller: "execute_plan", callee: "estimate_cost" }, repository);
+  assert.equal(fabricatedCall.status, Verdict.UNFAITHFUL);
+  assert.deepEqual(fabricatedCall.evidence.actualCallees, ["plan_batch"]);
+  // The same fabricated claim would score grounding: 1 under
+  // evaluateTutorAnswer, which only checks the two symbol names individually.
+  const fabricatedAnswer = evaluateTutorAnswer(
+    { text: `\`execute_plan\` calls \`estimate_cost\` at engine/executor.py:${realDefinitionLine}.` },
+    repository,
+  );
+  assert.equal(fabricatedAnswer.grounding, 1, "sanity: evaluateTutorAnswer really does miss this");
+  assert.equal(fabricatedAnswer.verdict, "grounded");
+  // A symbol this index never recorded any outgoing edge from at all (as
+  // opposed to one whose only recorded edges are to a different callee):
+  // abstain, not a manufactured negative.
+  const noOutgoing = verifyCallClaim({ caller: "a_name_this_index_never_saw_call_anything", callee: "plan_batch" }, repository);
+  assert.equal(noOutgoing.status, Verdict.ABSTAIN);
+  // A repository with no structural evidence at all (regex-fallback shape).
+  const noEvidenceRepo = { versionId: "v1", files: [{ path: "a.ps1" }], symbols: [{ path: "a.ps1", name: "DoThing", line: 1 }], callEdges: [], imports: [] };
+  assert.equal(verifyCallClaim({ caller: "DoThing", callee: "OtherThing" }, noEvidenceRepo).status, Verdict.ABSTAIN);
+  assert.equal(verifyCallClaim({ caller: null, callee: "x" }, repository).status, Verdict.ABSTAIN);
+
+  // --- verifyVersionPin: a stale snapshot is not evidence about the live repo
+  assert.equal(verifyVersionPin(repository.versionId, repository).status, Verdict.FAITHFUL);
+  assert.equal(verifyVersionPin("some-other-version", repository).status, Verdict.UNFAITHFUL);
+  assert.equal(verifyVersionPin(null, repository).status, Verdict.ABSTAIN);
+
+  // --- extractCallClaims: narrow, explicit relational-claim extraction -----
+  assert.deepEqual(extractCallClaims("`execute_plan` calls `plan_batch` before returning."), [{ caller: "execute_plan", callee: "plan_batch" }]);
+  assert.deepEqual(extractCallClaims("`execute_plan` invokes `plan_batch`."), [{ caller: "execute_plan", callee: "plan_batch" }]);
+  assert.deepEqual(extractCallClaims("`execute_plan` and `plan_batch` are both exported."), [], "no relation verb means no claim is invented");
+  assert.deepEqual(extractCallClaims("no backtick identifiers here at all."), []);
+
+  // --- verifyLessonFaithfulness: whole lesson, anchors + content blocks ----
+  const goodLesson = { id: "good", anchors: [{ path: "engine/planner.py", line: realDefinitionLine, symbol: "plan_batch" }], content: [] };
+  const goodResult = verifyLessonFaithfulness(goodLesson, { sourceVersion: repository.versionId }, repository);
+  assert.equal(goodResult.status, Verdict.FAITHFUL);
+  assert.equal(goodResult.unfaithful, 0);
+  const staleCourse = { sourceVersion: "some-other-version" };
+  const staleVersionResult = verifyLessonFaithfulness(goodLesson, staleCourse, repository);
+  assert.equal(staleVersionResult.status, Verdict.UNFAITHFUL, "a lesson pinned to a different repository state is not faithful even with real anchors");
+  const contentLesson = {
+    id: "withcontent",
+    anchors: [],
+    content: [{ steps: [{ anchor: { path: "engine/planner.py", line: realDefinitionLine, symbol: "plan_batch" } }] }, { nodes: [{ anchor: { path: "engine/nowhere.py", line: 1, symbol: null } }] }],
+  };
+  const contentResult = verifyLessonFaithfulness(contentLesson, { sourceVersion: repository.versionId }, repository);
+  assert.equal(contentResult.status, Verdict.UNFAITHFUL, "one unfaithful content-block anchor fails the whole lesson");
+  assert.equal(contentResult.checked, 2);
+
+  // --- verifyQuizFaithfulness: localization exercise gold files + definition
+  const exercise = buildLocalizationExercise(repository);
+  assert.ok(exercise, "fixture must produce a localization exercise");
+  const quizResult = verifyQuizFaithfulness(exercise, repository);
+  assert.equal(quizResult.status, Verdict.FAITHFUL);
+  const staleQuiz = { ...exercise, goldFiles: [...exercise.goldFiles, "engine/deleted.py"] };
+  const staleQuizResult = verifyQuizFaithfulness(staleQuiz, repository);
+  assert.equal(staleQuizResult.status, Verdict.UNFAITHFUL);
+  assert.ok(staleQuizResult.goldFiles.some((entry) => entry.status === Verdict.UNFAITHFUL));
+  assert.equal(verifyQuizFaithfulness({ id: "empty" }, repository).status, Verdict.ABSTAIN);
+
+  // --- verifyHintFaithfulness: a hint naming a real vs. fabricated location
+  const realHint = { id: "h1", text: `See engine/planner.py:${realDefinitionLine} for the definition.` };
+  assert.equal(verifyHintFaithfulness(realHint, repository, { "engine/planner.py": 6 }).status, Verdict.FAITHFUL);
+  const fakeHint = { id: "h2", anchorPath: "engine/does-not-exist.py" };
+  const fakeHintResult = verifyHintFaithfulness(fakeHint, repository);
+  assert.equal(fakeHintResult.status, Verdict.UNFAITHFUL);
+  assert.equal(fakeHintResult.checks[0].evidence.field, "anchorPath");
+  // A hint naming nothing checkable has nothing to abstain or fail on.
+  assert.equal(verifyHintFaithfulness({ id: "h3", text: "Think about inputs and outputs." }, repository).status, Verdict.ABSTAIN);
+
+  // --- verifyAnswerFaithfulness end-to-end from free text -------------------
+  const faithfulAnswer = verifyAnswerFaithfulness(extractCallClaims("`execute_plan` calls `plan_batch`."), repository);
+  assert.equal(faithfulAnswer.status, Verdict.FAITHFUL);
+  const unfaithfulAnswer = verifyAnswerFaithfulness(extractCallClaims("`execute_plan` calls `estimate_cost`."), repository);
+  assert.equal(unfaithfulAnswer.status, Verdict.UNFAITHFUL);
+  // Prose with no checkable relational claim abstains rather than passing by
+  // default.
+  assert.equal(verifyAnswerFaithfulness(extractCallClaims("The planner sorts work before running it."), repository).status, Verdict.ABSTAIN);
+
+  // --- verifyCourseFaithfulness: the four claim families reported separately
+  const whole = verifyCourseFaithfulness({
+    course: { sourceVersion: repository.versionId, modules: [{ lessons: [goodLesson, contentLesson] }] },
+    repository,
+    quizzes: [exercise, staleQuiz],
+    hints: [realHint, fakeHint],
+    answers: [{ text: "`execute_plan` calls `plan_batch`." }, { text: "`execute_plan` calls `estimate_cost`." }],
+  });
+  assert.equal(whole.version, 1);
+  assert.equal(whole.separate, true);
+  assert.equal("overall" in whole, false, "the four claim families must never be blended into one score, mirroring runEvaluation");
+  assert.equal(whole.lessons.status, Verdict.UNFAITHFUL);
+  assert.equal(whole.lessons.count, 2);
+  assert.equal(whole.lessons.unfaithful, 1);
+  assert.equal(whole.quizzes.status, Verdict.UNFAITHFUL);
+  assert.equal(whole.quizzes.unfaithful, 1);
+  assert.equal(whole.hints.status, Verdict.UNFAITHFUL);
+  assert.equal(whole.hints.unfaithful, 1);
+  assert.equal(whole.answers.status, Verdict.UNFAITHFUL);
+  assert.equal(whole.answers.unfaithful, 1);
+  // An empty call produces honest empty-shape nulls, not zeros pretending to
+  // have checked something.
+  const empty = verifyCourseFaithfulness({ repository });
+  assert.deepEqual([empty.lessons, empty.quizzes, empty.hints, empty.answers], [null, null, null, null]);
 });
