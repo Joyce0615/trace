@@ -79,6 +79,7 @@ import { forgetTelemetry, loadTelemetry, record, setTelemetryConsent, telemetryF
 import { SCALE_TIERS, SCALE_TIERS_VERSION, TIER_BUDGETS, buildScaleFixture, describeTierScaling, evaluateTierMeasurement, measureTier, runTierSuite, tierBudgetIds, tierFor, tierIds } from "../electron/scale-tiers.mjs";
 import { MODEL_FINGERPRINT_VERSION, NETWORK_PRIMITIVE_PATTERN, REQUIRED_CAPABILITIES, assessCompatibility, fingerprintModel, proveOfflineMode, sameFingerprint, scanElectronDirectoryForNetworkCapability, scanForNetworkCapability } from "../electron/model-fingerprint.mjs";
 import { LEARNING_EFFECTIVENESS_BUNDLE_SUBJECT, LEARNING_EFFECTIVENESS_BUNDLE_VERSION, buildBundleContent, buildLearningEffectivenessBundle, bundleDigest, collectSampleSizes, renderLearningEffectivenessBundle, summarizeCalibration, summarizeTasks, verifyLearningEffectivenessBundle } from "../electron/learning-effectiveness-bundle.mjs";
+import { COHORT_OBSERVATION_FIELDS, COHORT_PHASES, EXPERIMENT_COHORT_VERSION, analyzeCohort, assignCohortArm, attritionReport, cohortDigest, enrollParticipant, openCohort, phaseDue, renderCohortReport, sanitizeCohortObservation } from "../electron/experiment-cohort.mjs";
 
 const execFileAsync = promisify(execFile);
 const round4 = (value) => Number(Number(value).toFixed(4));
@@ -9542,4 +9543,177 @@ test("explanation-to-source faithfulness checks verify lesson, hint, quiz, and a
   // have checked something.
   const empty = verifyCourseFaithfulness({ repository });
   assert.deepEqual([empty.lessons, empty.quizzes, empty.hints, empty.answers], [null, null, null, null]);
+});
+
+test("longitudinal cohorts schedule pre/post/delayed/transfer phases, handle attrition, and produce a reproducible per-phase effect estimate", async () => {
+  const limit = EXPERIMENTS.find((experiment) => experiment.id === "review-daily-limit");
+
+  // --- openCohort refuses what it cannot analyze later ----------------------
+  assert.deepEqual(openCohort("not-a-real-experiment"), { ok: false, reason: "unknown-experiment" });
+  assert.deepEqual(openCohort("review-daily-limit", { phases: ["pre", "never-heard-of-it"] }), { ok: false, reason: "unknown-phase:never-heard-of-it" });
+  assert.deepEqual(COHORT_PHASES, ["pre", "post", "delayed", "transfer"]);
+
+  const opened = openCohort("review-daily-limit", { cohortId: "launch-a", now: "2026-01-01T00:00:00.000Z" });
+  assert.equal(opened.ok, true);
+  assert.equal(opened.cohort.version, EXPERIMENT_COHORT_VERSION);
+  assert.deepEqual(opened.cohort.phases, COHORT_PHASES);
+  assert.deepEqual(opened.cohort.roster, []);
+  let cohort = opened.cohort;
+
+  // --- enrollment is idempotent, and arm assignment is cohort-scoped --------
+  const enrolledOnce = enrollParticipant(cohort, "p-0", { now: "2026-01-01T00:00:00.000Z" });
+  assert.equal(enrolledOnce.alreadyEnrolled, false);
+  assert.ok(["twelve", "six"].includes(enrolledOnce.arm));
+  cohort = enrolledOnce.cohort;
+  const reEnrolled = enrollParticipant(cohort, "p-0", { now: "2026-01-02T00:00:00.000Z" });
+  assert.equal(reEnrolled.alreadyEnrolled, true);
+  assert.equal(reEnrolled.arm, null);
+  assert.equal(reEnrolled.cohort.roster.length, 1, "re-enrolling the same participant does not duplicate the roster entry");
+
+  // A fresh cohort launch of the SAME experiment re-randomizes: the same
+  // participant id is not pinned to the same arm just because the
+  // experiment and participant id are unchanged -- only `assignArm`'s
+  // single, unscheduled hash would do that.
+  const otherLaunch = openCohort("review-daily-limit", { cohortId: "launch-b", now: "2026-01-01T00:00:00.000Z" }).cohort;
+  const armsAcrossLaunches = Array.from({ length: 60 }, (_unused, index) => {
+    const id = `distinguishing-participant-${index}`;
+    return assignCohortArm(limit, "launch-a", id).id !== assignCohortArm(limit, "launch-b", id).id;
+  });
+  assert.ok(armsAcrossLaunches.some(Boolean), "at least one participant must be re-randomized into a different arm across two distinct cohort launches");
+  void otherLaunch;
+
+  // Enroll 20 participants total for the main cohort under test.
+  for (let index = 1; index < 20; index += 1) {
+    cohort = enrollParticipant(cohort, `p-${index}`, { now: "2026-01-01T00:00:00.000Z" }).cohort;
+  }
+  assert.equal(cohort.roster.length, 20);
+  const armCounts = cohort.roster.map((entry) => assignCohortArm(limit, cohort.cohortId, entry.participantId).id);
+  assert.equal(new Set(armCounts).size, 2, "both arms are reachable within one cohort");
+
+  // --- phaseDue names every refusal, and schedules a real delay -------------
+  assert.deepEqual(phaseDue(cohort, "nobody-enrolled", "pre"), { due: false, reason: "not-enrolled" });
+  assert.deepEqual(phaseDue({ ...cohort, phases: ["pre"] }, "p-0", "delayed"), { due: false, reason: "phase-not-scheduled" });
+  assert.equal(phaseDue(cohort, "p-0", "pre", { now: "2026-01-01T00:00:00.000Z" }).due, true, "an undelayed phase is due immediately");
+  const tooSoon = phaseDue(cohort, "p-0", "delayed", { now: "2026-01-02T00:00:00.000Z", minDelayDaysByPhase: { delayed: 7 } });
+  assert.equal(tooSoon.due, false);
+  assert.equal(tooSoon.reason, "too-soon");
+  const nowDue = phaseDue(cohort, "p-0", "delayed", { now: "2026-01-10T00:00:00.000Z", minDelayDaysByPhase: { delayed: 7 } });
+  assert.equal(nowDue.due, true);
+  assert.ok(nowDue.elapsedDays >= 7);
+
+  // --- sanitizeCohortObservation reuses experiments.mjs's own allowlist -----
+  assert.deepEqual(COHORT_OBSERVATION_FIELDS, ["experimentId", "arm", "metric", "value", "at", "phase"]);
+  assert.deepEqual(sanitizeCohortObservation(cohort, { experimentId: "wrong-experiment", arm: "six", metric: "review-success", value: 1, phase: "pre" }), { ok: false, reason: "wrong-experiment" });
+  assert.deepEqual(
+    sanitizeCohortObservation(cohort, { experimentId: "review-daily-limit", arm: "six", metric: "review-success", value: 1, phase: "never-scheduled" }),
+    { ok: false, reason: "unscheduled-phase" },
+  );
+  // Every rule sanitizeObservation already enforces still applies: a
+  // non-numeric value, an unknown arm, and an unexpected metric are all
+  // still refused for exactly the same reason, through this cohort-scoped
+  // path too.
+  assert.equal(sanitizeCohortObservation(cohort, { experimentId: "review-daily-limit", arm: "six", metric: "review-success", value: "not-a-number", phase: "pre" }).reason, "non-numeric-value");
+  assert.equal(sanitizeCohortObservation(cohort, { experimentId: "review-daily-limit", arm: "nope", metric: "review-success", value: 1, phase: "pre" }).reason, "unknown-arm");
+  assert.equal(sanitizeCohortObservation(cohort, { experimentId: "review-daily-limit", arm: "six", metric: "made-up", value: 1, phase: "pre" }).reason, "unexpected-metric");
+  // A hostile candidate carrying free text or a path still only ever
+  // produces the allowlisted fields plus `phase` -- nothing personal
+  // survives through this path either.
+  const hostile = sanitizeCohortObservation(cohort, {
+    experimentId: "review-daily-limit",
+    arm: "six",
+    metric: "review-success",
+    value: 1,
+    phase: "pre",
+    path: "/Users/someone/secret/app.py",
+    note: "learner wrote this",
+  });
+  assert.equal(hostile.ok, true);
+  assert.deepEqual(Object.keys(hostile.observation).sort(), [...COHORT_OBSERVATION_FIELDS].sort());
+  assert.equal(JSON.stringify(hostile.observation).includes("secret"), false);
+
+  // --- analyzeCohort: one Welch-interval verdict PER PHASE, never pooled ----
+  // A deliberately mixed pre+post set, built the same way the module's own
+  // docstring says analyzeExperiment would wrongly pool it: the control
+  // arm's pre-test mean (0.9) and post-test mean (0.2) are kept apart by
+  // phase, so neither phase's own verdict is computed from the other's data.
+  const mixedObservations = [];
+  for (let index = 0; index < 20; index += 1) {
+    const arm = assignCohortArm(limit, cohort.cohortId, `p-${index}`).id;
+    const sanitizedPre = sanitizeCohortObservation(cohort, {
+      experimentId: "review-daily-limit", arm, metric: "review-success",
+      value: arm === "twelve" ? 0.9 : 0.6, at: "2026-01-02T00:00:00.000Z", phase: "pre",
+    });
+    if (sanitizedPre.ok) mixedObservations.push(sanitizedPre.observation);
+    const sanitizedPost = sanitizeCohortObservation(cohort, {
+      experimentId: "review-daily-limit", arm, metric: "review-success",
+      value: arm === "twelve" ? 0.2 : 0.1, at: "2026-02-02T00:00:00.000Z", phase: "post",
+    });
+    if (sanitizedPost.ok) mixedObservations.push(sanitizedPost.observation);
+  }
+  const mixedAnalysis = analyzeCohort(cohort, mixedObservations);
+  assert.equal(mixedAnalysis.results.pre.control.mean, 0.9, "the pre phase's own control mean must not be diluted by post-phase values");
+  assert.equal(mixedAnalysis.results.post.control.mean, 0.2, "the post phase's own control mean must not be diluted by pre-phase values");
+  assert.equal("overall" in mixedAnalysis, false, "phases must never be blended into one score");
+  assert.equal("score" in mixedAnalysis, false);
+
+  // A phase nobody has reported into yet is honestly empty, not missing.
+  assert.equal(mixedAnalysis.results.delayed.observations, 0);
+  assert.equal(mixedAnalysis.results.delayed.verdict, "underpowered");
+  assert.equal(mixedAnalysis.results.delayed.difference, null);
+
+  // A sufficiently powered, sufficiently different phase names a real winner.
+  const poweredCohort = openCohort("review-daily-limit", { cohortId: "launch-powered", now: "2026-01-01T00:00:00.000Z" }).cohort;
+  let powered = poweredCohort;
+  for (let index = 0; index < 30; index += 1) powered = enrollParticipant(powered, `q-${index}`, { now: "2026-01-01T00:00:00.000Z" }).cohort;
+  const poweredObservations = [];
+  for (let index = 0; index < 30; index += 1) {
+    const arm = assignCohortArm(limit, powered.cohortId, `q-${index}`).id;
+    const sanitized = sanitizeCohortObservation(powered, {
+      experimentId: "review-daily-limit", arm, metric: "review-success",
+      value: (arm === "twelve" ? 0.85 : 0.55) + (index % 3) * 0.01, at: "2026-01-02T00:00:00.000Z", phase: "post",
+    });
+    if (sanitized.ok) poweredObservations.push(sanitized.observation);
+  }
+  const poweredAnalysis = analyzeCohort(powered, poweredObservations);
+  assert.equal(poweredAnalysis.results.post.powered, true);
+  assert.equal(poweredAnalysis.results.post.verdict, "control-better", JSON.stringify(poweredAnalysis.results.post));
+  assert.ok(poweredAnalysis.results.post.interval[0] < 0 && poweredAnalysis.results.post.interval[1] < 0, "a real, non-zero-crossing interval");
+
+  // --- attritionReport: visible per phase, not folded into a shrinking n ----
+  const attrition = attritionReport(cohort, mixedObservations);
+  assert.equal(attrition.enrolled, 20);
+  assert.equal(attrition.byPhase.pre.responded, 20);
+  assert.equal(attrition.byPhase.pre.attrition, 0);
+  assert.equal(attrition.byPhase.post.responded, 20);
+  // Every participant who reported "pre" also reported "post" here, so
+  // post-phase attrition is zero too -- but delayed/transfer, which nobody
+  // ever reported into, show full attrition rather than being silently
+  // absent from the report.
+  assert.equal(attrition.byPhase.delayed.responded, 0);
+  assert.equal(attrition.byPhase.delayed.attrition, 1);
+  assert.equal(attrition.byPhase.transfer.attrition, 1);
+
+  // A genuinely partial cohort -- half the roster never reports "post" --
+  // shows exactly that attrition rate, not a quietly smaller sample.
+  const postObservations = mixedObservations.filter((observation) => observation.phase === "post");
+  const halfAttritionObservations = mixedObservations.filter(
+    (observation) => observation.phase === "pre" || postObservations.indexOf(observation) % 2 === 0,
+  );
+  const partial = attritionReport(cohort, halfAttritionObservations);
+  assert.ok(partial.byPhase.post.attrition > 0 && partial.byPhase.post.attrition < 1, JSON.stringify(partial.byPhase.post));
+
+  // --- cohortDigest: identical inputs, identical bytes ----------------------
+  const digestA = cohortDigest(cohort, mixedAnalysis, attrition);
+  const digestB = cohortDigest(cohort, mixedAnalysis, attrition);
+  assert.equal(digestA, digestB, "the same cohort/analysis/attrition must digest identically");
+  const differentAttrition = attritionReport(cohort, []);
+  assert.notEqual(cohortDigest(cohort, mixedAnalysis, differentAttrition), digestA, "a genuinely different attrition report must digest differently");
+
+  // --- renderCohortReport names every phase, attrition, and verdict ---------
+  const rendered = renderCohortReport(cohort, mixedAnalysis, attrition);
+  assert.match(rendered, /## pre/);
+  assert.match(rendered, /## post/);
+  assert.match(rendered, /## delayed/);
+  assert.match(rendered, /## transfer/);
+  assert.match(rendered, /100% attrition/);
 });
