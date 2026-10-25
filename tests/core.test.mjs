@@ -46,6 +46,7 @@ import { EXPLANATION_GRADER_VERSION, buildExplanationTask, checkCitations, claim
 import { EXECUTABLE_QUIZ_VERSION, buildExecutableQuiz, candidateValues, gradeSubmission, parseSignature, probeArguments, publicQuiz, runInSandbox, screenSubmission, selfContainedFunctions } from "../electron/executable-quiz.mjs";
 import { DEFAULT_SCHEDULER, REVIEW_GRADE_IDS, SPACED_REPETITION_VERSION, applyReview, decayedMastery, forgettingCurve, gradeReview, intervalForRetention, retention, reviewPlan, scheduleSkill } from "../electron/spaced-repetition.mjs";
 import { FSRS_CALIBRATION_VERSION, reconcileInitialState, unifiedMasteryState } from "../electron/fsrs-calibration.mjs";
+import { FSRS_OPTIMIZER_VERSION, MIN_REVIEW_LOGS, compareAgainstDefaults, exportReviewLogs, fitPersonalizedParameters, personalizedSchedulerOptions, reviewLogToEvidence, rollbackParameters, toReviewLogs } from "../electron/fsrs-optimizer.mjs";
 import { EVALUATION_VERSION, evaluateLessons, evaluateRetrieval, evaluateTutorAnswer, runEvaluation } from "../electron/evaluation.mjs";
 import { FAITHFULNESS_GUARD_VERSION, Verdict, extractCallClaims, verifyAnchorClaim, verifyAnswerFaithfulness, verifyCallClaim, verifyCitationClaim, verifyCourseFaithfulness, verifyHintFaithfulness, verifyLessonFaithfulness, verifyQuizFaithfulness, verifyVersionPin } from "../electron/faithfulness-guard.mjs";
 import { EMBEDDING_DIMENSIONS, SEARCH_VERSION, buildSearchIndex, cosine, editDistance, embed, search, similarityScore, subsequenceScore, tokenize } from "../electron/search.mjs";
@@ -9716,4 +9717,155 @@ test("longitudinal cohorts schedule pre/post/delayed/transfer phases, handle att
   assert.match(rendered, /## delayed/);
   assert.match(rendered, /## transfer/);
   assert.match(rendered, /100% attrition/);
+});
+
+test("FSRS optimizer import/export converts private review logs to the standard schema, learns bounded per-learner parameters, compares against defaults, and rolls back deterministically", () => {
+  assert.equal(FSRS_OPTIMIZER_VERSION, 1);
+  assert.equal(MIN_REVIEW_LOGS, 8);
+
+  // --- toReviewLogs: the standard five-column schema, no text, no skill id -
+  const mastery = {
+    skillId: "skill-secret-name",
+    evidence: [
+      { kind: "review", strength: 0.8, detail: "recalled it cold", createdAt: "2026-01-01T00:00:00.000Z" },
+      { kind: "review", strength: 0.8, detail: "", createdAt: "2026-01-05T00:00:00.000Z" },
+      { kind: "review", strength: 0, detail: "forgot everything", createdAt: "2026-01-20T00:00:00.000Z" },
+      { kind: "review", strength: 0.8, detail: "", createdAt: "2026-01-21T00:00:00.000Z" },
+      { kind: "lesson", strength: 0.9, detail: "read it", createdAt: "2026-01-01T00:00:00.000Z" },
+      { kind: "review", strength: 0.9, detail: "unmappable strength", createdAt: "not-a-date" },
+    ],
+  };
+  const exported = toReviewLogs(mastery, { salt: "fixed-salt" });
+  assert.equal(exported.exported, 4, "only kind:review entries with a mappable strength and a parseable date are exported");
+  assert.equal(exported.skipped, 1, "the unmappable-strength/bad-date review is counted as skipped, not silently dropped or thrown");
+  assert.equal(exported.logs.length, 4);
+  for (const row of exported.logs) {
+    const text = JSON.stringify(row);
+    assert.equal(text.includes("skill-secret-name"), false, "the raw skill id never appears in an exported row");
+    assert.equal(text.includes("recalled it cold"), false, "evidence detail text never appears in an exported row");
+    assert.deepEqual(Object.keys(row).sort(), ["card_id", "review_duration", "review_rating", "review_state", "review_time"].sort());
+  }
+  assert.equal(exported.logs[0].review_state, 0, "a card's first exported review is state New");
+  assert.equal(exported.logs[1].review_state, 2, "a later review after a successful recall is state Review");
+  assert.equal(exported.logs[2].review_rating, 1, "strength 0 maps to rating 1 (Again)");
+  assert.equal(exported.logs[3].review_state, 3, "the review immediately after a lapse is state Relearning");
+  assert.ok(exported.logs.every((row) => row.card_id === exported.cardId));
+  // The card id is a digest, not the skill id, and is salt-dependent: the
+  // same skill exported with a different salt produces a different id, so
+  // two exports cannot be correlated without the salt that produced them.
+  const differentSalt = toReviewLogs(mastery, { salt: "other-salt" });
+  assert.notEqual(differentSalt.cardId, exported.cardId);
+  // With a pinned salt, re-exporting the identical mastery is byte-identical.
+  assert.deepEqual(toReviewLogs(mastery, { salt: "fixed-salt" }), exported);
+
+  // A skill with no review evidence at all exports zero rows, not an error.
+  const untouched = toReviewLogs({ skillId: "never-reviewed", evidence: [{ kind: "lesson", strength: 0.5, createdAt: "2026-01-01T00:00:00.000Z" }] }, { salt: "fixed-salt" });
+  assert.equal(untouched.exported, 0);
+  assert.equal(untouched.skipped, 0);
+  assert.deepEqual(untouched.logs, []);
+
+  // --- exportReviewLogs: every reviewed skill, one shared salt -------------
+  const learnerState = {
+    repositoryId: "repo-1",
+    mastery: {
+      "skill-a": mastery,
+      "skill-b": { skillId: "skill-b", evidence: [{ kind: "review", strength: 0.8, createdAt: "2026-02-01T00:00:00.000Z" }] },
+      "skill-c": { skillId: "skill-c", evidence: [{ kind: "lesson", strength: 0.5, createdAt: "2026-01-01T00:00:00.000Z" }] },
+    },
+  };
+  const bundle = exportReviewLogs(learnerState, { salt: "bundle-salt" });
+  assert.equal(bundle.totalExported, 5, "4 from skill-a + 1 from skill-b");
+  assert.equal(bundle.totalSkipped, 1);
+  assert.equal(bundle.cards, 2, "skill-c contributed no review rows, so it is not counted as a card");
+  assert.deepEqual([...bundle.logs].sort((left, right) => left.review_time - right.review_time), bundle.logs, "logs are sorted oldest first across every card");
+  const cardIds = new Set(bundle.logs.map((row) => row.card_id));
+  assert.equal(cardIds.size, 2, "skill-a and skill-b get distinct card ids under one shared salt");
+
+  // --- fitPersonalizedParameters: refuses below the sample floor ----------
+  const thin = fitPersonalizedParameters(bundle.logs.slice(0, 3));
+  assert.equal(thin.fitted, false);
+  assert.equal(thin.reason, "insufficient-review-logs");
+  assert.equal(thin.required, MIN_REVIEW_LOGS);
+  assert.equal(thin.stabilityScale, 1);
+  assert.equal(thin.difficultyBias, 0);
+  assert.deepEqual(compareAgainstDefaults(thin), {
+    version: FSRS_OPTIMIZER_VERSION, comparable: false, reason: "insufficient-review-logs",
+    stabilityDeltaPercent: 0, difficultyDeltaAbsolute: 0,
+  });
+  assert.deepEqual(personalizedSchedulerOptions(thin), { ...DEFAULT_SCHEDULER }, "an unfitted result passes the defaults through unchanged");
+
+  // --- fitPersonalizedParameters: direction is correct both ways ----------
+  const DAY_MS = 86_400_000;
+  const base = Date.parse("2026-01-01T00:00:00.000Z");
+  function syntheticLogs(ratings) {
+    const rows = [];
+    let time = base;
+    for (let index = 0; index < ratings.length; index += 1) {
+      rows.push({
+        card_id: "synthetic-card",
+        review_time: time,
+        review_rating: ratings[index],
+        review_state: index === 0 ? 0 : (ratings[index - 1] === 1 ? 3 : 2),
+        review_duration: null,
+      });
+      time += 10 * DAY_MS;
+    }
+    return rows;
+  }
+  // A learner who lapses often (rating 1, "Again") recalls worse than the
+  // default model predicts and must be fit to a SHORTER real stability.
+  const forgetsFaster = fitPersonalizedParameters(syntheticLogs([3, 3, 1, 3, 1, 3, 3, 1, 3, 1, 3, 3]));
+  assert.equal(forgetsFaster.fitted, true);
+  assert.ok(forgetsFaster.stabilityScale < 1, `expected < 1, got ${forgetsFaster.stabilityScale}`);
+  assert.ok(forgetsFaster.difficultyBias > 0, "a higher-than-predicted lapse rate biases difficulty up (harder)");
+  const forgetsFasterComparison = compareAgainstDefaults(forgetsFaster);
+  assert.equal(forgetsFasterComparison.comparable, true);
+  assert.ok(forgetsFasterComparison.stabilityDeltaPercent < 0, "a shorter real stability is reported as a negative percent change");
+
+  // A learner who never lapses (ratings only 3/4) recalls at least as well as
+  // predicted and must be fit to a stability scale of at least 1, never below.
+  const recallsWell = fitPersonalizedParameters(syntheticLogs([3, 3, 4, 3, 4, 3, 3, 4, 3, 4, 3, 3]));
+  assert.equal(recallsWell.fitted, true);
+  assert.ok(recallsWell.stabilityScale >= 1, `expected >= 1, got ${recallsWell.stabilityScale}`);
+  assert.ok(recallsWell.difficultyBias <= 0, "a zero or below-predicted lapse rate never biases difficulty up");
+
+  // --- bounded: even an extreme log cannot blow past the stated ceiling ---
+  const allLapses = fitPersonalizedParameters(syntheticLogs(Array.from({ length: 12 }, () => 1)), { maxStabilityScale: 2, maxDifficultyBias: 0.6 });
+  assert.ok(allLapses.stabilityScale >= 0.5, `clamped at 1/maxStabilityScale, got ${allLapses.stabilityScale}`);
+  assert.ok(allLapses.difficultyBias <= 0.6);
+  const neverLapses = fitPersonalizedParameters(syntheticLogs(Array.from({ length: 12 }, () => 4)), { maxStabilityScale: 2, maxDifficultyBias: 0.6 });
+  assert.ok(neverLapses.stabilityScale <= 2, `clamped at maxStabilityScale, got ${neverLapses.stabilityScale}`);
+
+  // --- personalizedSchedulerOptions: the exact shape gradeReview/reviewPlan accept, scaled and clamped --
+  const options = personalizedSchedulerOptions(forgetsFaster);
+  assert.equal(round4(options.initialStabilityDays), round4(DEFAULT_SCHEDULER.initialStabilityDays * forgetsFaster.stabilityScale));
+  assert.ok(options.initialDifficulty >= DEFAULT_SCHEDULER.difficultyFloor && options.initialDifficulty <= DEFAULT_SCHEDULER.difficultyCeiling);
+  assert.equal(options.targetRetention, DEFAULT_SCHEDULER.targetRetention, "every untouched field passes through from the defaults unchanged");
+  assert.equal(options.dailyLimit, DEFAULT_SCHEDULER.dailyLimit);
+  // The personalized options really do change gradeReview's output relative
+  // to the defaults -- this is not a shape that merely looks plausible.
+  const fresh = { stability: 1, difficulty: 2.2, reviews: 0, lapses: 0, lastReviewedAt: null, lastGrade: null };
+  const now = "2026-06-01T00:00:00.000Z";
+  const defaultFirstReview = gradeReview(fresh, { grade: "good", now });
+  const personalizedFirstReview = gradeReview(fresh, { grade: "good", now, parameters: options });
+  assert.notEqual(personalizedFirstReview.state.stability, defaultFirstReview.state.stability, "a personalization with stabilityScale < 1 produces a shorter first interval than the defaults");
+
+  // Clamped even at an extreme bias: initialDifficulty from
+  // personalizedSchedulerOptions is always within the scheduler's own floor
+  // and ceiling, never out of range regardless of how extreme the fit's bias is.
+  const extremeBias = { ...forgetsFaster, difficultyBias: 5 };
+  const extremeOptions = personalizedSchedulerOptions(extremeBias);
+  assert.equal(extremeOptions.initialDifficulty, DEFAULT_SCHEDULER.difficultyCeiling);
+
+  // --- rollbackParameters: deterministic identity on the defaults ---------
+  assert.deepEqual(rollbackParameters(), { ...DEFAULT_SCHEDULER });
+  assert.deepEqual(rollbackParameters(), rollbackParameters(), "rolling back twice lands on the identical state both times");
+  assert.notDeepEqual(options, rollbackParameters(), "the personalized options really do differ from a rollback, proving rollback is not a no-op in disguise");
+
+  // --- reviewLogToEvidence: the round trip back into this app's own shape -
+  const roundTrip = reviewLogToEvidence(exported.logs[0]);
+  assert.equal(roundTrip.kind, "review");
+  assert.equal(roundTrip.strength, 0.8);
+  assert.equal(roundTrip.createdAt, "2026-01-01T00:00:00.000Z");
+  assert.equal(reviewLogToEvidence({ review_rating: 99, review_time: Date.now() }), null, "an unmapped rating returns null rather than a wrong grade");
 });
