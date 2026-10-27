@@ -81,6 +81,7 @@ import { SCALE_TIERS, SCALE_TIERS_VERSION, TIER_BUDGETS, buildScaleFixture, desc
 import { MODEL_FINGERPRINT_VERSION, NETWORK_PRIMITIVE_PATTERN, REQUIRED_CAPABILITIES, assessCompatibility, fingerprintModel, proveOfflineMode, sameFingerprint, scanElectronDirectoryForNetworkCapability, scanForNetworkCapability } from "../electron/model-fingerprint.mjs";
 import { LEARNING_EFFECTIVENESS_BUNDLE_SUBJECT, LEARNING_EFFECTIVENESS_BUNDLE_VERSION, buildBundleContent, buildLearningEffectivenessBundle, bundleDigest, collectSampleSizes, renderLearningEffectivenessBundle, summarizeCalibration, summarizeTasks, verifyLearningEffectivenessBundle } from "../electron/learning-effectiveness-bundle.mjs";
 import { COHORT_OBSERVATION_FIELDS, COHORT_PHASES, EXPERIMENT_COHORT_VERSION, analyzeCohort, assignCohortArm, attritionReport, cohortDigest, enrollParticipant, openCohort, phaseDue, renderCohortReport, sanitizeCohortObservation } from "../electron/experiment-cohort.mjs";
+import { KNOWLEDGE_COMPONENT_VERSION, buildKnowledgeComponents, componentCoverage, componentForSkill, rebuildComponentMastery, reconcileKnowledgeComponents, renderComponentDigest } from "../electron/knowledge-components.mjs";
 
 const execFileAsync = promisify(execFile);
 const round4 = (value) => Number(Number(value).toFixed(4));
@@ -9868,4 +9869,147 @@ test("FSRS optimizer import/export converts private review logs to the standard 
   assert.equal(roundTrip.strength, 0.8);
   assert.equal(roundTrip.createdAt, "2026-01-01T00:00:00.000Z");
   assert.equal(reviewLogToEvidence({ review_rating: 99, review_time: Date.now() }), null, "an unmapped rating returns null rather than a wrong grade");
+});
+
+test("knowledge-component mastery graphs map symbols/misconceptions/exercises/evidence into versioned components and update mastery only from the audited activity log", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-kc-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "app"), { recursive: true });
+  await mkdir(path.join(rootPath, "tests"), { recursive: true });
+  await writeFile(path.join(rootPath, "app", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "app", "queue.py"), "def enqueue(job):\n    return job\n");
+  await writeFile(path.join(rootPath, "app", "worker.py"), "from app.queue import enqueue\n\n\ndef work(job):\n    return enqueue(job)\n");
+  await writeFile(path.join(rootPath, "tests", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "tests", "test_worker.py"), "from app.queue import enqueue\n\n\ndef test_enqueue_returns_job():\n    assert enqueue(1) == 1\n");
+
+  const git = (...args) => execFileAsync("git", ["-C", rootPath, ...args]);
+  await execFileAsync("git", ["init", rootPath]);
+  await git("config", "user.email", "dev@contributor.dev");
+  await git("config", "user.name", "Dev");
+  await git("add", ".");
+  await git("commit", "-m", "Initial import");
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const course = generateStarterCourse(repository);
+  const skillGraph = buildSkillGraph(repository, course);
+  const knowledgeGraph = buildKnowledgeGraph(repository);
+  const commits = (await readCommits(rootPath, { includeMerges: true })).commits;
+  const evidence = await importEvidence(repository, { commits });
+
+  assert.equal(KNOWLEDGE_COMPONENT_VERSION, 1);
+
+  // --- Build: symbols + misconceptions + exercises + evidence are mapped in --
+  const components = buildKnowledgeComponents(skillGraph, knowledgeGraph, evidence.items, { repository });
+  assert.equal(components.version, KNOWLEDGE_COMPONENT_VERSION);
+  assert.equal(components.items.length, skillGraph.nodes.length);
+  for (const component of components.items) {
+    assert.ok(component.id.startsWith("kc-"));
+    assert.equal(typeof component.skillId, "string");
+    // Every anchor's symbol resolves to a real symbol node already present in
+    // the knowledge graph, rather than this module inventing its own.
+    for (const symbolId of component.symbolIds) {
+      assert.ok(knowledgeGraph.nodes.some((node) => node.id === symbolId), `${symbolId} is not a real knowledge-graph node`);
+    }
+    // The misconception taxonomy entries attached are references to the real
+    // taxonomy (electron/misconception.mjs), not a re-derived copy of it.
+    for (const misconceptionId of component.misconceptionIds) {
+      assert.ok(MISCONCEPTIONS.some((entry) => entry.id === misconceptionId), misconceptionId);
+    }
+    // Every component names which activity kinds exercise it.
+    assert.ok(Array.isArray(component.exerciseKinds));
+    assert.ok(component.componentDigest.length === 16);
+  }
+
+  // The queue/worker skills pick up linked evidence (the test file + README)
+  // through the exact same anchor-matching evidenceForSkills already uses.
+  const withEvidence = components.items.filter((component) => component.evidenceIds.length > 0);
+  assert.ok(withEvidence.length >= 1, JSON.stringify(components.items.map((c) => c.evidenceIds)));
+
+  // componentForSkill is the one lookup path, keyed by skill id.
+  const first = skillGraph.nodes[0];
+  const lookedUp = componentForSkill(components, first.id);
+  assert.equal(lookedUp.skillId, first.id);
+  assert.equal(componentForSkill(components, "not-a-real-skill"), null);
+
+  // componentCoverage reports how much of the graph actually links to a real
+  // symbol/evidence/misconception, rather than silently assuming full coverage.
+  const coverage = componentCoverage(components);
+  assert.equal(coverage.total, components.items.length);
+  assert.ok(coverage.withSymbol >= 1);
+  assert.ok(coverage.symbolCoverage > 0 && coverage.symbolCoverage <= 1);
+
+  // --- Mastery update only from auditable observations ---------------------
+  // A renderer-supplied LearnerState with self-reported evidence must be
+  // ignored entirely: rebuildComponentMastery only trusts the activity log
+  // (main-process-written, append-only), never the mastery numbers a learner
+  // could have tampered with client-side.
+  const tamperedLearnerState = {
+    repositoryId: repository.id,
+    mastery: Object.fromEntries(skillGraph.nodes.map((node) => [node.id, {
+      skillId: node.id, mastery: 0.99, confidence: 0.99, status: "mastered",
+      evidence: [{ id: "fake", skillId: node.id, kind: "self-report", strength: 1, detail: "trust me", createdAt: "" }],
+    }])),
+    memory: [],
+  };
+  const noActivity = rebuildComponentMastery(components, [], { learnerState: tamperedLearnerState });
+  for (const entry of Object.values(noActivity.mastery)) {
+    assert.equal(entry.evidenceCount, 0, "self-reported client evidence must never feed the audited mastery rebuild");
+    assert.ok(entry.mastery < 0.6, JSON.stringify(entry));
+  }
+
+  // Real audited activity-log events (the same shape electron/main.mjs's
+  // recordActivity already writes, each carrying a skillId) do move mastery,
+  // and the Beta-Bernoulli math is the same calibrateSkill the rest of the app
+  // already uses, not a second reimplementation of it.
+  const skillId = first.id;
+  const auditedEvents = [
+    { id: "a1", at: "2026-01-01T00:00:00.000Z", kind: "probe", skillId, correct: true, score: 1, path: null, hints: 0, hintPenalty: 0 },
+    { id: "a2", at: "2026-01-02T00:00:00.000Z", kind: "explanation", skillId, correct: true, score: 0.9, path: null, hints: 0, hintPenalty: 0 },
+    { id: "a3", at: "2026-01-03T00:00:00.000Z", kind: "probe", skillId, correct: false, score: 0, path: null, hints: 1, hintPenalty: 0.1, misconception: { id: "execution-order" } },
+  ];
+  const rebuilt = rebuildComponentMastery(components, auditedEvents);
+  const entry = rebuilt.mastery[skillId];
+  assert.ok(entry.evidenceCount === 3, JSON.stringify(entry));
+  assert.ok(entry.mastery > 0 && entry.mastery < 1);
+  // The wrong probe's misconception is attached to the component's observed
+  // misconceptions, from the audited event, not from re-detecting it.
+  assert.ok(rebuilt.misconceptionsObserved[skillId]?.includes("execution-order"), JSON.stringify(rebuilt.misconceptionsObserved));
+  // Events naming an unknown skillId (e.g. a stale/renamed component) are
+  // counted and reported, never silently dropped or attributed elsewhere.
+  const withUnknown = rebuildComponentMastery(components, [...auditedEvents, { id: "a4", at: "2026-01-04T00:00:00.000Z", kind: "probe", skillId: "not-a-real-skill", correct: true, score: 1 }]);
+  assert.equal(withUnknown.unmatchedEvents, 1);
+  // Unaudited/malformed events (no kind, no timestamp) are dropped, not guessed at.
+  const withGarbage = rebuildComponentMastery(components, [...auditedEvents, { foo: "bar" }, null]);
+  assert.equal(withGarbage.mastery[skillId].evidenceCount, 3, "malformed events must not silently count as evidence");
+
+  // Deterministic: rebuilding twice from the same audited log produces the
+  // same mastery numbers and the same digest.
+  const rebuiltAgain = rebuildComponentMastery(components, auditedEvents);
+  assert.deepEqual(rebuilt.mastery, rebuiltAgain.mastery);
+  assert.equal(rebuilt.digest, rebuiltAgain.digest);
+
+  // --- Versioning across a rebuild ------------------------------------------
+  // Changing a symbol's underlying line (a real source edit) must mark that
+  // component's version lineage as changed, not silently keep serving the old
+  // digest for a component whose source anchor actually moved.
+  const changedRepository = {
+    ...repository,
+    versionId: `${repository.versionId}-changed`,
+    files: repository.files.map((file) => (file.path === "app/queue.py" ? { ...file, blobId: "blob-changed" } : file)),
+  };
+  const changedSkillGraph = buildSkillGraph(changedRepository, course);
+  const changedKnowledgeGraph = buildKnowledgeGraph(changedRepository);
+  const changedComponents = buildKnowledgeComponents(changedSkillGraph, changedKnowledgeGraph, evidence.items, { repository: changedRepository });
+  const reconciled = reconcileKnowledgeComponents(components, changedComponents);
+  assert.ok(reconciled.changed.length >= 1, JSON.stringify(reconciled));
+  assert.ok(reconciled.unchanged.length >= 1);
+  assert.equal(reconciled.changed.length + reconciled.unchanged.length + reconciled.added.length, changedComponents.items.length);
+
+  // A render-ready digest is a stable, short, reproducible string summarizing
+  // the component graph for display/export, and never leaks detector patterns.
+  const digestText = renderComponentDigest(components);
+  assert.match(digestText, /knowledge component/i);
+  assert.equal(digestText.includes("patterns"), false);
 });

@@ -52,7 +52,11 @@ export const RETENTION_BUCKETS = [
   { id: "months", maxDays: Number.POSITIVE_INFINITY, label: "over a month" },
 ];
 
-const GRADED_KINDS = new Set(["executable-quiz", "explanation", "teach-back", "prediction", "contrast", "call-chain", "localization", "race", "probe", "review", "delayed-transfer"]);
+// Exported so other modules (item 22's knowledge-component mastery graphs) can
+// recognize exactly the same set of "this activity-log event was actually
+// graded" kinds this module already curates, instead of maintaining a second,
+// possibly-drifting list of what counts as gradable evidence.
+export const GRADED_KINDS = new Set(["executable-quiz", "explanation", "teach-back", "prediction", "contrast", "call-chain", "localization", "race", "probe", "review", "delayed-transfer"]);
 
 /**
  * Immediate-quiz kinds: every graded kind except the two that already carry
