@@ -67,6 +67,7 @@ import { Backend as SandboxBackend, detectBackend as detectSandboxBackend } from
 import { DEFAULT_MIN_TRANSFER_DELAY_DAYS, DEFAULT_TRANSFER_PROBE_DEPTH, TRANSFER_PROBE_VERSION, elapsedSinceStudy, planDelayedTransferProbe, unseenRelatedFiles } from "../electron/transfer-probe.mjs";
 import { DELAYED_TRANSFER_BUCKETS, delayedTransferAnalytics } from "../electron/analytics.mjs";
 import { EXECUTABLE_EXPLANATION_VERIFICATION_VERSION, MIN_COUNTEREXAMPLE_PROBES, TEACHING_GATE_STATUSES, extractExecutableClaims, gateHighConfidenceTeaching, verifyExplanationClaimsExecutably, verifyHintExecutably, verifyLessonExecutably } from "../electron/executable-explanation-verification.mjs";
+import { CurriculumPhase, TRANSFER_CURRICULUM_VERSION, administerPostTest, administerPreTest, bestStructuralMatch, classifyStructuralRelation, detectMemorizedSymbolLeak, evaluateTransferGain, openTransferCurriculum, recordLessonDelivered, renderTransferCurriculum, selectTransferCandidates } from "../electron/transfer-curriculum.mjs";
 import { loadLearnerState, loadLearnerStateReport, saveLearnerState } from "../electron/learning-store.mjs";
 import { addEvidence, completeDiagnostic, recommend } from "../src/learning.ts";
 import { DURABLE_VERSION, inspectDurable, readDurable, sweepInterruptedWrites, writeDurable } from "../electron/durable-store.mjs";
@@ -10486,4 +10487,152 @@ test("executable explanation verification turns claims into symbol queries, test
   const empty = await verifyExplanationClaimsExecutably("", { repository, sources });
   assert.equal(empty.checked, 0);
   assert.equal(empty.status, Verdict.ABSTAIN);
+});
+
+test("cross-repository transfer curricula select structurally related unseen repositories, enforce pre-test isolation, and detect memorized-symbol leaks", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "transfer-curriculum-"));
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+
+  async function buildRepo(id, files) {
+    const rootPath = path.join(workspace, id);
+    for (const [relativePath, contents] of Object.entries(files)) {
+      await mkdir(path.dirname(path.join(rootPath, relativePath)), { recursive: true });
+      await writeFile(path.join(rootPath, relativePath), contents);
+    }
+    resetAnalysisCache();
+    const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+    return { repository, sources: files };
+  }
+
+  const validateHome = [
+    "def validate_user(data):",
+    "    if not data.get('name'):",
+    "        return False",
+    "    if not data.get('email'):",
+    "        return False",
+    "    return True",
+    "",
+  ].join("\n");
+  const home = await buildRepo("home", { "app/__init__.py": "", "app/users.py": validateHome });
+
+  // A structurally similar repository: a differently-named function with a
+  // near-identical body (same shape `course-migration.mjs` already classifies
+  // as a rename during a migration, here compared across repositories).
+  const similarSource = [
+    "def validate_payload(data):",
+    "    if not data.get('name'):",
+    "        return False",
+    "    if not data.get('email'):",
+    "        return False",
+    "    return True",
+    "",
+  ].join("\n");
+  const relatedRepo = await buildRepo("related", { "app/__init__.py": "", "app/payload.py": similarSource });
+
+  // An unrelated repository: real code, but nothing shaped like the skill's anchor.
+  const unrelatedSource = [
+    "def compute_tax(amount):",
+    "    rate = 0.18",
+    "    return amount * rate",
+    "",
+  ].join("\n");
+  const unrelatedRepo = await buildRepo("unrelated", { "app/__init__.py": "", "app/tax.py": unrelatedSource });
+
+  const skillNode = { id: "skill-validate", anchors: [{ path: "app/users.py", line: 1, symbol: "validate_user" }] };
+
+  // --- bestStructuralMatch / classifyStructuralRelation -------------------
+  const anchorSymbol = home.repository.symbols.find((symbol) => symbol.name === "validate_user");
+  assert.ok(anchorSymbol, "fixture must index validate_user");
+  const relatedMatch = bestStructuralMatch(anchorSymbol, home.sources, relatedRepo.repository.symbols, relatedRepo.sources);
+  assert.equal(relatedMatch.symbol.name, "validate_payload");
+  assert.ok(relatedMatch.similarity > 0.5, JSON.stringify(relatedMatch));
+  assert.equal(classifyStructuralRelation(relatedMatch.similarity), "structurally-related");
+
+  const unrelatedMatch = bestStructuralMatch(anchorSymbol, home.sources, unrelatedRepo.repository.symbols, unrelatedRepo.sources);
+  assert.equal(unrelatedMatch.similarity, 0);
+  assert.equal(classifyStructuralRelation(unrelatedMatch.similarity), "unrelated");
+
+  // --- selectTransferCandidates: unseen + structurally related only -------
+  const candidates = [
+    { repository: relatedRepo.repository, sources: relatedRepo.sources },
+    { repository: unrelatedRepo.repository, sources: unrelatedRepo.sources },
+    { repository: home.repository, sources: home.sources },
+  ];
+  const selected = selectTransferCandidates(skillNode, home.repository, home.sources, candidates, new Set([home.repository.id]));
+  assert.deepEqual(selected.map((entry) => entry.repositoryId), [relatedRepo.repository.id]);
+  assert.equal(selected[0].matchedSymbol, "validate_payload");
+
+  const seenEverything = selectTransferCandidates(skillNode, home.repository, home.sources, candidates, new Set([home.repository.id, relatedRepo.repository.id]));
+  assert.deepEqual(seenEverything, [], "an already-seen repository must never be offered as a transfer target");
+
+  // --- pre-test isolation state machine ------------------------------------
+  assert.equal(TRANSFER_CURRICULUM_VERSION, 1);
+  let curriculum = openTransferCurriculum("skill-validate", [relatedRepo.repository.id]);
+  assert.equal(curriculum.entries[relatedRepo.repository.id].phase, CurriculumPhase.PENDING);
+
+  // Delivering the lesson before a pre-test is recorded must be refused.
+  const blockedDelivery = recordLessonDelivered(curriculum, relatedRepo.repository.id);
+  assert.equal(blockedDelivery.ok, false);
+  assert.equal(blockedDelivery.reason, "pre-test-required-first");
+  // The refused call must not have mutated the curriculum.
+  assert.equal(blockedDelivery.curriculum.entries[relatedRepo.repository.id].phase, CurriculumPhase.PENDING);
+
+  // Post-test before the lesson is delivered must also be refused.
+  const blockedPost = administerPostTest(curriculum, relatedRepo.repository.id, { text: "anything" });
+  assert.equal(blockedPost.ok, false);
+  assert.equal(blockedPost.reason, "lesson-not-delivered-yet");
+
+  const preTestResult = { text: "I am not sure what `validate_payload` does." };
+  const afterPre = administerPreTest(curriculum, relatedRepo.repository.id, preTestResult);
+  assert.equal(afterPre.ok, true);
+  assert.equal(afterPre.curriculum.entries[relatedRepo.repository.id].phase, CurriculumPhase.PRE_TESTED);
+  curriculum = afterPre.curriculum;
+
+  // Recording a second pre-test for the same repository is refused, not overwritten.
+  const duplicatePre = administerPreTest(curriculum, relatedRepo.repository.id, { text: "second attempt" });
+  assert.equal(duplicatePre.ok, false);
+  assert.equal(duplicatePre.reason, "pre-test-already-recorded");
+  assert.deepEqual(duplicatePre.curriculum.entries[relatedRepo.repository.id].preTest, preTestResult);
+
+  const afterLesson = recordLessonDelivered(curriculum, relatedRepo.repository.id, { now: "2026-10-30T00:00:00.000Z" });
+  assert.equal(afterLesson.ok, true);
+  assert.equal(afterLesson.curriculum.entries[relatedRepo.repository.id].phase, CurriculumPhase.LESSONED);
+  curriculum = afterLesson.curriculum;
+
+  const honestPost = { text: "`validate_payload` returns False when name or email is missing, otherwise True." };
+  const afterPost = administerPostTest(curriculum, relatedRepo.repository.id, honestPost);
+  assert.equal(afterPost.ok, true);
+  assert.equal(afterPost.curriculum.entries[relatedRepo.repository.id].phase, CurriculumPhase.POST_TESTED);
+  curriculum = afterPost.curriculum;
+
+  const duplicatePost = administerPostTest(curriculum, relatedRepo.repository.id, { text: "again" });
+  assert.equal(duplicatePost.ok, false);
+  assert.equal(duplicatePost.reason, "post-test-already-recorded");
+
+  // --- detectMemorizedSymbolLeak -------------------------------------------
+  const leakyAnswer = "It behaves just like `validate_user` in the other repository.";
+  const leak = detectMemorizedSymbolLeak(leakyAnswer, home.repository, relatedRepo.repository);
+  assert.equal(leak.hasLeak, true);
+  assert.deepEqual(leak.leaked, ["validate_user"]);
+
+  const cleanAnswer = "It behaves just like `validate_payload` here.";
+  const noLeak = detectMemorizedSymbolLeak(cleanAnswer, home.repository, relatedRepo.repository);
+  assert.equal(noLeak.hasLeak, false);
+  assert.deepEqual(noLeak.leaked, []);
+
+  // --- evaluateTransferGain --------------------------------------------------
+  const honestGain = evaluateTransferGain(preTestResult, honestPost, home.repository, relatedRepo.repository);
+  assert.ok(honestGain.gain >= 0, JSON.stringify(honestGain));
+  assert.equal(honestGain.leak.hasLeak, false);
+  assert.equal(honestGain.verdict, honestGain.gain > 0 ? "transferred" : "no-change");
+
+  const leakedPost = { text: "It is `validate_user` from the other repository, so it returns False when name or email is missing." };
+  const leakedGain = evaluateTransferGain(preTestResult, leakedPost, home.repository, relatedRepo.repository);
+  assert.equal(leakedGain.leak.hasLeak, true);
+  assert.equal(leakedGain.verdict, "leaked");
+
+  // --- renderTransferCurriculum ----------------------------------------------
+  const rendered = renderTransferCurriculum(curriculum);
+  assert.ok(rendered.includes(relatedRepo.repository.id));
+  assert.ok(rendered.includes(CurriculumPhase.POST_TESTED));
 });
