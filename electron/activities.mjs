@@ -31,8 +31,12 @@ import { detectMisconceptions } from "./misconception.mjs";
 
 export const ACTIVITY_VERSION = 1;
 
-const CAUSAL_WORDS = /\b(?:because|so that|which means|therefore|as a result|that is why|the reason|otherwise|in order to|this lets|this allows|since)\b/i;
-const EXAMPLE_WORDS = /\b(?:for example|for instance|say you|imagine|suppose|e\.g\.|concretely|in practice)\b/i;
+// Exported (was module-private) so item 23's tutor-safety benchmark can score
+// a tutor answer's pedagogical moves with the exact same two detectors a
+// teach-back grade already uses, rather than redeclaring a second pair of
+// phrase lists with a chance to drift from this one.
+export const CAUSAL_WORDS = /\b(?:because|so that|which means|therefore|as a result|that is why|the reason|otherwise|in order to|this lets|this allows|since)\b/i;
+export const EXAMPLE_WORDS = /\b(?:for example|for instance|say you|imagine|suppose|e\.g\.|concretely|in practice)\b/i;
 
 function round(value, places = 4) {
   return Number(Number(value).toFixed(places));
