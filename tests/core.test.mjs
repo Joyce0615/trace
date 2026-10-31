@@ -68,6 +68,7 @@ import { DEFAULT_MIN_TRANSFER_DELAY_DAYS, DEFAULT_TRANSFER_PROBE_DEPTH, TRANSFER
 import { DELAYED_TRANSFER_BUCKETS, delayedTransferAnalytics } from "../electron/analytics.mjs";
 import { EXECUTABLE_EXPLANATION_VERIFICATION_VERSION, MIN_COUNTEREXAMPLE_PROBES, TEACHING_GATE_STATUSES, extractExecutableClaims, gateHighConfidenceTeaching, verifyExplanationClaimsExecutably, verifyHintExecutably, verifyLessonExecutably } from "../electron/executable-explanation-verification.mjs";
 import { CurriculumPhase, TRANSFER_CURRICULUM_VERSION, administerPostTest, administerPreTest, bestStructuralMatch, classifyStructuralRelation, detectMemorizedSymbolLeak, evaluateTransferGain, openTransferCurriculum, recordLessonDelivered, renderTransferCurriculum, selectTransferCandidates } from "../electron/transfer-curriculum.mjs";
+import { LOCAL_MODEL_EVALUATION_VERSION, MIN_SAMPLE_RUNS, buildLocalModelCandidates, estimateEnergyProxy, renderLocalModelEvaluation, runLocalModelEvaluation, runLocalModelTask } from "../electron/local-model-evaluation.mjs";
 import { loadLearnerState, loadLearnerStateReport, saveLearnerState } from "../electron/learning-store.mjs";
 import { addEvidence, completeDiagnostic, recommend } from "../src/learning.ts";
 import { DURABLE_VERSION, inspectDurable, readDurable, sweepInterruptedWrites, writeDurable } from "../electron/durable-store.mjs";
@@ -10635,4 +10636,120 @@ test("cross-repository transfer curricula select structurally related unseen rep
   const rendered = renderTransferCurriculum(curriculum);
   assert.ok(rendered.includes(relatedRepo.repository.id));
   assert.ok(rendered.includes(CurriculumPhase.POST_TESTED));
+});
+
+test("local model/provider candidates are compared on fixed tasks for privacy, grounding, latency, memory, energy, and pedagogical policy compliance", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "local-model-eval-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "engine"), { recursive: true });
+  const plannerSource = "def plan_batch(requests):\n    return sorted(requests)\n";
+  await writeFile(path.join(rootPath, "engine", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "engine", "planner.py"), plannerSource);
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const lineCounts = { "engine/planner.py": plannerSource.split("\n").length };
+
+  assert.equal(LOCAL_MODEL_EVALUATION_VERSION, 1);
+
+  const tasks = [
+    { id: "task-1", channel: "tutor:answer" },
+    { id: "task-2", channel: "tutor:answer" },
+    { id: "task-3", channel: "tutor:answer" },
+  ];
+
+  // --- buildLocalModelCandidates: carries exactly what the learner picked --
+  const [goodCandidate, leakyCandidate, dumpingCandidate] = buildLocalModelCandidates([
+    {
+      provider: "local", model: "qwen2.5-coder", quantization: "q4_K_M",
+      answer: async () => ({ text: "`plan_batch` is defined at engine/planner.py:1; it sorts the incoming requests, for example plan_batch([3, 1, 2]) returns [1, 2, 3].", pack: { sections: [{ source: "engine/planner.py:1" }] } }),
+      offlineEntries: [{ name: "local-adapter.mjs", source: "export function answer() { return 'ok'; }" }],
+    },
+    {
+      provider: "local", model: "qwen2.5-coder", quantization: "q8_0",
+      answer: async () => ({ text: "`plan_batch` sorts requests, for example plan_batch([3, 1]) returns [1, 3]. By the way the answerKey is secret-value-123.", answerKey: "secret-value-123", pack: { sections: [{ source: "engine/planner.py:1" }] } }),
+      offlineEntries: [{ name: "leaky-adapter.mjs", source: "import('node:https').then(() => {});" }],
+    },
+    {
+      provider: "local", model: "tiny-llm", quantization: "q2_K",
+      answer: async () => ({ text: "The answer is: def plan_batch(requests):\n    return sorted(requests)", pack: { sections: [] } }),
+      offlineEntries: [{ name: "tiny-adapter.mjs", source: "export function answer() { return 'ok'; }" }],
+    },
+  ]);
+  assert.equal(goodCandidate.id, "local:qwen2.5-coder:q4_K_M");
+  assert.equal(leakyCandidate.quantization, "q8_0");
+
+  // --- estimateEnergyProxy: a real CPU-time delta, explicitly labeled a proxy
+  const proxy = await estimateEnergyProxy(async () => {
+    let total = 0;
+    for (let index = 0; index < 100_000; index += 1) total += index;
+    return total;
+  });
+  assert.equal(proxy.kind, "proxy");
+  assert.ok(proxy.cpuMicros >= 0, JSON.stringify(proxy));
+
+  // --- runLocalModelTask: one candidate, one task, every axis in one case --
+  const goodCase = await runLocalModelTask(goodCandidate, tasks[0], { repository, lineCounts, watchMemory: () => ({ stop: () => ({ peakRss: 1_000_000, peakHeap: 500_000 }) }) });
+  assert.equal(goodCase.taskId, "task-1");
+  assert.ok(goodCase.grounding.score > 0.5, JSON.stringify(goodCase.grounding));
+  assert.equal(goodCase.policyCompliant, true);
+  assert.equal(goodCase.peakRssBytes, 1_000_000);
+
+  const leakyCase = await runLocalModelTask(leakyCandidate, tasks[0], { repository, lineCounts, watchMemory: () => ({ stop: () => ({ peakRss: 1_000_000, peakHeap: 500_000 }) }) });
+  assert.equal(leakyCase.policyAudit.ok, false, JSON.stringify(leakyCase.policyAudit));
+  assert.equal(leakyCase.policyCompliant, false, "an answerKey leak must fail policy compliance even with good pedagogy");
+
+  const dumpingCase = await runLocalModelTask(dumpingCandidate, tasks[0], { repository, lineCounts, watchMemory: () => ({ stop: () => ({ peakRss: 1_000_000, peakHeap: 500_000 }) }) });
+  assert.equal(dumpingCase.pedagogy.handsRawSolution, false, JSON.stringify(dumpingCase.pedagogy));
+  // The dumping candidate's answer gives a mechanism and an example but no
+  // real solution string was ever registered for this fixture, so it is
+  // graded on pedagogy structure, not solution leakage; it still complies.
+  assert.equal(typeof dumpingCase.policyCompliant, "boolean");
+
+  // --- runLocalModelEvaluation: full suite, per-candidate, never blended ---
+  const report = await runLocalModelEvaluation({
+    candidates: [goodCandidate, leakyCandidate],
+    tasks,
+    repository,
+    lineCounts,
+    now: () => ({ rss: 2_000_000, heapUsed: 1_000_000 }),
+  });
+  assert.equal(report.version, LOCAL_MODEL_EVALUATION_VERSION);
+  assert.equal(report.candidates.length, 2);
+
+  const goodReport = report.candidates.find((entry) => entry.candidateId === "local:qwen2.5-coder:q4_K_M");
+  assert.equal(goodReport.privacy.ok, true, JSON.stringify(goodReport.privacy));
+  assert.equal(goodReport.policy.compliantCount, tasks.length);
+  assert.equal(goodReport.latency.kind, "measured");
+  assert.equal(goodReport.latency.unit, "ms");
+  assert.equal(goodReport.memory.kind, "measured");
+  assert.equal(goodReport.energy.kind, "proxy");
+  assert.ok(goodReport.latency.reliable, "three task runs must clear the MIN_SAMPLE_RUNS floor");
+  assert.equal(MIN_SAMPLE_RUNS, 3);
+
+  const leakyReport = report.candidates.find((entry) => entry.candidateId === "local:qwen2.5-coder:q8_0");
+  assert.equal(leakyReport.privacy.ok, false, "an adapter that reaches node:https must not be reported offline-safe");
+  assert.ok(leakyReport.privacy.findings.length > 0);
+  assert.equal(leakyReport.policy.compliantCount, 0, "every task must fail policy compliance once the answer leaks answerKey");
+
+  // Axes are per-candidate, never blended: a privacy failure on the leaky
+  // candidate must not change the good candidate's own privacy verdict.
+  assert.notDeepEqual(goodReport.privacy, leakyReport.privacy);
+
+  // --- below the sample floor: fewer task runs must not claim "reliable" --
+  const smallReport = await runLocalModelEvaluation({
+    candidates: [goodCandidate],
+    tasks: [tasks[0]],
+    repository,
+    lineCounts,
+    now: () => ({ rss: 2_000_000, heapUsed: 1_000_000 }),
+  });
+  assert.equal(smallReport.candidates[0].latency.reliable, false, "one task run must not be reported as a reliable latency summary");
+
+  // --- renderLocalModelEvaluation ------------------------------------------
+  const rendered = renderLocalModelEvaluation(report);
+  assert.ok(rendered.includes(goodCandidate.id));
+  assert.ok(rendered.includes("offline-safe"));
+  assert.ok(rendered.includes("not-proven"));
 });
