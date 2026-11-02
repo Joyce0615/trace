@@ -69,6 +69,7 @@ import { DELAYED_TRANSFER_BUCKETS, delayedTransferAnalytics } from "../electron/
 import { EXECUTABLE_EXPLANATION_VERIFICATION_VERSION, MIN_COUNTEREXAMPLE_PROBES, TEACHING_GATE_STATUSES, extractExecutableClaims, gateHighConfidenceTeaching, verifyExplanationClaimsExecutably, verifyHintExecutably, verifyLessonExecutably } from "../electron/executable-explanation-verification.mjs";
 import { CurriculumPhase, TRANSFER_CURRICULUM_VERSION, administerPostTest, administerPreTest, bestStructuralMatch, classifyStructuralRelation, detectMemorizedSymbolLeak, evaluateTransferGain, openTransferCurriculum, recordLessonDelivered, renderTransferCurriculum, selectTransferCandidates } from "../electron/transfer-curriculum.mjs";
 import { LOCAL_MODEL_EVALUATION_VERSION, MIN_SAMPLE_RUNS, buildLocalModelCandidates, estimateEnergyProxy, renderLocalModelEvaluation, runLocalModelEvaluation, runLocalModelTask } from "../electron/local-model-evaluation.mjs";
+import { DEFAULT_MASTERY_THRESHOLD, MIN_COHORT_SIZE, PRIVATE_COHORT_ANALYTICS_VERSION, aggregateCohortOutcomes, attritionSensitivityBounds, evaluatePrivateCohortAnalytics, laplaceNoise, learnerRetentionOutcome, learnerTransferOutcome, openPrivacyBudget, renderPrivateCohortAnalytics, seededUniform, spendEpsilon } from "../electron/private-cohort-analytics.mjs";
 import { loadLearnerState, loadLearnerStateReport, saveLearnerState } from "../electron/learning-store.mjs";
 import { addEvidence, completeDiagnostic, recommend } from "../src/learning.ts";
 import { DURABLE_VERSION, inspectDurable, readDurable, sweepInterruptedWrites, writeDurable } from "../electron/durable-store.mjs";
@@ -10752,4 +10753,133 @@ test("local model/provider candidates are compared on fixed tasks for privacy, g
   assert.ok(rendered.includes(goodCandidate.id));
   assert.ok(rendered.includes("offline-safe"));
   assert.ok(rendered.includes("not-proven"));
+});
+
+test("private cohort analytics privatize retention/transfer rates with a spendable epsilon budget, a minimum cohort floor, attrition sensitivity, and reproducible seeds", async () => {
+  const base = Date.parse("2026-07-01T09:00:00.000Z");
+  const at = (minutes) => new Date(base + minutes * 60_000).toISOString();
+  const skillGraph = { nodes: [] };
+  const studiedPaths = ["app/studied.py"];
+
+  assert.equal(PRIVATE_COHORT_ANALYTICS_VERSION, 1);
+  assert.equal(MIN_COHORT_SIZE, 5);
+  assert.equal(DEFAULT_MASTERY_THRESHOLD, 0.5);
+
+  // --- seededUniform / laplaceNoise: reproducible, derived from hash32 ----
+  assert.equal(seededUniform("seed-a", 0), seededUniform("seed-a", 0));
+  assert.notEqual(seededUniform("seed-a", 0), seededUniform("seed-a", 1));
+  assert.ok(seededUniform("seed-a", 0) >= 0 && seededUniform("seed-a", 0) < 1);
+  assert.equal(laplaceNoise("seed-a", 0, 1), laplaceNoise("seed-a", 0, 1));
+  assert.notEqual(laplaceNoise("seed-a", 0, 1), laplaceNoise("seed-a", 1, 1));
+  assert.ok(Number.isFinite(laplaceNoise("seed-a", 0, 1)));
+
+  // --- learnerRetentionOutcome / learnerTransferOutcome ---------------------
+  const buildLearnerEvents = (retentionCorrect, transferCorrect, reviewCount = 3) => [
+    ...Array.from({ length: reviewCount }, (_, index) => ({ at: at(index), kind: "review", correct: retentionCorrect, elapsedDays: 0.5, stability: 10 })),
+    ...[0, 1, 2].map((index) => ({ at: at(10 + index), kind: "prediction", correct: transferCorrect, path: "app/unseen.py" })),
+  ];
+  const strongLearner = buildLearnerEvents(true, true);
+  const weakLearner = buildLearnerEvents(false, false);
+  assert.equal(learnerRetentionOutcome(strongLearner, null, skillGraph, { studiedPaths }), 1);
+  assert.equal(learnerTransferOutcome(strongLearner, null, { studiedPaths }), 1);
+  assert.equal(learnerRetentionOutcome(weakLearner, null, skillGraph, { studiedPaths }), 0);
+  assert.equal(learnerTransferOutcome(weakLearner, null, { studiedPaths }), 0);
+  // Below analytics.mjs's own MIN_SAMPLE floor (3), the underlying rate is
+  // null, and the outcome must be null too, not a coerced zero.
+  const thinLearner = buildLearnerEvents(true, true, 2);
+  assert.equal(learnerRetentionOutcome(thinLearner, null, skillGraph, { studiedPaths }), null);
+  assert.equal(learnerTransferOutcome(thinLearner, null, { studiedPaths }), 1, "transfer evidence is unaffected by a thin retention log");
+
+  // --- aggregateCohortOutcomes: a null contributor is excluded, not zeroed -
+  assert.deepEqual(aggregateCohortOutcomes([1, 1, 0, null]), { contributed: 3, successes: 2, rate: round4(2 / 3) });
+  assert.deepEqual(aggregateCohortOutcomes([null, null]), { contributed: 0, successes: 0, rate: null });
+
+  // --- attritionSensitivityBounds -----------------------------------------
+  const bounds = attritionSensitivityBounds(4, { contributed: 3, successes: 2 });
+  assert.deepEqual(bounds, { lower: 0.5, upper: 0.75, missing: 1, width: 0.25, enrolled: 4, contributed: 3 });
+  assert.equal(attritionSensitivityBounds(0, { contributed: 0, successes: 0 }).reason, "no-roster");
+  assert.equal(attritionSensitivityBounds(3, { contributed: 3, successes: 3 }).width, 0, "full participation with full success has zero width");
+
+  // --- openPrivacyBudget / spendEpsilon ------------------------------------
+  assert.equal(openPrivacyBudget(0).ok, false);
+  assert.equal(openPrivacyBudget(-1).ok, false);
+  const opened = openPrivacyBudget(2, { seed: "budget-seed" });
+  assert.equal(opened.ok, true);
+  assert.equal(opened.budget.spent, 0);
+  const spent1 = spendEpsilon(opened.budget, 1, "axis-a");
+  assert.equal(spent1.ok, true);
+  assert.equal(spent1.budget.spent, 1);
+  assert.equal(spent1.remaining, 1);
+  const spent2 = spendEpsilon(spent1.budget, 1, "axis-b");
+  assert.equal(spent2.ok, true);
+  assert.equal(spent2.remaining, 0);
+  const overspent = spendEpsilon(spent2.budget, 1, "axis-c");
+  assert.equal(overspent.ok, false);
+  assert.equal(overspent.reason, "budget-exhausted");
+  assert.equal(overspent.remaining, 0);
+  assert.equal(spendEpsilon(opened.budget, 0, "bad").ok, false);
+  assert.equal(spendEpsilon(opened.budget, 0, "bad").reason, "invalid-query-epsilon");
+
+  // --- evaluatePrivateCohortAnalytics: cohort-too-small refuses up front --
+  const tooSmall = evaluatePrivateCohortAnalytics({ roster: ["a", "b"], learners: [], skillGraph });
+  assert.equal(tooSmall.ok, false);
+  assert.equal(tooSmall.reason, "cohort-too-small");
+  assert.equal(tooSmall.required, MIN_COHORT_SIZE);
+
+  // --- a full, successful cohort report: both axes contribute, never blended
+  const roster = ["learner-a", "learner-b", "learner-c", "learner-missing"];
+  const learners = [
+    { events: buildLearnerEvents(true, true) },
+    { events: buildLearnerEvents(true, false) },
+    { events: buildLearnerEvents(false, true) },
+  ];
+  const options = { minimumCohortSize: 3, epsilonPerQuery: 1, seed: "cohort-seed", studiedPaths };
+  const report = evaluatePrivateCohortAnalytics({ roster, learners, skillGraph, options });
+  assert.equal(report.ok, true);
+  assert.equal(report.enrolled, 4);
+  assert.equal(report.budget.totalEpsilon, 2);
+  assert.equal(report.budget.spent, 2);
+  assert.equal(report.budget.remaining, 0);
+  assert.equal(report.retention.raw, round4(2 / 3));
+  assert.equal(report.retention.contributed, 3);
+  assert.ok(report.retention.value !== null && report.retention.value >= 0 && report.retention.value <= 1);
+  assert.equal(report.transfer.raw, round4(2 / 3));
+  assert.deepEqual(report.retention.attrition, { lower: 0.5, upper: 0.75, missing: 1, width: 0.25, enrolled: 4, contributed: 3 });
+  assert.deepEqual(report.transfer.attrition, { lower: 0.5, upper: 0.75, missing: 1, width: 0.25, enrolled: 4, contributed: 3 });
+  // Axes are never blended: corrupting one axis's attrition object must not
+  // change the other's, i.e. they are not the same reference.
+  assert.notEqual(report.retention.attrition, report.transfer.attrition);
+
+  // --- reproducible seeds: the same inputs produce byte-identical reports --
+  const repeat = evaluatePrivateCohortAnalytics({ roster, learners, skillGraph, options });
+  assert.deepEqual(report, repeat);
+  const differentSeed = evaluatePrivateCohortAnalytics({ roster, learners, skillGraph, options: { ...options, seed: "a-different-seed" } });
+  assert.notEqual(differentSeed.digest, report.digest, "a different seed must change the privatized report's digest");
+
+  // --- a too-thin axis is reported insufficient and spends no budget ------
+  const thinLearners = [
+    { events: buildLearnerEvents(true, true, 2) },
+    { events: buildLearnerEvents(true, false, 2) },
+    { events: buildLearnerEvents(false, true) },
+  ];
+  const thinReport = evaluatePrivateCohortAnalytics({ roster, learners: thinLearners, skillGraph, options });
+  assert.equal(thinReport.ok, true);
+  assert.equal(thinReport.retention.value, null, "only one learner's retention log cleared analytics.mjs's own sample floor");
+  assert.equal(thinReport.retention.reason, "insufficient-evidence");
+  assert.equal(thinReport.transfer.value !== null, true, "transfer evidence is unaffected by the thin retention logs");
+  assert.equal(thinReport.budget.spent, 1, "no epsilon is spent on an axis that was never released");
+
+  // --- budget exhaustion is refused, by name, not silently truncated ------
+  const exhausted = evaluatePrivateCohortAnalytics({ roster, learners, skillGraph, options: { ...options, totalEpsilon: 1 } });
+  assert.equal(exhausted.ok, false);
+  assert.equal(exhausted.reason, "budget-exhausted");
+  assert.equal(exhausted.remaining, 0);
+
+  // --- renderPrivateCohortAnalytics ----------------------------------------
+  const renderedRefusal = renderPrivateCohortAnalytics(tooSmall);
+  assert.match(renderedRefusal, /cohort-too-small/);
+  const rendered = renderPrivateCohortAnalytics(report);
+  assert.match(rendered, /Retention/);
+  assert.match(rendered, /Transfer/);
+  assert.match(rendered, /epsilon/);
 });
