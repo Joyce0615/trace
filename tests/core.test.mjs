@@ -70,6 +70,7 @@ import { EXECUTABLE_EXPLANATION_VERIFICATION_VERSION, MIN_COUNTEREXAMPLE_PROBES,
 import { CurriculumPhase, TRANSFER_CURRICULUM_VERSION, administerPostTest, administerPreTest, bestStructuralMatch, classifyStructuralRelation, detectMemorizedSymbolLeak, evaluateTransferGain, openTransferCurriculum, recordLessonDelivered, renderTransferCurriculum, selectTransferCandidates } from "../electron/transfer-curriculum.mjs";
 import { LOCAL_MODEL_EVALUATION_VERSION, MIN_SAMPLE_RUNS, buildLocalModelCandidates, estimateEnergyProxy, renderLocalModelEvaluation, runLocalModelEvaluation, runLocalModelTask } from "../electron/local-model-evaluation.mjs";
 import { DEFAULT_MASTERY_THRESHOLD, MIN_COHORT_SIZE, PRIVATE_COHORT_ANALYTICS_VERSION, aggregateCohortOutcomes, attritionSensitivityBounds, evaluatePrivateCohortAnalytics, laplaceNoise, learnerRetentionOutcome, learnerTransferOutcome, openPrivacyBudget, renderPrivateCohortAnalytics, seededUniform, spendEpsilon } from "../electron/private-cohort-analytics.mjs";
+import { ACCESSIBILITY_LEARNING_EXPERIMENTS_VERSION, ACCESSIBILITY_PATHS, DEFAULT_EQUIVALENCE_MARGIN, PATH_AUDIT_RULES, auditPathCompliance, buildPathComparison, evaluateDifficultyEquivalence, measureContrastCompliance, pathAccommodation, renderAccessibilityLearningExperiments, runAccessibilityLearningExperiment, runAllAccessibilityPaths } from "../electron/accessibility-learning-experiments.mjs";
 import { loadLearnerState, loadLearnerStateReport, saveLearnerState } from "../electron/learning-store.mjs";
 import { addEvidence, completeDiagnostic, recommend } from "../src/learning.ts";
 import { DURABLE_VERSION, inspectDurable, readDurable, sweepInterruptedWrites, writeDurable } from "../electron/durable-store.mjs";
@@ -10882,4 +10883,149 @@ test("private cohort analytics privatize retention/transfer rates with a spendab
   assert.match(rendered, /Retention/);
   assert.match(rendered, /Transfer/);
   assert.match(rendered, /epsilon/);
+});
+
+test("accessibility-aware learning experiments accommodate keyboard-only, screen-reader, reduced-motion, contrast, cognitive-load, and alternative-format paths while holding the assessment difficulty bar equivalent", () => {
+  assert.equal(ACCESSIBILITY_LEARNING_EXPERIMENTS_VERSION, 1);
+  assert.deepEqual(ACCESSIBILITY_PATHS, ["keyboard-only", "screen-reader", "reduced-motion", "contrast", "cognitive-load", "alternative-format"]);
+  assert.equal(DEFAULT_EQUIVALENCE_MARGIN, 0.1);
+
+  let nextIndex = 0;
+  const element = (tag, overrides = {}) => ({
+    index: nextIndex++,
+    tag,
+    parentIndex: -1,
+    classes: [],
+    attributes: {},
+    ownText: "",
+    text: "",
+    tabIndex: tag === "button" || tag === "input" || tag === "a" ? 0 : -1,
+    disabled: false,
+    width: 40,
+    height: 40,
+    display: "block",
+    visibility: "visible",
+    opacity: 1,
+    color: "rgb(255, 255, 255)",
+    backgroundColor: "rgb(0, 0, 0)",
+    fontSize: 14,
+    fontWeight: 400,
+    outlineStyle: "none",
+    ...overrides,
+  });
+  const page = (nodes, extra = {}) => ({ url: "http://test", title: "Trace", lang: "en", activeElementIndex: -1, nodes, ...extra });
+
+  // --- pathAccommodation: changes presentation/input/time, never scoring --
+  assert.equal(pathAccommodation("not-a-path").ok, false);
+  const keyboardAccommodation = pathAccommodation("keyboard-only");
+  assert.equal(keyboardAccommodation.interactionMode, "keyboard-only");
+  assert.equal(keyboardAccommodation.displaySettings.contrast, "normal");
+  const contrastAccommodation = pathAccommodation("contrast");
+  assert.equal(contrastAccommodation.displaySettings.contrast, "high");
+  const motionAccommodation = pathAccommodation("reduced-motion");
+  assert.equal(motionAccommodation.displaySettings.motion, "reduced");
+  const cognitiveAccommodation = pathAccommodation("cognitive-load");
+  assert.equal(cognitiveAccommodation.extraTimeMultiplier, 2);
+  const formatAccommodation = pathAccommodation("alternative-format");
+  assert.equal(formatAccommodation.presentationMode, "text-equivalent");
+  for (const accommodation of [keyboardAccommodation, contrastAccommodation, motionAccommodation, cognitiveAccommodation, formatAccommodation]) {
+    assert.equal("score" in accommodation, false, "an accommodation must never carry a scoring field");
+  }
+
+  // --- auditPathCompliance: reuses auditSnapshot unmodified, scoped to the path's own rules ---
+  assert.deepEqual(PATH_AUDIT_RULES["keyboard-only"], ["no-positive-tabindex", "focusable-aria-hidden", "tab-parent", "tab-selected", "tablist-empty", "tablist-roving"]);
+  const cleanSnapshot = page([element("button", { text: "Save" })]);
+  assert.equal(auditPathCompliance("keyboard-only", cleanSnapshot).compliant, true);
+  const positiveTabindex = page([element("button", { text: "Save", tabIndex: 1 })]);
+  const keyboardAudit = auditPathCompliance("keyboard-only", positiveTabindex);
+  assert.equal(keyboardAudit.compliant, false);
+  assert.deepEqual(keyboardAudit.violations.map((v) => v.rule), ["no-positive-tabindex"]);
+  const namelessSnapshot = page([element("button")]);
+  const screenReaderAudit = auditPathCompliance("screen-reader", namelessSnapshot);
+  assert.equal(screenReaderAudit.compliant, false);
+  assert.deepEqual(screenReaderAudit.violations.map((v) => v.rule), ["interactive-name"]);
+  // A violation outside this path's own rule set must not count against it.
+  assert.equal(auditPathCompliance("contrast", positiveTabindex).compliant, true, "a tabindex violation does not belong to the contrast path");
+  // A path with no static rule says so, rather than fabricating a pass.
+  const motionCompliance = auditPathCompliance("reduced-motion", cleanSnapshot);
+  assert.equal(motionCompliance.applicable, false);
+  assert.match(motionCompliance.reason, /no static rule/);
+  const cognitiveCompliance = auditPathCompliance("cognitive-load", cleanSnapshot);
+  assert.equal(cognitiveCompliance.applicable, false);
+  const formatCompliance = auditPathCompliance("alternative-format", cleanSnapshot);
+  assert.equal(formatCompliance.applicable, false);
+
+  // --- measureContrastCompliance: theme.mjs's own CONTRAST_TARGETS, reused ---
+  const goodContrast = measureContrastCompliance([{ foreground: [255, 255, 255], background: [0, 0, 0] }], "high");
+  assert.equal(goodContrast.compliant, true);
+  assert.equal(goodContrast.required, 7);
+  const badContrast = measureContrastCompliance([{ foreground: [150, 150, 150], background: [100, 100, 100] }], "high");
+  assert.equal(badContrast.compliant, false);
+  assert.equal(badContrast.failing.length, 1);
+
+  // --- buildPathComparison / evaluateDifficultyEquivalence -----------------
+  // Equivalent scores: the same distribution on both arms.
+  const equivalentComparison = buildPathComparison("keyboard-only", [0.8, 0.82, 0.79, 0.81, 0.8], [0.79, 0.81, 0.8, 0.82, 0.78]);
+  assert.equal(equivalentComparison.powered, true);
+  const equivalentVerdict = evaluateDifficultyEquivalence(equivalentComparison);
+  assert.equal(equivalentVerdict.verdict, "equivalent", JSON.stringify(equivalentComparison));
+
+  // A genuinely harder path: scores far enough below baseline that the
+  // interval does not fit inside the margin, even though it is powered.
+  const harderComparison = buildPathComparison("cognitive-load", [0.9, 0.88, 0.91, 0.89, 0.9], [0.5, 0.48, 0.52, 0.49, 0.51]);
+  assert.equal(harderComparison.powered, true);
+  const harderVerdict = evaluateDifficultyEquivalence(harderComparison);
+  assert.equal(harderVerdict.verdict, "not-equivalent", JSON.stringify(harderComparison));
+  // "not-equivalent" is a stronger, different claim than analyzeExperiment's
+  // own "no-difference" — this comparison's own crude verdict may or may not
+  // agree, but equivalence must never be reported as "equivalent" when the
+  // path is clearly harder.
+  assert.notEqual(harderVerdict.verdict, "equivalent");
+
+  // Below the sample floor: underpowered, never silently promoted to "equivalent".
+  const thinComparison = buildPathComparison("screen-reader", [0.8], [0.8]);
+  assert.equal(thinComparison.powered, false);
+  const thinVerdict = evaluateDifficultyEquivalence(thinComparison);
+  assert.equal(thinVerdict.verdict, "underpowered");
+  assert.ok(thinVerdict.needed > 0);
+
+  // --- runAccessibilityLearningExperiment: three claims, never blended ----
+  const fullReport = runAccessibilityLearningExperiment({
+    path: "contrast",
+    baselineScores: [0.8, 0.82, 0.79, 0.81, 0.8],
+    pathScores: [0.79, 0.81, 0.8, 0.82, 0.78],
+    snapshot: cleanSnapshot,
+    contrastPairs: [{ foreground: [255, 255, 255], background: [0, 0, 0] }],
+  });
+  assert.equal(fullReport.ok, true);
+  assert.equal(fullReport.compliance.applicable, true);
+  assert.equal(fullReport.compliance.compliant, true);
+  assert.equal(fullReport.contrastCheck.compliant, true);
+  assert.equal(fullReport.equivalence.verdict, "equivalent");
+  // A path that is structurally non-compliant can still be reported
+  // difficulty-equivalent — the two claims never contaminate each other.
+  const nonCompliantButEquivalent = runAccessibilityLearningExperiment({
+    path: "keyboard-only",
+    baselineScores: [0.8, 0.82, 0.79, 0.81, 0.8],
+    pathScores: [0.79, 0.81, 0.8, 0.82, 0.78],
+    snapshot: positiveTabindex,
+  });
+  assert.equal(nonCompliantButEquivalent.compliance.compliant, false);
+  assert.equal(nonCompliantButEquivalent.equivalence.verdict, "equivalent");
+
+  // --- runAllAccessibilityPaths: all six, never averaged into one score ---
+  const allReports = runAllAccessibilityPaths({
+    baselineScores: [0.8, 0.82, 0.79, 0.81, 0.8],
+    perPathScores: Object.fromEntries(ACCESSIBILITY_PATHS.map((path) => [path, [0.79, 0.81, 0.8, 0.82, 0.78]])),
+    snapshots: { "keyboard-only": cleanSnapshot, "screen-reader": cleanSnapshot, contrast: cleanSnapshot },
+    contrastPairs: [{ foreground: [255, 255, 255], background: [0, 0, 0] }],
+  });
+  assert.equal(allReports.length, 6);
+  assert.deepEqual(allReports.map((report) => report.path), ACCESSIBILITY_PATHS);
+  for (const report of allReports) assert.equal(report.equivalence.verdict, "equivalent");
+
+  // --- renderAccessibilityLearningExperiments -------------------------------
+  const rendered = renderAccessibilityLearningExperiments(allReports);
+  assert.match(rendered, /keyboard-only/);
+  assert.match(rendered, /equivalent/);
 });
