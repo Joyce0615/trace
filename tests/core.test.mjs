@@ -71,6 +71,7 @@ import { CurriculumPhase, TRANSFER_CURRICULUM_VERSION, administerPostTest, admin
 import { LOCAL_MODEL_EVALUATION_VERSION, MIN_SAMPLE_RUNS, buildLocalModelCandidates, estimateEnergyProxy, renderLocalModelEvaluation, runLocalModelEvaluation, runLocalModelTask } from "../electron/local-model-evaluation.mjs";
 import { DEFAULT_MASTERY_THRESHOLD, MIN_COHORT_SIZE, PRIVATE_COHORT_ANALYTICS_VERSION, aggregateCohortOutcomes, attritionSensitivityBounds, evaluatePrivateCohortAnalytics, laplaceNoise, learnerRetentionOutcome, learnerTransferOutcome, openPrivacyBudget, renderPrivateCohortAnalytics, seededUniform, spendEpsilon } from "../electron/private-cohort-analytics.mjs";
 import { ACCESSIBILITY_LEARNING_EXPERIMENTS_VERSION, ACCESSIBILITY_PATHS, DEFAULT_EQUIVALENCE_MARGIN, PATH_AUDIT_RULES, auditPathCompliance, buildPathComparison, evaluateDifficultyEquivalence, measureContrastCompliance, pathAccommodation, renderAccessibilityLearningExperiments, runAccessibilityLearningExperiment, runAllAccessibilityPaths } from "../electron/accessibility-learning-experiments.mjs";
+import { CURRICULUM_UPDATE_FORMAT, CURRICULUM_UPDATE_VERSION, assessCurriculumUpdateCompatibility, assessMigrationReadiness, buildCurriculumUpdate, describeCurriculumUpdateDecision, evaluateCurriculumUpdate, installCurriculumUpdate, proveCurriculumUpdateInstallerOffline, rollbackCurriculumUpdate, scanCurriculumUpdateForAnswerLeakage, signCurriculumUpdate, verifyCurriculumUpdateSignature } from "../electron/curriculum-update.mjs";
 import { loadLearnerState, loadLearnerStateReport, saveLearnerState } from "../electron/learning-store.mjs";
 import { addEvidence, completeDiagnostic, recommend } from "../src/learning.ts";
 import { DURABLE_VERSION, inspectDurable, readDurable, sweepInterruptedWrites, writeDurable } from "../electron/durable-store.mjs";
@@ -11028,4 +11029,151 @@ test("accessibility-aware learning experiments accommodate keyboard-only, screen
   const rendered = renderAccessibilityLearningExperiments(allReports);
   assert.match(rendered, /keyboard-only/);
   assert.match(rendered, /equivalent/);
+});
+
+test("signed offline curriculum updates verify provenance, compatibility, migrations, rollback, model/index fingerprints, and answer-leakage before installing without network access", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-curriculum-update-"));
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+
+  assert.equal(CURRICULUM_UPDATE_FORMAT, "trace-curriculum-update-v1");
+  assert.equal(CURRICULUM_UPDATE_VERSION, 1);
+
+  // --- A tiny repository and a starter course against it -------------------
+  const rootPath = path.join(workspace, "repo");
+  await mkdir(path.join(rootPath, "app"), { recursive: true });
+  await writeFile(path.join(rootPath, "app", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "app", "queue.py"), "def enqueue(job):\n    return job\n");
+  await writeFile(path.join(rootPath, "LICENSE"), "MIT License\n\nPermission is hereby granted, free of charge, to any person obtaining a copy...\n");
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const course = generateStarterCourse(repository);
+  const sources = {};
+  for (const file of repository.files) sources[file.path] = await readRepositoryFile(rootPath, file.path);
+  const license = detectLicense(sources);
+
+  const keyPair = createKeyPair();
+  const trustedKeyIds = [keyPair.keyId];
+
+  // --- Build and sign ------------------------------------------------------
+  const built = buildCurriculumUpdate(repository, course, { sources, license, releaseVersion: "1.0.0" });
+  assert.equal(built.updateFormat, CURRICULUM_UPDATE_FORMAT);
+  assert.equal(built.releaseVersion, "1.0.0");
+  assert.ok(built.requiredModelFingerprint);
+  assert.ok(built.requiredIndexSignature);
+  // The course-package payload underneath is untouched: provenance, license
+  // gate, and anchor manifest all still hold.
+  assert.equal(built.provenance.repositoryId, repository.id);
+  assert.equal(built.license.embedsSource, false);
+
+  const signed = signCurriculumUpdate(built, keyPair);
+  const sealed = verifyCurriculumUpdateSignature(signed, { trustedKeyIds });
+  assert.equal(sealed.verified, true);
+  assert.equal(sealed.trust, "trusted");
+  // Tampering after signing is caught exactly like any other course package.
+  const tampered = { ...signed, releaseVersion: "99.0.0" };
+  assert.equal(verifyCurriculumUpdateSignature(tampered, { trustedKeyIds }).verified, false);
+
+  // --- Compatibility: version, model fingerprint, index signature ----------
+  const sameEnvironment = { installedVersion: "0.9.0", modelConfig: {}, indexSignature: built.requiredIndexSignature };
+  const compatible = assessCurriculumUpdateCompatibility(signed, sameEnvironment);
+  assert.equal(compatible.compatible, true, JSON.stringify(compatible.reasons));
+
+  const downgrade = assessCurriculumUpdateCompatibility(signed, { installedVersion: "2.0.0", indexSignature: built.requiredIndexSignature });
+  assert.equal(downgrade.compatible, false);
+  assert.ok(downgrade.reasons.some((reason) => reason.startsWith("downgrade:")));
+
+  const alreadyCurrent = assessCurriculumUpdateCompatibility(signed, { installedVersion: "1.0.0", indexSignature: built.requiredIndexSignature });
+  assert.ok(alreadyCurrent.reasons.some((reason) => reason.startsWith("already-current:")));
+
+  const wrongModel = assessCurriculumUpdateCompatibility(signed, { installedVersion: "0.9.0", modelConfig: { provider: "claude" }, indexSignature: built.requiredIndexSignature });
+  assert.ok(wrongModel.reasons.some((reason) => reason.startsWith("model-fingerprint-mismatch:")), JSON.stringify(wrongModel.reasons));
+
+  const wrongIndex = assessCurriculumUpdateCompatibility(signed, { installedVersion: "0.9.0", indexSignature: "ts1:deadbeef00000000" });
+  assert.ok(wrongIndex.reasons.some((reason) => reason.startsWith("index-signature-mismatch:")));
+
+  // --- Migration readiness: review gate ------------------------------------
+  assert.deepEqual(assessMigrationReadiness(null), { ready: true, pendingReview: 0 });
+  const reviewPlan = { operations: [{ id: "op-1", requiresReview: true }, { id: "op-2", requiresReview: false }] };
+  const notReady = assessMigrationReadiness(reviewPlan);
+  assert.equal(notReady.ready, false);
+  assert.equal(notReady.pendingReview, 1);
+  assert.deepEqual(notReady.pendingIds, ["op-1"]);
+  assert.equal(assessMigrationReadiness(reviewPlan, { accept: ["op-1"] }).ready, true);
+  assert.equal(assessMigrationReadiness(reviewPlan, { accept: "all" }).ready, true);
+
+  // --- Answer-leakage scan: clean course vs. a planted answer key ----------
+  const cleanLeakage = scanCurriculumUpdateForAnswerLeakage(signed);
+  assert.equal(cleanLeakage.ok, true);
+  assert.deepEqual(cleanLeakage.forbiddenFields, []);
+  const leakyBase = { ...built, content: { ...built.content, course: { ...built.content.course, modules: [{ id: "m1", lessons: [{ id: "l1", answerKey: "42", anchors: [] }] }] } } };
+  const leakyUpdate = signCurriculumUpdate(leakyBase, keyPair);
+  const leakyScan = scanCurriculumUpdateForAnswerLeakage(leakyUpdate);
+  assert.equal(leakyScan.ok, false);
+  assert.ok(leakyScan.forbiddenFields.some((pointer) => pointer.includes("answerKey")), JSON.stringify(leakyScan.forbiddenFields));
+
+  // --- Installer-offline proof: reuses model-fingerprint.mjs's own prover --
+  const cleanInstallerEntries = [{ name: "curriculum-update.mjs", source: "export function install() { return true; }" }];
+  const offlineProof = proveCurriculumUpdateInstallerOffline(cleanInstallerEntries);
+  assert.equal(offlineProof.offlineModeSafe, true);
+  const networkyEntries = [{ name: "curriculum-update.mjs", source: 'fetch("https://example.com")' }];
+  const networkyProof = proveCurriculumUpdateInstallerOffline(networkyEntries);
+  assert.equal(networkyProof.offlineModeSafe, false);
+  assert.ok(networkyProof.findings.length >= 1);
+
+  // --- evaluateCurriculumUpdate: every gate must hold, in order ------------
+  const goodVerification = evaluateCurriculumUpdate(signed, { trustedKeyIds, environment: sameEnvironment, installerEntries: cleanInstallerEntries });
+  assert.equal(goodVerification.acceptable, true, JSON.stringify(goodVerification));
+
+  assert.equal(evaluateCurriculumUpdate({ updateFormat: "something-else" }).reason, "unreadable");
+  assert.equal(evaluateCurriculumUpdate({ ...signed, updateVersion: 99 }).reason, "unreadable");
+  assert.equal(evaluateCurriculumUpdate(signed, { trustedKeyIds: [] }).reason, "untrusted-key");
+  assert.equal(evaluateCurriculumUpdate(tampered, { trustedKeyIds }).reason, "unsigned-or-tampered");
+  assert.equal(evaluateCurriculumUpdate(signed, { trustedKeyIds, environment: { installedVersion: "2.0.0", indexSignature: built.requiredIndexSignature } }).reason, "downgrade");
+  assert.equal(evaluateCurriculumUpdate(leakyUpdate, { trustedKeyIds, environment: sameEnvironment }).reason, "answer-leak");
+  assert.equal(evaluateCurriculumUpdate(signed, { trustedKeyIds, environment: sameEnvironment, installerEntries: networkyEntries }).reason, "network-capability-found");
+  const needsReviewUpdate = signCurriculumUpdate({ ...built, migrationPlan: reviewPlan }, keyPair);
+  assert.equal(evaluateCurriculumUpdate(needsReviewUpdate, { trustedKeyIds, environment: sameEnvironment }).reason, "migration-requires-review");
+  assert.equal(evaluateCurriculumUpdate(needsReviewUpdate, { trustedKeyIds, environment: sameEnvironment, migrationOptions: { accept: "all" } }).acceptable, true);
+
+  // --- Install: a first install with no prior course -----------------------
+  const firstInstall = installCurriculumUpdate(signed, null, { trustedKeyIds, environment: sameEnvironment, installerEntries: cleanInstallerEntries });
+  assert.equal(firstInstall.installed, true);
+  assert.equal(firstInstall.rollbackMigrationId, null);
+  assert.equal(firstInstall.course.id, course.id);
+
+  // A refused update never installs.
+  const refusedInstall = installCurriculumUpdate(signed, course, { trustedKeyIds: [] });
+  assert.equal(refusedInstall.installed, false);
+  assert.equal(refusedInstall.course, course);
+
+  // --- Install with a real migration plan, then roll it back --------------
+  const oldSnapshot = buildSymbolSnapshot(
+    [{ name: "enqueue", kind: "function", path: "app/queue.py", line: 1 }],
+    { "app/queue.py": "def enqueue(job):\n    validated = validate(job)\n    self.scheduler.add(validated)\n    return validated\n" },
+    { label: "v1", commit: "old" },
+  );
+  const newSnapshot = buildSymbolSnapshot(
+    [{ name: "push", kind: "function", path: "app/queue.py", line: 1 }],
+    { "app/queue.py": "def push(job):\n    validated = validate(job)\n    self.scheduler.add(validated)\n    return validated\n" },
+    { label: "v2", commit: "new" },
+  );
+  const courseWithAnchor = {
+    id: "course-with-anchor",
+    sourceCommit: "old",
+    modules: [{ id: "m1", lessons: [{ id: "l1", title: "Queueing", anchors: [{ path: "app/queue.py", line: 1, symbol: "enqueue" }], content: [] }] }],
+  };
+  const migrationPlan = planMigration(courseWithAnchor, oldSnapshot, newSnapshot);
+  const migratingUpdate = signCurriculumUpdate({ ...built, migrationPlan }, keyPair);
+  const migratedInstall = installCurriculumUpdate(migratingUpdate, courseWithAnchor, { trustedKeyIds, environment: sameEnvironment, installerEntries: cleanInstallerEntries, migrationOptions: { accept: "all" } });
+  assert.equal(migratedInstall.installed, true);
+  assert.ok(migratedInstall.rollbackMigrationId);
+  const migratedAnchor = migratedInstall.course.modules[0].lessons[0].anchors[0];
+  assert.equal(migratedAnchor.symbol, "push", JSON.stringify(migratedAnchor));
+
+  const rolledBack = rollbackCurriculumUpdate(migratedInstall.course, migratedInstall.rollbackMigrationId);
+  assert.equal(rolledBack.reverted !== false, true);
+  assert.equal(rolledBack.course.modules[0].lessons[0].anchors[0].symbol, "enqueue");
+
+  // --- Human-readable decision text -----------------------------------------
+  assert.match(describeCurriculumUpdateDecision(refusedInstall), /No install/);
+  assert.match(describeCurriculumUpdateDecision(migratedInstall), /migrating 1 anchor/);
 });
