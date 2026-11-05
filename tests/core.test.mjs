@@ -53,6 +53,7 @@ import { EMBEDDING_DIMENSIONS, SEARCH_VERSION, buildSearchIndex, cosine, editDis
 import { EVIDENCE_VERSION, evidenceByPath, evidenceForSkills, importEvidence } from "../electron/evidence-import.mjs";
 import { ARCHITECTURE_VERSION, architectureDiagramBlock, buildArchitecture, dataFlow, moduleFor, symbolNeighborhood } from "../electron/architecture.mjs";
 import { EXECUTION_TRACE_VERSION, detectRuntimes, runExecutionTrace, suggestTraceSnippets, summarizeTrace, traceSupported, traceTimelineBlock } from "../electron/execution-trace.mjs";
+import { PROGRAM_STATE_TRACE_VERSION, buildStateCheckpoints, buildStateTraceTask, gradeHypothesis, gradeStateTrace, publicStateCheckpointTask, recordStateTraceAttempt, renderStateTraceReview } from "../electron/program-state-tracing.mjs";
 import { RACE_GRADER_VERSION, buildRaceTask, gradeRaceSubmission, publicRaceTask, signatureParameters } from "../electron/race-grader.mjs";
 import { LOCALIZATION_VERSION, buildLocalizationExercise, nextHint, publicLocalizationExercise, scoreLocalization } from "../electron/localization.mjs";
 import { CALL_CHAIN_VERSION, buildCallChainExercises, buildCallChains, extractReturnExpressions, gradeCallChainAnswer, publicExercise, symbolBodyRange } from "../electron/call-chain.mjs";
@@ -11176,4 +11177,159 @@ test("signed offline curriculum updates verify provenance, compatibility, migrat
   // --- Human-readable decision text -----------------------------------------
   assert.match(describeCurriculumUpdateDecision(refusedInstall), /No install/);
   assert.match(describeCurriculumUpdateDecision(migratedInstall), /migrating 1 anchor/);
+});
+
+test("externalized program-state tracing turns a real execution trace into graded checkpoint annotations, a before-you-look hypothesis, and preserved evidence", async (context) => {
+  const runtimes = await detectRuntimes({ refresh: true });
+  if (!runtimes.python?.available) {
+    context.skip("No python runtime is installed, so program-state tracing cannot be verified here.");
+    return;
+  }
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "state-trace-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "app"), { recursive: true });
+  await writeFile(path.join(rootPath, "app", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "app", "core.py"), "def inner(x):\n    return x + 1\n\n\ndef outer(x):\n    return inner(x) * 2\n");
+  await writeFile(path.join(rootPath, "app", "boom.py"), "def explode():\n    raise ValueError('kaboom')\n");
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  assert.equal(PROGRAM_STATE_TRACE_VERSION, 1);
+
+  // Unsupported/unavailable traces pass through honestly rather than
+  // pretending a task was built.
+  const unsupported = buildStateTraceTask({ supported: false, reason: "Trace has no execution tracer for rust.", status: "unsupported" });
+  assert.equal(unsupported.available, false);
+  assert.match(unsupported.reason, /rust/);
+
+  const trace = await runExecutionTrace(repository, { language: "python", snippet: "from app.core import outer\nprint(outer(3))" });
+  assert.equal(trace.status, "ok", JSON.stringify({ error: trace.error, stderr: trace.stderr }));
+
+  const checkpoints = buildStateCheckpoints(trace);
+  assert.ok(checkpoints.length >= 4, String(checkpoints.length));
+  // Every checkpoint is a real recorded call/return, never invented.
+  for (const checkpoint of checkpoints) {
+    assert.ok(["call", "return"].includes(checkpoint.kind));
+    assert.ok(repository.files.some((file) => file.path === checkpoint.path));
+  }
+
+  const task = buildStateTraceTask(trace);
+  assert.equal(task.available, true);
+  assert.equal(task.checkpoints.length, checkpoints.length);
+  assert.equal(task.hypothesis.expectedStatus, "ok");
+  assert.equal(task.hypothesis.expectedFinalValue, "8");
+  assert.equal(task.hypothesis.finalFunction, "outer");
+
+  // The learner-facing projection hides every answer field.
+  const publicTask = publicStateCheckpointTask(task);
+  assert.equal(publicTask.checkpointCount, task.checkpoints.length);
+  for (const prompt of publicTask.prompts) {
+    assert.equal("value" in prompt, false);
+    assert.equal("function" in prompt, false);
+    assert.equal("depth" in prompt, false);
+  }
+  assert.match(publicTask.hypothesisPrompt, /Before you see the result/);
+
+  const outerIndex = task.checkpoints.findIndex((checkpoint) => checkpoint.function === "outer" && checkpoint.kind === "call");
+  const innerCallIndex = task.checkpoints.findIndex((checkpoint) => checkpoint.function === "inner" && checkpoint.kind === "call");
+  const innerReturnIndex = task.checkpoints.findIndex((checkpoint) => checkpoint.function === "inner" && checkpoint.kind === "return");
+  const outerReturnIndex = task.checkpoints.findIndex((checkpoint) => checkpoint.function === "outer" && checkpoint.kind === "return");
+  assert.ok([outerIndex, innerCallIndex, innerReturnIndex, outerReturnIndex].every((index) => index >= 0));
+
+  const toAnswer = (checkpoint) => ({
+    checkpointId: checkpoint.id,
+    controlFlow: checkpoint.kind,
+    function: checkpoint.function,
+    depth: checkpoint.depth,
+    value: checkpoint.value,
+  });
+
+  // A fully correct, checkpoint-by-checkpoint submission passes every step.
+  const perfectAnnotations = task.checkpoints.map(toAnswer);
+  const perfectGrade = gradeStateTrace(task, perfectAnnotations);
+  assert.equal(perfectGrade.passed, true);
+  assert.equal(perfectGrade.correct, task.checkpoints.length);
+  assert.equal(perfectGrade.score, 1);
+  assert.equal(perfectGrade.omitted, 0);
+  assert.equal(perfectGrade.swapped, 0);
+  assert.equal(perfectGrade.wrong, 0);
+
+  // Omission: the inner-return checkpoint is simply never answered.
+  const withOmission = task.checkpoints
+    .filter((checkpoint) => checkpoint.index !== innerReturnIndex)
+    .map(toAnswer);
+  const omissionGrade = gradeStateTrace(task, withOmission);
+  assert.equal(omissionGrade.omitted, 1);
+  assert.equal(omissionGrade.passed, false);
+  const omittedResult = omissionGrade.results.find((result) => result.index === innerReturnIndex);
+  assert.equal(omittedResult.status, "omitted");
+  assert.match(omittedResult.detail, /No annotation/);
+
+  // Swap: the inner-call checkpoint is annotated with the inner-return
+  // checkpoint's real state (a believable, concrete tracing mistake), and
+  // vice versa.
+  const swapAnnotations = task.checkpoints.map((checkpoint) => {
+    if (checkpoint.index === innerCallIndex) return { ...toAnswer(task.checkpoints[innerReturnIndex]), checkpointId: checkpoint.id };
+    if (checkpoint.index === innerReturnIndex) return { ...toAnswer(task.checkpoints[innerCallIndex]), checkpointId: checkpoint.id };
+    return toAnswer(checkpoint);
+  });
+  const swapGrade = gradeStateTrace(task, swapAnnotations);
+  assert.equal(swapGrade.swapped, 2);
+  const swappedCallResult = swapGrade.results.find((result) => result.index === innerCallIndex);
+  assert.equal(swappedCallResult.status, "swapped");
+  assert.equal(swappedCallResult.swappedWithIndex, innerReturnIndex);
+  assert.match(swappedCallResult.detail, new RegExp(`step ${innerReturnIndex + 1}`));
+
+  // Wrong: nonsense that matches neither its own checkpoint nor any other.
+  const wrongAnnotations = task.checkpoints.map((checkpoint) =>
+    checkpoint.index === outerReturnIndex
+      ? { checkpointId: checkpoint.id, controlFlow: "return", function: "nonexistent", depth: 99, value: "999" }
+      : toAnswer(checkpoint),
+  );
+  const wrongGrade = gradeStateTrace(task, wrongAnnotations);
+  assert.equal(wrongGrade.wrong, 1);
+  assert.equal(wrongGrade.results.find((result) => result.index === outerReturnIndex).status, "wrong");
+
+  // --- The before-you-look hypothesis, Brier-scored like this app's other
+  // stated-confidence predictions -------------------------------------------
+  const confidentRight = gradeHypothesis(task, { status: "ok", finalValue: "8", confidence: 0.9 });
+  assert.equal(confidentRight.correct, true);
+  assert.equal(confidentRight.calibration, "confident-and-right");
+  assert.equal(confidentRight.brier, 0.01);
+
+  const confidentWrong = gradeHypothesis(task, { status: "ok", finalValue: "999", confidence: 0.95 });
+  assert.equal(confidentWrong.correct, false);
+  assert.equal(confidentWrong.valueCorrect, false);
+  assert.equal(confidentWrong.calibration, "overconfident");
+
+  // An exception run has no final return value: the hypothesis only asks
+  // about status, and no phantom expected value is invented.
+  const failingTrace = await runExecutionTrace(repository, { language: "python", snippet: "from app.boom import explode\nexplode()" });
+  assert.equal(failingTrace.status, "error");
+  const failingTask = buildStateTraceTask(failingTrace);
+  assert.equal(failingTask.hypothesis.expectedStatus, "error");
+  assert.equal(failingTask.hypothesis.expectedFinalValue, null);
+  const failingHypothesis = gradeHypothesis(failingTask, { status: "error", finalValue: null, confidence: 0.8 });
+  assert.equal(failingHypothesis.correct, true);
+  assert.equal(failingHypothesis.valueCorrect, true);
+
+  // --- Attempts are preserved as evidence through the same append-only,
+  // main-process-owned activity log every other graded activity writes to --
+  const logDirectory = path.join(workspace, "state-trace-log");
+  const stored = await recordStateTraceAttempt(logDirectory, repository, task, omissionGrade, confidentWrong);
+  assert.equal(stored.kind, "program-state-trace");
+  assert.equal(stored.correct, false);
+  assert.equal(stored.omitted, 1);
+  assert.equal(stored.hypothesisCorrect, false);
+  const loggedEvents = await readEvents(logDirectory, repository.id);
+  assert.equal(loggedEvents.length, 1);
+  assert.equal(loggedEvents[0].taskId, task.id);
+
+  // --- The missed-step review is source-anchored for the lesson canvas -----
+  const review = renderStateTraceReview(task, omissionGrade);
+  assert.equal(review.type, "timeline");
+  assert.equal(review.steps.length, 1);
+  assert.equal(review.steps[0].anchor.symbol, "inner");
+  assert.ok(repository.files.some((file) => file.path === review.steps[0].anchor.path));
 });
