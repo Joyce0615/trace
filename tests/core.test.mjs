@@ -55,6 +55,7 @@ import { ARCHITECTURE_VERSION, architectureDiagramBlock, buildArchitecture, data
 import { EXECUTION_TRACE_VERSION, detectRuntimes, runExecutionTrace, suggestTraceSnippets, summarizeTrace, traceSupported, traceTimelineBlock } from "../electron/execution-trace.mjs";
 import { PROGRAM_STATE_TRACE_VERSION, buildStateCheckpoints, buildStateTraceTask, gradeHypothesis, gradeStateTrace, publicStateCheckpointTask, recordStateTraceAttempt, renderStateTraceReview } from "../electron/program-state-tracing.mjs";
 import { COGNITIVE_OFFLOAD_GUARD_VERSION, DEFAULT_MASTERY_FLOOR, EXPLANATION_GATE_THRESHOLD, classifyAssistanceSeeking, classifyRequest, classifyRequestObjective, describeOffloadDecision, gateHighAssistanceOutput, measureOffloadingOutcome, recordOffloadDecision } from "../electron/cognitive-offload-guard.mjs";
+import { DISAGREEMENT_THRESHOLD, PROCESS_TRACE_ASSESSMENT_VERSION, assessProcessTrace, scoreDebuggingStep, scoreEvidenceSelectionStep, scoreNavigationStep, scoreRevisionStep, scoreTracingStep, validateRubricAgreement } from "../electron/process-trace-assessment.mjs";
 import { RACE_GRADER_VERSION, buildRaceTask, gradeRaceSubmission, publicRaceTask, signatureParameters } from "../electron/race-grader.mjs";
 import { LOCALIZATION_VERSION, buildLocalizationExercise, nextHint, publicLocalizationExercise, scoreLocalization } from "../electron/localization.mjs";
 import { CALL_CHAIN_VERSION, buildCallChainExercises, buildCallChains, extractReturnExpressions, gradeCallChainAnswer, publicExercise, symbolBodyRange } from "../electron/call-chain.mjs";
@@ -11462,4 +11463,165 @@ test("cognitive-offloading safeguards classify requests, gate high-assistance ou
   assert.match(describeOffloadDecision(gatedClassification, unlockedByPrediction), /unlocked by a passing prediction/);
   assert.match(describeOffloadDecision(ungatedClassification, neverGated), /clears the bar/);
   assert.match(describeOffloadDecision(ordinaryClassification, gateHighAssistanceOutput(ordinaryClassification, {})), /not asking for a finished solution/);
+});
+
+test("process-trace learning assessment scores navigation, evidence selection, tracing, debugging, and revision separately from final answers, and validates automated rubrics against instructor review", async (context) => {
+  const runtimes = await detectRuntimes({ refresh: true });
+  if (!runtimes.python?.available) {
+    context.skip("No python runtime is installed, so process-trace assessment cannot be verified here.");
+    return;
+  }
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "process-trace-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "app"), { recursive: true });
+  await writeFile(path.join(rootPath, "app", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "app", "core.py"), "def inner(x):\n    return x + 1\n\n\ndef outer(x):\n    return inner(x) * 2\n");
+  await writeFile(path.join(rootPath, "app", "caller2.py"), "from app.core import outer\n\n\ndef runner(x):\n    return outer(x)\n");
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  assert.equal(PROCESS_TRACE_ASSESSMENT_VERSION, 1);
+
+  // --- Navigation and evidence selection both derive from
+  // localization.mjs's own scoreLocalization, but answer two different
+  // questions about the same submission ------------------------------------
+  const exercise = buildLocalizationExercise(repository, { symbol: "outer" });
+  const efficientAndPrecise = scoreLocalization(exercise, { inspected: exercise.goldFiles, selected: exercise.goldFiles }, repository);
+  const navigation = scoreNavigationStep(efficientAndPrecise);
+  assert.equal(navigation.available, true);
+  assert.equal(navigation.score, 1);
+  const evidence = scoreEvidenceSelectionStep(efficientAndPrecise);
+  assert.equal(evidence.available, true);
+  assert.equal(evidence.score, 1);
+  assert.equal(scoreNavigationStep(null).available, false);
+
+  // A submission that reads a lot of noise but still selects the right files
+  // navigates poorly while still selecting evidence well -- the two steps
+  // disagree, which is exactly why they are not one number.
+  const wastefulButCorrectSelection = scoreLocalization(
+    exercise,
+    { inspected: [...exercise.goldFiles, "app/__init__.py"], selected: exercise.goldFiles },
+    repository,
+  );
+  const wastefulNav = scoreNavigationStep(wastefulButCorrectSelection);
+  const wastefulEvidence = scoreEvidenceSelectionStep(wastefulButCorrectSelection);
+  assert.ok(wastefulNav.score < navigation.score, `${wastefulNav.score} should be worse than ${navigation.score}`);
+  assert.equal(wastefulEvidence.score, 1);
+
+  // --- Tracing derives from program-state-tracing.mjs's own gradeStateTrace -
+  const trace = await runExecutionTrace(repository, { language: "python", snippet: "from app.core import outer\nprint(outer(3))" });
+  assert.equal(trace.status, "ok", JSON.stringify({ error: trace.error, stderr: trace.stderr }));
+  const task = buildStateTraceTask(trace);
+  const toAnswer = (checkpoint) => ({ checkpointId: checkpoint.id, controlFlow: checkpoint.kind, function: checkpoint.function, depth: checkpoint.depth, value: checkpoint.value });
+  const innerReturnIndex = task.checkpoints.findIndex((checkpoint) => checkpoint.function === "inner" && checkpoint.kind === "return");
+  const withOmission = task.checkpoints.filter((checkpoint) => checkpoint.index !== innerReturnIndex).map(toAnswer);
+  const omissionGrade = gradeStateTrace(task, withOmission);
+  const tracingBefore = scoreTracingStep(omissionGrade);
+  assert.equal(tracingBefore.available, true);
+  assert.equal(tracingBefore.omitted, 1);
+  assert.ok(tracingBefore.score < 1);
+  assert.equal(scoreTracingStep(null).available, false);
+  const perfectGrade = gradeStateTrace(task, task.checkpoints.map(toAnswer));
+  const tracingAfter = scoreTracingStep(perfectGrade);
+  assert.equal(tracingAfter.score, 1);
+
+  // --- Debugging derives from misconception.mjs's own gradeProbe -----------
+  const skillGraph = buildSkillGraph(repository, generateStarterCourse(repository));
+  const probe = buildProbe(skillGraph.nodes[0], repository);
+  const wrongProbeGrade = gradeProbe(probe, "execution-order");
+  const debuggingWrong = scoreDebuggingStep(wrongProbeGrade);
+  assert.equal(debuggingWrong.available, true);
+  assert.equal(debuggingWrong.correct, false);
+  assert.equal(debuggingWrong.misconceptionId, "execution-order");
+  assert.equal(debuggingWrong.score, 0);
+  const rightProbeGrade = gradeProbe(probe, "correct");
+  assert.equal(scoreDebuggingStep(rightProbeGrade).score, 1);
+  assert.equal(scoreDebuggingStep(null).available, false);
+
+  // --- Revision: a targeted fix repairs exactly the checkpoint that was
+  // wrong, which is a different claim from "the score went up" ---------------
+  const revisionTargeted = scoreRevisionStep(omissionGrade, perfectGrade);
+  assert.equal(revisionTargeted.available, true);
+  assert.equal(revisionTargeted.improved, true);
+  assert.ok(revisionTargeted.delta > 0, String(revisionTargeted.delta));
+  assert.equal(revisionTargeted.targetedFix.attempted, 1);
+  assert.equal(revisionTargeted.targetedFix.fixed, 1);
+  // An unrelated change that still raises the score is distinguishable: the
+  // thing that was wrong before is still wrong.
+  const stillBrokenDifferentWay = gradeStateTrace(task, task.checkpoints.map((checkpoint) =>
+    checkpoint.index === innerReturnIndex
+      ? { checkpointId: checkpoint.id, controlFlow: "return", function: "nonexistent", depth: 99, value: "999" }
+      : toAnswer(checkpoint)));
+  const revisionUntargeted = scoreRevisionStep(omissionGrade, stillBrokenDifferentWay);
+  assert.equal(revisionUntargeted.targetedFix.fixed, 0);
+  assert.equal(scoreRevisionStep(null, perfectGrade).available, false);
+
+  // Navigation-shaped revision: a localization resubmission that fixes the
+  // specific missed/false-positive files is also recognized as targeted.
+  const missingOneFile = scoreLocalization(exercise, { inspected: [exercise.goldFiles[0]], selected: [exercise.goldFiles[0]] }, repository);
+  const fixedSelection = scoreLocalization(exercise, { inspected: exercise.goldFiles, selected: exercise.goldFiles }, repository);
+  const navRevision = scoreRevisionStep(missingOneFile, fixedSelection);
+  assert.ok(navRevision.targetedFix.attempted > 0);
+  assert.equal(navRevision.targetedFix.fixed, navRevision.targetedFix.attempted);
+
+  // --- The combined report keeps all five dimensions structurally separate,
+  // never averaged into a combined score ------------------------------------
+  const combined = assessProcessTrace({
+    localization: efficientAndPrecise,
+    tracing: omissionGrade,
+    debugging: wrongProbeGrade,
+    revisionBefore: omissionGrade,
+    revisionAfter: perfectGrade,
+    finalAnswer: { correct: true, score: 1 },
+  });
+  assert.equal(combined.navigation.score, 1);
+  assert.equal(combined.evidenceSelection.score, 1);
+  assert.equal(combined.tracing.score, tracingBefore.score);
+  assert.equal(combined.debugging.score, 0);
+  assert.equal(combined.revision.improved, true);
+  assert.equal(combined.finalAnswer.correct, true);
+  assert.equal("overallScore" in combined, false);
+  assert.equal("score" in combined, false);
+  const emptyFinal = assessProcessTrace({});
+  assert.equal(emptyFinal.finalAnswer.available, false);
+  assert.equal(emptyFinal.navigation.available, false);
+
+  // --- Rubric validation against instructor review reuses analytics.mjs's
+  // own rate(), with its real minimum-sample floor -----------------------
+  assert.equal(DISAGREEMENT_THRESHOLD, 0.2);
+  const tooFew = validateRubricAgreement([
+    { id: "a", automatedScore: 0.9, automatedPassed: true, instructorScore: 0.9, instructorPassed: true },
+    { id: "b", automatedScore: 0.8, automatedPassed: true, instructorScore: 0.8, instructorPassed: true },
+  ]);
+  assert.equal(tooFew.verdict, "insufficient-evidence");
+  assert.equal(tooFew.agreementRate.value, null);
+
+  const agreeing = validateRubricAgreement([
+    { id: "a", automatedScore: 0.9, automatedPassed: true, instructorScore: 0.88, instructorPassed: true },
+    { id: "b", automatedScore: 0.2, automatedPassed: false, instructorScore: 0.25, instructorPassed: false },
+    { id: "c", automatedScore: 0.7, automatedPassed: true, instructorScore: 0.72, instructorPassed: true },
+  ]);
+  assert.equal(agreeing.verdict, "rubric-agrees");
+  assert.equal(agreeing.agreementRate.value, 1);
+  assert.equal(agreeing.disagreements.length, 0);
+  assert.ok(agreeing.meanAbsoluteError < 0.05, String(agreeing.meanAbsoluteError));
+
+  const diverging = validateRubricAgreement([
+    { id: "a", automatedScore: 0.9, automatedPassed: true, instructorScore: 0.9, instructorPassed: true },
+    { id: "b", automatedScore: 0.8, automatedPassed: true, instructorScore: 0.3, instructorPassed: false },
+    { id: "c", automatedScore: 0.5, automatedPassed: false, instructorScore: 0.5, instructorPassed: false },
+  ]);
+  assert.equal(diverging.verdict, "rubric-diverges");
+  assert.equal(diverging.disagreements.length, 1);
+  assert.equal(diverging.disagreements[0].id, "b");
+  assert.equal(diverging.disagreements[0].passedMismatch, true);
+  // An unusable pair (missing a score) is dropped rather than crashing.
+  const withUnusable = validateRubricAgreement([
+    { id: "a", automatedScore: 0.9, automatedPassed: true, instructorScore: 0.9, instructorPassed: true },
+    { id: "b", automatedScore: 0.8, automatedPassed: true, instructorScore: 0.8, instructorPassed: true },
+    { id: "c", automatedPassed: true, instructorScore: 0.8, instructorPassed: true },
+    { id: "d", automatedScore: 0.6, automatedPassed: true, instructorScore: 0.6, instructorPassed: true },
+  ]);
+  assert.equal(withUnusable.samples, 3);
 });
