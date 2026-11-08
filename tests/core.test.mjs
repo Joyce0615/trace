@@ -56,6 +56,7 @@ import { EXECUTION_TRACE_VERSION, detectRuntimes, runExecutionTrace, suggestTrac
 import { PROGRAM_STATE_TRACE_VERSION, buildStateCheckpoints, buildStateTraceTask, gradeHypothesis, gradeStateTrace, publicStateCheckpointTask, recordStateTraceAttempt, renderStateTraceReview } from "../electron/program-state-tracing.mjs";
 import { COGNITIVE_OFFLOAD_GUARD_VERSION, DEFAULT_MASTERY_FLOOR, EXPLANATION_GATE_THRESHOLD, classifyAssistanceSeeking, classifyRequest, classifyRequestObjective, describeOffloadDecision, gateHighAssistanceOutput, measureOffloadingOutcome, recordOffloadDecision } from "../electron/cognitive-offload-guard.mjs";
 import { DISAGREEMENT_THRESHOLD, PROCESS_TRACE_ASSESSMENT_VERSION, assessProcessTrace, scoreDebuggingStep, scoreEvidenceSelectionStep, scoreNavigationStep, scoreRevisionStep, scoreTracingStep, validateRubricAgreement } from "../electron/process-trace-assessment.mjs";
+import { DEFAULT_COGNITIVE_BUDGET, PROGRESSIVE_DISCOVERY_VERSION, initializeDiscovery, measureComprehensionImpact, revealNext } from "../electron/progressive-discovery.mjs";
 import { RACE_GRADER_VERSION, buildRaceTask, gradeRaceSubmission, publicRaceTask, signatureParameters } from "../electron/race-grader.mjs";
 import { LOCALIZATION_VERSION, buildLocalizationExercise, nextHint, publicLocalizationExercise, scoreLocalization } from "../electron/localization.mjs";
 import { CALL_CHAIN_VERSION, buildCallChainExercises, buildCallChains, extractReturnExpressions, gradeCallChainAnswer, publicExercise, symbolBodyRange } from "../electron/call-chain.mjs";
@@ -11624,4 +11625,121 @@ test("process-trace learning assessment scores navigation, evidence selection, t
     { id: "d", automatedScore: 0.6, automatedPassed: true, instructorScore: 0.6, instructorPassed: true },
   ]);
   assert.equal(withUnusable.samples, 3);
+});
+
+test("progressive repository discovery reveals symbols/files/tests/graph neighborhoods/lessons incrementally under cognitive and context budgets, with learner-controlled expansion and measurable comprehension impact", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "progressive-discovery-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "app"), { recursive: true });
+  await mkdir(path.join(rootPath, "tests"), { recursive: true });
+  await writeFile(path.join(rootPath, "app", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "app", "queue.py"), "def enqueue(job):\n    return job\n");
+  await writeFile(path.join(rootPath, "app", "worker.py"), "from app.queue import enqueue\n\n\ndef work(job):\n    return enqueue(job)\n");
+  await writeFile(path.join(rootPath, "tests", "test_worker.py"), "from app.worker import work\n\n\ndef test_work():\n    assert work(1) == 1\n");
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const graph = buildKnowledgeGraph(repository);
+  const skillGraph = buildSkillGraph(repository, generateStarterCourse(repository));
+  assert.equal(PROGRESSIVE_DISCOVERY_VERSION, 1);
+  assert.equal(DEFAULT_COGNITIVE_BUDGET, 5);
+
+  const entry = graph.nodes.find((node) => node.kind === "symbol" && node.label === "work");
+  assert.ok(entry);
+
+  // --- Session starts at one entry, with its defining file revealed
+  // alongside it -- a symbol is never shown without the file a learner would
+  // actually open -------------------------------------------------------------
+  const initial = initializeDiscovery(graph, entry.id);
+  assert.deepEqual(initial.revealedIds, [entry.id, "file:app/worker.py"]);
+  assert.deepEqual(initial.unlockedLessonIds, []);
+
+  // --- A generous budget reveals everything one hop away: enqueue (calls)
+  // and queue.py (its defining file) and test_work (a cross-file caller) ------
+  const generous = revealNext(graph, initial, skillGraph, { cognitiveBudget: 10, contextTokenBudget: 10_000 });
+  assert.equal(generous.boundBy, "frontier-exhausted");
+  const revealedSymbolLabels = generous.symbols.map((node) => node.label).sort();
+  assert.deepEqual(revealedSymbolLabels, ["enqueue", "test_work"]);
+  const revealedFileLabels = generous.files.map((node) => node.label).sort();
+  assert.deepEqual(revealedFileLabels, ["queue.py"]);
+  // test_worker.py is recognized as a test file, not an ordinary file.
+  assert.equal(generous.tests.length, 1);
+  assert.equal(generous.tests[0].label, "test_worker.py");
+  assert.ok(generous.files.every((node) => node.label !== "test_worker.py"));
+  // The structural picture: an edge between two nodes both now revealed.
+  assert.ok(generous.neighborhoodEdges.some((edge) => edge.from === entry.id && edge.kind === "calls"));
+
+  // --- A tight cognitive budget stops after exactly that many new items,
+  // even though more of the frontier remains unrevealed -----------------------
+  const tight = revealNext(graph, initial, skillGraph, { cognitiveBudget: 1, contextTokenBudget: 10_000 });
+  assert.equal(tight.boundBy, "cognitive-budget");
+  assert.equal(tight.revealedCount, 1);
+
+  // --- A tiny context-token budget stops expansion even under a generous
+  // cognitive budget, and names which budget actually bound -------------------
+  const tinyContext = revealNext(graph, initial, skillGraph, { cognitiveBudget: 10, contextTokenBudget: 1 });
+  assert.equal(tinyContext.boundBy, "context-budget");
+  assert.equal(tinyContext.revealedCount, 0);
+  assert.equal(tinyContext.tokensUsed, 0);
+
+  // --- Lessons unlock exactly when their anchors fall inside the revealed
+  // scope, never before -------------------------------------------------------
+  const workerLesson = skillGraph.nodes.find((node) => node.anchors.some((anchor) => anchor.path === "app/worker.py"));
+  const queueLesson = skillGraph.nodes.find((node) => node.anchors.some((anchor) => anchor.path === "app/queue.py"));
+  if (workerLesson) assert.ok(initial.unlockedLessonIds.length === 0, "nothing is unlocked before any expansion runs");
+  if (queueLesson) {
+    assert.ok(generous.newlyUnlockedLessons.some((lesson) => lesson.id === queueLesson.id), "the queue.py lesson unlocks once queue.py is revealed");
+  }
+  // A lesson anchored to a file that is never revealed (e.g. tiny-context
+  // expansion revealed nothing) never unlocks.
+  assert.deepEqual(tinyContext.newlyUnlockedLessons, []);
+
+  // --- Discovery is purely learner-controlled: calling revealNext twice from
+  // the same starting state with a generous budget, versus chaining the
+  // returned state forward, both only ever grow what was revealed -------------
+  const chained = revealNext(graph, generous.state, skillGraph, { cognitiveBudget: 10, contextTokenBudget: 10_000 });
+  assert.equal(chained.boundBy, "frontier-exhausted");
+  assert.equal(chained.revealedCount, 0, "nothing new is left to reveal once the whole graph has been reached");
+  for (const id of generous.state.revealedIds) assert.ok(chained.state.revealedIds.includes(id));
+
+  // --- Measurable comprehension impact: accuracy within the revealed scope
+  // versus accuracy beyond it, reusing analytics.mjs's own rate(), never
+  // averaged into one number ---------------------------------------------------
+  const at = (minutes) => new Date(Date.parse("2026-06-01T09:00:00.000Z") + minutes * 60_000).toISOString();
+  const revealedPaths = ["app/worker.py", "app/queue.py"];
+  const tooFew = measureComprehensionImpact([
+    { at: at(0), kind: "prediction", path: "app/worker.py", correct: true },
+  ], revealedPaths);
+  assert.equal(tooFew.verdict, "insufficient-evidence");
+  assert.equal(tooFew.withinRevealedAccuracy.value, null);
+
+  const keepingPace = measureComprehensionImpact([
+    { at: at(0), kind: "prediction", path: "app/worker.py", correct: true },
+    { at: at(1), kind: "prediction", path: "app/queue.py", correct: true },
+    { at: at(2), kind: "contrast", path: "app/worker.py", correct: true },
+    { at: at(3), kind: "prediction", path: "app/unseen.py", correct: false },
+    { at: at(4), kind: "contrast", path: "app/unseen.py", correct: true },
+    { at: at(5), kind: "teach-back", path: "app/unseen.py", correct: false },
+  ], revealedPaths);
+  assert.equal(keepingPace.revealedAttempts, 3);
+  assert.equal(keepingPace.beyondAttempts, 3);
+  assert.equal(keepingPace.withinRevealedAccuracy.value, 1);
+  assert.ok(keepingPace.beyondRevealedAccuracy.value < 1);
+  assert.equal(keepingPace.verdict, "discovery-keeps-pace");
+  assert.ok(keepingPace.gap > 0, String(keepingPace.gap));
+
+  const lagging = measureComprehensionImpact([
+    { at: at(0), kind: "prediction", path: "app/worker.py", correct: false },
+    { at: at(1), kind: "prediction", path: "app/queue.py", correct: false },
+    { at: at(2), kind: "contrast", path: "app/worker.py", correct: true },
+    { at: at(3), kind: "prediction", path: "app/unseen.py", correct: true },
+    { at: at(4), kind: "contrast", path: "app/unseen.py", correct: true },
+    { at: at(5), kind: "teach-back", path: "app/unseen.py", correct: true },
+  ], revealedPaths);
+  assert.equal(lagging.verdict, "discovery-lags-exposure");
+  assert.ok(lagging.gap < 0, String(lagging.gap));
+  // The two accuracies are reported side by side, never averaged.
+  assert.equal("overallAccuracy" in lagging, false);
+  assert.equal("score" in lagging, false);
 });
