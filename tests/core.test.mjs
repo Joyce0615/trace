@@ -57,6 +57,7 @@ import { PROGRAM_STATE_TRACE_VERSION, buildStateCheckpoints, buildStateTraceTask
 import { COGNITIVE_OFFLOAD_GUARD_VERSION, DEFAULT_MASTERY_FLOOR, EXPLANATION_GATE_THRESHOLD, classifyAssistanceSeeking, classifyRequest, classifyRequestObjective, describeOffloadDecision, gateHighAssistanceOutput, measureOffloadingOutcome, recordOffloadDecision } from "../electron/cognitive-offload-guard.mjs";
 import { DISAGREEMENT_THRESHOLD, PROCESS_TRACE_ASSESSMENT_VERSION, assessProcessTrace, scoreDebuggingStep, scoreEvidenceSelectionStep, scoreNavigationStep, scoreRevisionStep, scoreTracingStep, validateRubricAgreement } from "../electron/process-trace-assessment.mjs";
 import { DEFAULT_COGNITIVE_BUDGET, PROGRESSIVE_DISCOVERY_VERSION, initializeDiscovery, measureComprehensionImpact, revealNext } from "../electron/progressive-discovery.mjs";
+import { COUNTEREXAMPLE_LAB_VERSION, applyCounterexampleResolution, buildCounterexampleLab, gradeCounterexamplePrediction, listCounterexampleLabs, publicCounterexampleLab, recordCounterexampleAttempt, runCounterexampleLab } from "../electron/counterexample-lab.mjs";
 import { RACE_GRADER_VERSION, buildRaceTask, gradeRaceSubmission, publicRaceTask, signatureParameters } from "../electron/race-grader.mjs";
 import { LOCALIZATION_VERSION, buildLocalizationExercise, nextHint, publicLocalizationExercise, scoreLocalization } from "../electron/localization.mjs";
 import { CALL_CHAIN_VERSION, buildCallChainExercises, buildCallChains, extractReturnExpressions, gradeCallChainAnswer, publicExercise, symbolBodyRange } from "../electron/call-chain.mjs";
@@ -11742,4 +11743,102 @@ test("progressive repository discovery reveals symbols/files/tests/graph neighbo
   // The two accuracies are reported side by side, never averaged.
   assert.equal("overallAccuracy" in lagging, false);
   assert.equal("score" in lagging, false);
+});
+
+test("misconception counterexample laboratories generate minimal executable examples that discriminate competing learner models, require prediction, and update mastery only when observed behavior resolves the misconception", async (context) => {
+  const runtimes = await detectRuntimes({ refresh: true });
+  if (!runtimes.python?.available) {
+    context.skip("No python runtime is installed, so counterexample labs cannot be verified here.");
+    return;
+  }
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "counterexample-lab-"));
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+
+  assert.equal(COUNTEREXAMPLE_LAB_VERSION, 1);
+
+  // --- Every taxonomy misconception this app ships has a lab, and every
+  // lab's two predictions genuinely differ (a lab that does not discriminate
+  // would prove nothing) --------------------------------------------------
+  const labIds = listCounterexampleLabs();
+  assert.ok(labIds.length >= 8, String(labIds.length));
+  for (const misconceptionId of labIds) {
+    assert.ok(MISCONCEPTIONS.some((entry) => entry.id === misconceptionId), misconceptionId);
+    const lab = buildCounterexampleLab(misconceptionId);
+    assert.ok(lab.snippet.length > 0);
+    assert.notEqual(lab.options[0].text, lab.options[1].text, misconceptionId);
+    assert.equal(lab.correctOptionId, "model-correct");
+  }
+
+  // An id with no defined lab is reported as null, never invented.
+  assert.equal(buildCounterexampleLab("not-a-real-misconception"), null);
+
+  // --- The learner-facing projection hides which option is correct --------
+  const executionOrderLab = buildCounterexampleLab("execution-order");
+  const publicLab = publicCounterexampleLab(executionOrderLab);
+  assert.equal("correctOptionId" in publicLab, false);
+  assert.equal(publicLab.options.length, 2);
+
+  // --- Required prediction before the run, scored like every other
+  // before-you-look prediction in this app --------------------------------
+  const wrongPrediction = gradeCounterexamplePrediction(executionOrderLab, "model-misconception", 0.9);
+  assert.equal(wrongPrediction.correct, false);
+  assert.equal(wrongPrediction.heldMisconception, true);
+  assert.equal(wrongPrediction.calibration, "overconfident");
+  assert.equal(wrongPrediction.brier, 0.81);
+
+  const rightPrediction = gradeCounterexamplePrediction(executionOrderLab, "model-correct", 0.9);
+  assert.equal(rightPrediction.correct, true);
+  assert.equal(rightPrediction.heldMisconception, false);
+  assert.equal(rightPrediction.calibration, "confident-and-right");
+
+  // --- The snippet is actually executed, never simulated, and the
+  // misconception resolves only when the run completed, truly discriminates,
+  // and the observed output matches the correct model --------------------
+  const run = await runCounterexampleLab(executionOrderLab, { rootPath: workspace });
+  assert.equal(run.available, true);
+  assert.equal(run.status, "ok");
+  assert.equal(run.observed, "beta,alpha");
+  assert.equal(run.discriminates, true);
+  assert.equal(run.matchesCorrect, true);
+  assert.equal(run.matchesMisconception, false);
+  assert.equal(run.resolved, true);
+
+  // --- Mastery updates only on a resolved run, reusing misconception.mjs's
+  // own calibrateSkill, and the evidence kind it writes is one that
+  // function already weighs ------------------------------------------------
+  const emptyMastery = { skillId: "skill-order", evidence: [] };
+  const applied = applyCounterexampleResolution(emptyMastery, run, rightPrediction);
+  assert.equal(applied.updated, true);
+  assert.equal(applied.reason, null);
+  assert.equal(applied.mastery.evidence.length, 1);
+  assert.equal(applied.mastery.evidence[0].kind, "diagnostic");
+  assert.ok(applied.calibration.mastery > calibrateSkill(emptyMastery).mastery);
+
+  // --- A run that fails to run updates nothing and says why ---------------
+  const brokenLabId = "mutation-vs-copy";
+  const brokenLab = buildCounterexampleLab(brokenLabId);
+  const failedRun = { available: false, labId: brokenLab.id, misconceptionId: brokenLabId, status: "unavailable", reason: "No python runtime is installed, so this repository cannot be traced here.", observed: null, resolved: false };
+  const notApplied = applyCounterexampleResolution({ skillId: "skill-mutation", evidence: [] }, failedRun, null);
+  assert.equal(notApplied.updated, false);
+  assert.equal(notApplied.reason, failedRun.reason);
+  assert.equal(notApplied.mastery.evidence.length, 0);
+
+  // A run that resolves nothing (e.g. the learner's own future lab authoring
+  // mistake made both predictions identical) also updates nothing, named
+  // distinctly from the "did not run" case.
+  const nonDiscriminatingRun = { available: true, labId: brokenLab.id, misconceptionId: brokenLabId, status: "ok", observed: "same", matchesCorrect: true, matchesMisconception: true, discriminates: false, resolved: false };
+  const notResolved = applyCounterexampleResolution({ skillId: "skill-mutation", evidence: [] }, nonDiscriminatingRun, rightPrediction);
+  assert.equal(notResolved.updated, false);
+  assert.match(notResolved.reason, /did not resolve/);
+
+  // --- Preserved as learning evidence through the real append-only
+  // activity log, unmodified --------------------------------------------
+  const entry = await recordCounterexampleAttempt(workspace, { id: "repo-counterexample" }, run, rightPrediction);
+  assert.ok(entry);
+  const events = await readEvents(workspace, "repo-counterexample");
+  assert.equal(events.length, 1);
+  assert.equal(events[0].kind, "counterexample-lab");
+  assert.equal(events[0].misconceptionId, "execution-order");
+  assert.equal(events[0].resolved, true);
+  assert.equal(events[0].correct, true);
 });
