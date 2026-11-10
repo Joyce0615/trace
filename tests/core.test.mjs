@@ -38,7 +38,7 @@ import { applyMigration, bodyTokens, buildSymbolSnapshot, courseAnchorSites, cov
 import { GOALS, GOALS_VERSION, goalKeywords, goalPlan, orderLessonsForGoal, rankTargets, resolveGoal } from "../electron/goals.mjs";
 import { EXPERIMENTS, EXPERIMENT_VERSION, OBSERVATION_FIELDS, activeAssignments, analyzeExperiment, assignArm, consentState, experimentReport, hash32, sanitizeObservation, settingsFor } from "../electron/experiments.mjs";
 import { forgetEverything, loadExperimentState, recordObservation, setConsent } from "../electron/experiment-store.mjs";
-import { ANALYTICS_VERSION, MIN_SAMPLE, analyticsReport, hintAnalytics, misconceptionHintAnalytics, normalizeEvents, rate, retentionAnalytics, timeOnTaskAnalytics, transferAnalytics } from "../electron/analytics.mjs";
+import { ANALYTICS_VERSION, GRADED_KINDS, MIN_SAMPLE, analyticsReport, hintAnalytics, misconceptionHintAnalytics, normalizeEvents, rate, retentionAnalytics, timeOnTaskAnalytics, transferAnalytics } from "../electron/analytics.mjs";
 import { appendEvent, readEvents } from "../electron/activity-log.mjs";
 import { ALWAYS_FORBIDDEN, ANSWER_GUARD_VERSION, MAX_HINT_PENALTY, SCANNED_CHANNELS, answerSecrets, applyScaffold, auditResponse, buildScaffold, clearAnswerSecrets, findForbiddenKeys, findLeakedValues, forbiddenKeysFor, guardResponse, nextHintRung, publicScaffold, registerAnswerSecrets, scaffoldPenalty } from "../electron/answer-guard.mjs";
 import { ACTIVITY_VERSION, buildActivitySet, excerptFor, gradeContrast, gradePrediction, gradeTeachBack, headerParameters, publicActivitySet, restatementRatio, summarizePredictions } from "../electron/activities.mjs";
@@ -58,6 +58,7 @@ import { COGNITIVE_OFFLOAD_GUARD_VERSION, DEFAULT_MASTERY_FLOOR, EXPLANATION_GAT
 import { DISAGREEMENT_THRESHOLD, PROCESS_TRACE_ASSESSMENT_VERSION, assessProcessTrace, scoreDebuggingStep, scoreEvidenceSelectionStep, scoreNavigationStep, scoreRevisionStep, scoreTracingStep, validateRubricAgreement } from "../electron/process-trace-assessment.mjs";
 import { DEFAULT_COGNITIVE_BUDGET, PROGRESSIVE_DISCOVERY_VERSION, initializeDiscovery, measureComprehensionImpact, revealNext } from "../electron/progressive-discovery.mjs";
 import { COUNTEREXAMPLE_LAB_VERSION, applyCounterexampleResolution, buildCounterexampleLab, gradeCounterexamplePrediction, listCounterexampleLabs, publicCounterexampleLab, recordCounterexampleAttempt, runCounterexampleLab } from "../electron/counterexample-lab.mjs";
+import { ALGORITHM_TRACING_TASK_KIND, ALGORITHM_TRACING_TUTOR_VERSION, algorithmTracingPassRate, buildAlgorithmTracingTask, combineAlgorithmTracingGrades, gradeHiddenTestStage, gradeRetrievalStage, gradeStateStage, measureAlgorithmTransfer, nextAlgorithmHint, publicAlgorithmTracingTask, recordAlgorithmTracingAttempt } from "../electron/algorithm-tracing-tutor.mjs";
 import { RACE_GRADER_VERSION, buildRaceTask, gradeRaceSubmission, publicRaceTask, signatureParameters } from "../electron/race-grader.mjs";
 import { LOCALIZATION_VERSION, buildLocalizationExercise, nextHint, publicLocalizationExercise, scoreLocalization } from "../electron/localization.mjs";
 import { CALL_CHAIN_VERSION, buildCallChainExercises, buildCallChains, extractReturnExpressions, gradeCallChainAnswer, publicExercise, symbolBodyRange } from "../electron/call-chain.mjs";
@@ -11841,4 +11842,163 @@ test("misconception counterexample laboratories generate minimal executable exam
   assert.equal(events[0].misconceptionId, "execution-order");
   assert.equal(events[0].resolved, true);
   assert.equal(events[0].correct, true);
+});
+
+test("adaptive algorithm-tracing tutors combine retrieval, notional-machine state, hidden tests, and graduated hints for unfamiliar algorithms while preventing solution leakage and measuring transfer", async (context) => {
+  const runtimes = await detectRuntimes({ refresh: true });
+  if (!runtimes.python?.available) {
+    context.skip("No python runtime is installed, so algorithm-tracing tutors cannot be verified here.");
+    return;
+  }
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "algorithm-tracing-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(rootPath, { recursive: true });
+  const source = [
+    "def bubble_sort(items):",
+    "    result = list(items)",
+    "    n = len(result)",
+    "    for i in range(n):",
+    "        for j in range(0, n - i - 1):",
+    "            if result[j] > result[j + 1]:",
+    "                result[j], result[j + 1] = result[j + 1], result[j]",
+    "    return result",
+    "",
+  ].join("\n");
+  await writeFile(path.join(rootPath, "bubble_sort.py"), source);
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  assert.equal(ALGORITHM_TRACING_TUTOR_VERSION, 1);
+  assert.equal(ALGORITHM_TRACING_TASK_KIND, "algorithm-tracing");
+
+  const task = await buildAlgorithmTracingTask(repository, { sources: { "bubble_sort.py": source } });
+  assert.equal(task.available, true, JSON.stringify(task));
+
+  // --- Retrieval is answered against the real index, not invented ---------
+  assert.match(task.retrieval.referenceAnswer, /bubble_sort is defined at bubble_sort\.py:1/);
+
+  // --- The notional-machine state task is built from a real recorded
+  // reference run, with real checkpoints ------------------------------------
+  assert.equal(task.stateTask.available, true, JSON.stringify(task.stateTask));
+  assert.ok(task.stateTask.checkpoints.length >= 2);
+
+  // --- Hidden tests are executable-quiz.mjs's own real oracle, unmodified -
+  assert.equal(task.quiz.entry, "bubble_sort");
+  assert.ok(task.quiz.cases.length >= 4);
+
+  // --- A hint ladder exists for the hidden-test stage, built by
+  // answer-guard.mjs's own buildScaffold --------------------------------------
+  assert.equal(task.scaffold.available, true);
+  assert.ok(task.scaffold.rungs.length > 0);
+
+  // --- Solution leakage is prevented structurally: the public projection
+  // carries no answer field across any of the four stages --------------------
+  const publicTask = publicAlgorithmTracingTask(task);
+  assert.equal("referenceAnswer" in publicTask.retrieval, false);
+  for (const prompt of publicTask.stateTask.prompts) {
+    assert.equal("value" in prompt, false);
+    assert.equal("function" in prompt, false);
+  }
+  assert.equal("cases" in publicTask.quiz, false);
+  assert.equal("expected" in (publicTask.quiz.example ?? {}), false, "the example's answer is named result, not expected, per answer-guard.mjs's own egress rule");
+  for (const hidden of publicTask.quiz.hiddenCases) assert.equal("expected" in hidden, false);
+  for (const rung of publicTask.scaffold.rungs ?? []) assert.ok(rung); // rungs are fetched one at a time elsewhere; presence here is just the ladder shape
+  assert.equal(JSON.stringify(publicTask).includes(JSON.stringify(task.quiz.cases[1]?.expected ?? "__unused__")), false);
+
+  // --- Retrieval grading: correct and incorrect claims ---------------------
+  const correctRetrieval = gradeRetrievalStage(task, "bubble_sort.py:1");
+  assert.equal(correctRetrieval.correct, true);
+  const wrongRetrieval = gradeRetrievalStage(task, "nowhere.py:1");
+  assert.equal(wrongRetrieval.correct, false);
+
+  // --- State-trace grading delegates to program-state-tracing.mjs's real
+  // gradeStateTrace, so a perfect annotation set passes outright -------------
+  const toAnswer = (checkpoint) => ({
+    checkpointId: checkpoint.id,
+    controlFlow: checkpoint.kind,
+    function: checkpoint.function,
+    depth: checkpoint.depth,
+    value: checkpoint.value,
+  });
+  const perfectAnnotations = task.stateTask.checkpoints.map(toAnswer);
+  const perfectStateGrade = gradeStateStage(task, perfectAnnotations);
+  assert.equal(perfectStateGrade.available, true);
+  assert.equal(perfectStateGrade.passed, true);
+  const emptyStateGrade = gradeStateStage(task, []);
+  assert.equal(emptyStateGrade.passed, false);
+  assert.ok(emptyStateGrade.omitted > 0);
+
+  // --- Hidden-test grading delegates to executable-quiz.mjs's real
+  // gradeSubmission over the real sandbox: a correct reimplementation passes,
+  // a wrong one fails hidden cases --------------------------------------------
+  const correctSubmission = source;
+  const correctGrade = await gradeHiddenTestStage(task, correctSubmission);
+  assert.equal(correctGrade.passed, true, JSON.stringify(correctGrade));
+  assert.equal(correctGrade.hiddenPassed, correctGrade.hiddenTotal);
+
+  const wrongSubmission = "def bubble_sort(items):\n    return list(items)\n";
+  const wrongGrade = await gradeHiddenTestStage(task, wrongSubmission);
+  assert.equal(wrongGrade.passed, false);
+
+  // --- Graduated hints: the next rung and only the next one, with a
+  // running cost -----------------------------------------------------------
+  const first = nextAlgorithmHint(task, []);
+  assert.equal(first.rung.level, 1);
+  const second = nextAlgorithmHint(task, [first.rung.id]);
+  assert.equal(second.rung.level, 2);
+  assert.notEqual(first.rung.id, second.rung.id);
+
+  // --- Combined grading: a correct submission with no hints passes
+  // outright; a correct submission after revealing a hint is still correct
+  // but no longer counted as a clean pass ------------------------------------
+  const cleanCombined = combineAlgorithmTracingGrades(correctRetrieval, perfectStateGrade, correctGrade, task.scaffold, []);
+  assert.equal(cleanCombined.correct, true);
+  assert.equal(cleanCombined.passed, true);
+  assert.equal(cleanCombined.hintPenalty, 0);
+
+  const withHint = combineAlgorithmTracingGrades(correctRetrieval, perfectStateGrade, correctGrade, task.scaffold, [first.rung.id]);
+  assert.equal(withHint.correct, true);
+  assert.equal(withHint.passed, false, "a hint was revealed, so this did not pass cleanly even though the hidden tests did");
+  assert.ok(withHint.hintPenalty > 0);
+  assert.ok(withHint.score < cleanCombined.score);
+
+  // --- Recording an attempt uses the real executable-quiz kind so
+  // analytics.mjs's own GRADED_KINDS-filtered functions recognize it, tagged
+  // with taskKind so this module's own callers can still scope to just these
+  // attempts -----------------------------------------------------------------
+  const logDir = await mkdtemp(path.join(os.tmpdir(), "algorithm-tracing-log-"));
+  context.after(() => rm(logDir, { recursive: true, force: true }));
+  const recorded = await recordAlgorithmTracingAttempt(logDir, repository, task, cleanCombined);
+  assert.equal(recorded.kind, "executable-quiz");
+  assert.equal(recorded.taskKind, ALGORITHM_TRACING_TASK_KIND);
+  assert.equal(GRADED_KINDS.has("executable-quiz"), true, "the event is recorded under a kind analytics.mjs already recognizes as graded");
+  assert.equal(GRADED_KINDS.has(ALGORITHM_TRACING_TASK_KIND), false, "the shared GRADED_KINDS set from analytics.mjs is never mutated or extended by this module");
+
+  // --- Transfer is measured, not assumed, and reported side by side --------
+  const at = (minutes) => new Date(Date.parse("2026-06-01T09:00:00.000Z") + minutes * 60_000).toISOString();
+  const tooFewEvents = measureAlgorithmTransfer([
+    { at: at(0), kind: "executable-quiz", taskKind: ALGORITHM_TRACING_TASK_KIND, path: "bubble_sort.py", correct: true },
+  ]);
+  assert.equal(tooFewEvents.immediate.near.value, null);
+  assert.equal(tooFewEvents.delayed.delayedAccuracy.value, null);
+
+  const transferEvents = [
+    { at: at(0), kind: "executable-quiz", taskKind: ALGORITHM_TRACING_TASK_KIND, path: "bubble_sort.py", correct: true },
+    { at: at(1), kind: "executable-quiz", taskKind: ALGORITHM_TRACING_TASK_KIND, path: "bubble_sort.py", correct: true },
+    { at: at(2), kind: "executable-quiz", taskKind: ALGORITHM_TRACING_TASK_KIND, path: "bubble_sort.py", correct: true },
+    { at: at(3), kind: "executable-quiz", taskKind: ALGORITHM_TRACING_TASK_KIND, path: "quick_sort.py", correct: false },
+    { at: at(4), kind: "executable-quiz", taskKind: ALGORITHM_TRACING_TASK_KIND, path: "quick_sort.py", correct: true },
+    { at: at(5), kind: "executable-quiz", taskKind: ALGORITHM_TRACING_TASK_KIND, path: "quick_sort.py", correct: false },
+  ];
+  const measured = measureAlgorithmTransfer(transferEvents, { studiedPaths: ["bubble_sort.py"] });
+  assert.equal(measured.immediate.near.value, 1);
+  assert.ok(measured.immediate.far.value < 1);
+  assert.equal("score" in measured, false, "immediate and delayed are reported side by side, never averaged");
+
+  // --- The pass rate over this module's own attempts honestly reports
+  // insufficient evidence below the sample floor ----------------------------
+  const thinRate = algorithmTracingPassRate(transferEvents.slice(0, 1), 3);
+  assert.equal(thinRate.value, null);
+  assert.equal(thinRate.reason, "insufficient-evidence");
 });
