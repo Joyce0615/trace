@@ -59,6 +59,7 @@ import { DISAGREEMENT_THRESHOLD, PROCESS_TRACE_ASSESSMENT_VERSION, assessProcess
 import { DEFAULT_COGNITIVE_BUDGET, PROGRESSIVE_DISCOVERY_VERSION, initializeDiscovery, measureComprehensionImpact, revealNext } from "../electron/progressive-discovery.mjs";
 import { COUNTEREXAMPLE_LAB_VERSION, applyCounterexampleResolution, buildCounterexampleLab, gradeCounterexamplePrediction, listCounterexampleLabs, publicCounterexampleLab, recordCounterexampleAttempt, runCounterexampleLab } from "../electron/counterexample-lab.mjs";
 import { ALGORITHM_TRACING_TASK_KIND, ALGORITHM_TRACING_TUTOR_VERSION, algorithmTracingPassRate, buildAlgorithmTracingTask, combineAlgorithmTracingGrades, gradeHiddenTestStage, gradeRetrievalStage, gradeStateStage, measureAlgorithmTransfer, nextAlgorithmHint, publicAlgorithmTracingTask, recordAlgorithmTracingAttempt } from "../electron/algorithm-tracing-tutor.mjs";
+import { MODEL_ADVISORY_SUBJECT, MODEL_ADVISORY_VERSION, buildModelAdvisory, classifyModelLicense, evaluateModelForQuarantine, signModelAdvisory, verifyModelAdvisory } from "../electron/model-advisory.mjs";
 import { RACE_GRADER_VERSION, buildRaceTask, gradeRaceSubmission, publicRaceTask, signatureParameters } from "../electron/race-grader.mjs";
 import { LOCALIZATION_VERSION, buildLocalizationExercise, nextHint, publicLocalizationExercise, scoreLocalization } from "../electron/localization.mjs";
 import { CALL_CHAIN_VERSION, buildCallChainExercises, buildCallChains, extractReturnExpressions, gradeCallChainAnswer, publicExercise, symbolBodyRange } from "../electron/call-chain.mjs";
@@ -12001,4 +12002,84 @@ test("adaptive algorithm-tracing tutors combine retrieval, notional-machine stat
   const thinRate = algorithmTracingPassRate(transferEvents.slice(0, 1), 3);
   assert.equal(thinRate.value, null);
   assert.equal(thinRate.reason, "insufficient-evidence");
+});
+
+test("local-model advisory and provenance gates map runtime/model artifacts to signed advisories and licenses, verify quantization/model fingerprints, and quarantine unsafe or incompatible tutor configurations offline", () => {
+  assert.equal(MODEL_ADVISORY_VERSION, 1);
+  assert.equal(MODEL_ADVISORY_SUBJECT, "model-advisory");
+  assert.ok(SIGNABLE_SUBJECTS.includes(MODEL_ADVISORY_SUBJECT), "the new subject must be registered in signing.mjs's own list");
+
+  // --- License classification reuses supply-chain.mjs's own buckets,
+  // not a second parallel policy ---------------------------------------------
+  assert.equal(classifyModelLicense("MIT").bucket, "allowed");
+  assert.equal(classifyModelLicense("GPL-3.0").bucket, "denied");
+  assert.equal(classifyModelLicense("MPL-2.0").bucket, "review");
+  assert.equal(classifyModelLicense("Some-Unheard-Of-License").bucket, "unrecognized");
+  assert.equal(classifyModelLicense(null).bucket, "unknown");
+
+  // --- Building an advisory composes real fingerprinting and real
+  // compatibility assessment, never inventing either ------------------------
+  const goodBytes = Buffer.from("model-weights-v1-content");
+  const compatibleConfig = { provider: "codex", command: "codex", version: "1.0.0", sandbox: "read-only", permissionMode: null, tools: ["Read"], available: true };
+  const advisory = buildModelAdvisory({ artifactBytes: goodBytes, declaredLicense: "MIT", config: compatibleConfig });
+  assert.equal(advisory.version, MODEL_ADVISORY_VERSION);
+  assert.equal(advisory.artifactFingerprint, fingerprintRuntimeArtifact(goodBytes));
+  assert.equal(advisory.configFingerprint, fingerprintModel(compatibleConfig));
+  assert.equal(advisory.compatibility.compatible, true);
+  assert.equal(advisory.license.bucket, "allowed");
+
+  const incompatibleConfig = { ...compatibleConfig, sandbox: "unrestricted" };
+  const badAdvisory = buildModelAdvisory({ artifactBytes: goodBytes, declaredLicense: "GPL-3.0", config: incompatibleConfig });
+  assert.equal(badAdvisory.compatibility.compatible, false);
+  assert.equal(badAdvisory.license.bucket, "denied");
+
+  // --- Signing/verification delegates to signing.mjs's own
+  // signPayload/verifyPayload, under the advisory's own subject -------------
+  const keyPair = createKeyPair();
+  const signed = signModelAdvisory(advisory, keyPair);
+  assert.equal(signed.signature.subject, MODEL_ADVISORY_SUBJECT);
+  const seal = verifyModelAdvisory(signed, { trustedKeyIds: [keyPair.keyId] });
+  assert.equal(seal.verified, true);
+  assert.equal(seal.trust, "trusted");
+
+  const untrustedSeal = verifyModelAdvisory(signed, { trustedKeyIds: [] });
+  assert.equal(untrustedSeal.verified, true);
+  assert.equal(untrustedSeal.trust, "untrusted");
+
+  const tampered = { ...signed, license: { bucket: "allowed", license: "MIT-BUT-FAKE" } };
+  const tamperedSeal = verifyModelAdvisory(tampered, { trustedKeyIds: [keyPair.keyId] });
+  assert.equal(tamperedSeal.verified, false);
+  assert.equal(tamperedSeal.reason, "content-changed");
+
+  // --- Quarantine: a fully clean advisory against the matching artifact
+  // is cleared ----------------------------------------------------------------
+  const clearedDecision = evaluateModelForQuarantine(advisory, goodBytes);
+  assert.equal(clearedDecision.cleared, true);
+  assert.equal(clearedDecision.quarantined, false);
+  assert.deepEqual(clearedDecision.reasons, []);
+
+  // --- Quarantine: an incompatible configuration is refused, and the
+  // reason names the compatibility gate specifically -------------------------
+  const incompatibleDecision = evaluateModelForQuarantine(badAdvisory, goodBytes);
+  assert.equal(incompatibleDecision.cleared, false);
+  assert.equal(incompatibleDecision.quarantined, true);
+  assert.ok(incompatibleDecision.reasons.some((item) => item.gate === "compatibility"));
+  assert.ok(incompatibleDecision.reasons.some((item) => item.gate === "license"));
+
+  // --- Quarantine: a swapped artifact (same advisory, different bytes on
+  // disk) is caught by the artifact-integrity gate even though compatibility
+  // and license both still look fine --------------------------------------
+  const swappedBytes = Buffer.from("a-completely-different-binary");
+  const swappedDecision = evaluateModelForQuarantine(advisory, swappedBytes);
+  assert.equal(swappedDecision.cleared, false);
+  assert.equal(swappedDecision.quarantined, true);
+  assert.equal(swappedDecision.reasons.length, 1);
+  assert.equal(swappedDecision.reasons[0].gate, "artifact-integrity");
+
+  // --- Multiple simultaneous failures are all reported, not just the first -
+  const everythingWrongAdvisory = buildModelAdvisory({ artifactBytes: goodBytes, declaredLicense: "GPL-3.0", config: incompatibleConfig });
+  const everythingWrongDecision = evaluateModelForQuarantine(everythingWrongAdvisory, swappedBytes);
+  assert.equal(everythingWrongDecision.reasons.length, 3);
+  const gates = everythingWrongDecision.reasons.map((item) => item.gate).sort();
+  assert.deepEqual(gates, ["artifact-integrity", "compatibility", "license"]);
 });

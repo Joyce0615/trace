@@ -137,6 +137,8 @@ artifact to another.
 - `learning-effectiveness-bundle` — tasks, pre/post/delayed/transfer
   effectiveness, calibration, and private telemetry, with a reproducibility
   digest over content that carries no wall-clock field.
+- `model-advisory` — a local model artifact's content fingerprint,
+  configuration fingerprint, capability compatibility, and license bucket.
 
 Validity and trust are separate. An intact signature from an unknown key is
 `untrusted`, which is a warning for a course package and a **refusal** for
