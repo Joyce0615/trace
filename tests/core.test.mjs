@@ -60,6 +60,7 @@ import { DEFAULT_COGNITIVE_BUDGET, PROGRESSIVE_DISCOVERY_VERSION, initializeDisc
 import { COUNTEREXAMPLE_LAB_VERSION, applyCounterexampleResolution, buildCounterexampleLab, gradeCounterexamplePrediction, listCounterexampleLabs, publicCounterexampleLab, recordCounterexampleAttempt, runCounterexampleLab } from "../electron/counterexample-lab.mjs";
 import { ALGORITHM_TRACING_TASK_KIND, ALGORITHM_TRACING_TUTOR_VERSION, algorithmTracingPassRate, buildAlgorithmTracingTask, combineAlgorithmTracingGrades, gradeHiddenTestStage, gradeRetrievalStage, gradeStateStage, measureAlgorithmTransfer, nextAlgorithmHint, publicAlgorithmTracingTask, recordAlgorithmTracingAttempt } from "../electron/algorithm-tracing-tutor.mjs";
 import { MODEL_ADVISORY_SUBJECT, MODEL_ADVISORY_VERSION, buildModelAdvisory, classifyModelLicense, evaluateModelForQuarantine, signModelAdvisory, verifyModelAdvisory } from "../electron/model-advisory.mjs";
+import { SEQUENTIAL_CAUSAL_EXPERIMENT_VERSION, analyzeSubgroups, preregisterSequentialExperiment, runSequentialLooks, sequentialAttritionSensitivity, sequentialCriticalValue, verifyAgainstPreregistration } from "../electron/sequential-causal-experiments.mjs";
 import { RACE_GRADER_VERSION, buildRaceTask, gradeRaceSubmission, publicRaceTask, signatureParameters } from "../electron/race-grader.mjs";
 import { LOCALIZATION_VERSION, buildLocalizationExercise, nextHint, publicLocalizationExercise, scoreLocalization } from "../electron/localization.mjs";
 import { CALL_CHAIN_VERSION, buildCallChainExercises, buildCallChains, extractReturnExpressions, gradeCallChainAnswer, publicExercise, symbolBodyRange } from "../electron/call-chain.mjs";
@@ -12082,4 +12083,108 @@ test("local-model advisory and provenance gates map runtime/model artifacts to s
   assert.equal(everythingWrongDecision.reasons.length, 3);
   const gates = everythingWrongDecision.reasons.map((item) => item.gate).sort();
   assert.deepEqual(gates, ["artifact-integrity", "compatibility", "license"]);
+});
+
+test("sequential causal learning experiments support preregistered hypotheses, stopping rules, heterogeneous treatment effects, attrition sensitivity, and privacy budgets without peeking-driven false positives", () => {
+  assert.equal(SEQUENTIAL_CAUSAL_EXPERIMENT_VERSION, 1);
+
+  // --- A single planned look collapses to experiments.mjs's own fixed
+  // 1.96 two-sided 95% critical value, exactly -------------------------------
+  assert.ok(Math.abs(sequentialCriticalValue(1, 0.05) - 1.959963986120195) < 1e-6);
+
+  // --- More planned looks require a wider interval at every look, so the
+  // real cumulative false-positive rate across all looks stays at the
+  // declared total rather than growing with each additional peek -----------
+  const z1 = sequentialCriticalValue(1, 0.05);
+  const z4 = sequentialCriticalValue(4, 0.05);
+  assert.ok(z4 > z1, "more planned looks must require a stricter per-look critical value");
+
+  // --- Preregistration freezes the design before any data exists, and is
+  // tamper-checkable afterwards ----------------------------------------------
+  const prereg = preregisterSequentialExperiment("review-daily-limit", { plannedLooks: 3, totalAlpha: 0.05, subgroupDimension: "cohortYear", now: "2026-06-01T00:00:00.000Z" });
+  assert.equal(prereg.ok, true);
+  assert.equal(prereg.preregistration.plannedLooks, 3);
+  assert.ok(prereg.preregistration.preregistrationDigest);
+  assert.equal(verifyAgainstPreregistration(prereg.preregistration, { experimentId: "review-daily-limit", plannedLooks: 3, totalAlpha: 0.05, subgroupDimension: "cohortYear" }), true);
+  assert.equal(verifyAgainstPreregistration(prereg.preregistration, { experimentId: "review-daily-limit", plannedLooks: 5, totalAlpha: 0.05, subgroupDimension: "cohortYear" }), false, "changing the planned look count after the fact must be detectable");
+
+  const unknownExperiment = preregisterSequentialExperiment("not-a-real-experiment", { plannedLooks: 1 });
+  assert.equal(unknownExperiment.ok, false);
+  assert.equal(unknownExperiment.reason, "unknown-experiment");
+
+  const invalidAlpha = preregisterSequentialExperiment("review-daily-limit", { plannedLooks: 1, totalAlpha: 0 });
+  assert.equal(invalidAlpha.ok, false);
+  assert.equal(invalidAlpha.reason, "invalid-total-alpha");
+
+  // --- Build a growing sequence of observation snapshots: a strong,
+  // genuinely real effect by the final look, but noisy and underpowered at
+  // the first look ------------------------------------------------------------
+  const obs = (arm, value) => ({ experimentId: "review-daily-limit", arm, metric: "review-success", value, at: "2026-06-01T00:00:00.000Z" });
+  const allControl = Array.from({ length: 20 }, (_, index) => obs("twelve", 0.5 + (index % 2 === 0 ? 0.02 : -0.02)));
+  const allVariant = Array.from({ length: 20 }, (_, index) => obs("six", 0.85 + (index % 2 === 0 ? 0.02 : -0.02)));
+  const snapshotAt = (n) => [...allControl.slice(0, n), ...allVariant.slice(0, n)];
+
+  const twoLookPrereg = preregisterSequentialExperiment("review-daily-limit", { plannedLooks: 2, totalAlpha: 0.05 });
+  const snapshots = [snapshotAt(3), snapshotAt(20)];
+  const run = runSequentialLooks(twoLookPrereg.preregistration, snapshots, { epsilonPerLook: 0.4 });
+  assert.equal(run.ok, true);
+  assert.equal(run.looks[0].verdict, "underpowered", "the first look has too few samples to conclude anything");
+  assert.equal(run.looks.length, 2);
+  assert.equal(run.looks[1].verdict, "variant-better");
+  assert.equal(run.stoppedEarly, false, "the stopping rule only stops early on a concluding verdict at an *earlier* look than the last planned one");
+
+  // --- Running more looks than were preregistered is refused outright ------
+  const tooManyLooks = runSequentialLooks(twoLookPrereg.preregistration, [snapshotAt(3), snapshotAt(10), snapshotAt(20)], { epsilonPerLook: 0.1 });
+  assert.equal(tooManyLooks.ok, false);
+  assert.equal(tooManyLooks.reason, "more-looks-than-preregistered");
+
+  // --- A sequential run that concludes early actually stops, and does not
+  // spend budget or report a look beyond the stopping point -----------------
+  const threeLookPrereg = preregisterSequentialExperiment("review-daily-limit", { plannedLooks: 3, totalAlpha: 0.05 });
+  const earlyStopRun = runSequentialLooks(threeLookPrereg.preregistration, [snapshotAt(20), snapshotAt(20), snapshotAt(20)], { epsilonPerLook: 0.1 });
+  assert.equal(earlyStopRun.ok, true);
+  assert.equal(earlyStopRun.stoppedEarly, true);
+  assert.equal(earlyStopRun.stoppedAt, 1);
+  assert.equal(earlyStopRun.looks.length, 1);
+
+  // --- The privacy budget is a real, spendable one shared across looks,
+  // reusing private-cohort-analytics.mjs's own accounting unmodified -------
+  const tightBudgetRun = runSequentialLooks(twoLookPrereg.preregistration, snapshots, { totalEpsilon: 0.3, epsilonPerLook: 0.4 });
+  assert.equal(tightBudgetRun.ok, false);
+  assert.equal(tightBudgetRun.reason, "budget-exhausted");
+
+  // --- Heterogeneous treatment effects: estimated separately per subgroup,
+  // never blended into one overall number -------------------------------------
+  const mixedObservations = [
+    ...Array.from({ length: 15 }, (_, index) => ({ ...obs("twelve", 0.5), at: "2026-06-01T00:00:00.000Z", cohortYear: index % 2 === 0 ? "2025" : "2026" })),
+    ...Array.from({ length: 15 }, (_, index) => ({ ...obs("six", index < 8 ? 0.9 : 0.5), at: "2026-06-01T00:00:00.000Z", cohortYear: index < 8 ? "2025" : "2026" })),
+  ];
+  const subgroupResult = analyzeSubgroups(prereg.preregistration, mixedObservations, (item) => item.cohortYear, { minimumSample: 3 });
+  assert.equal(subgroupResult.dimension, "cohortYear");
+  assert.equal(subgroupResult.subgroups.length, 2);
+  const by2025 = subgroupResult.subgroups.find((item) => item.subgroup === "2025");
+  const by2026 = subgroupResult.subgroups.find((item) => item.subgroup === "2026");
+  assert.ok(by2025);
+  assert.ok(by2026);
+  assert.notEqual(by2025.verdict, by2026.verdict, "the two subgroups must be allowed to disagree, since the effect was constructed to be real for one and absent for the other");
+  assert.equal("overallVerdict" in subgroupResult, false, "subgroup results must never be blended into one overall verdict");
+
+  const tooFewPerSubgroup = analyzeSubgroups(prereg.preregistration, mixedObservations.slice(0, 2), (item) => item.cohortYear, { minimumSample: 3 });
+  assert.ok(tooFewPerSubgroup.subgroups.every((item) => item.verdict === "underpowered"));
+
+  // --- Attrition sensitivity reuses private-cohort-analytics.mjs's own
+  // bounds, scoped to this experiment's own cohort roster ---------------------
+  const cohortOpen = openCohort("review-daily-limit", { cohortId: "seq-cohort-1" });
+  assert.equal(cohortOpen.ok, true);
+  let cohort = cohortOpen.cohort;
+  for (const participantId of ["p1", "p2", "p3", "p4", "p5"]) {
+    cohort = enrollParticipant(cohort, participantId).cohort;
+  }
+  const partialOutcomes = [1, 0, 1, null, null];
+  const sensitivity = sequentialAttritionSensitivity(cohort, partialOutcomes);
+  assert.equal(sensitivity.enrolled, 5);
+  assert.equal(sensitivity.contributed, 3);
+  assert.equal(sensitivity.missing, 2);
+  assert.ok(sensitivity.lower <= sensitivity.upper);
+  assert.ok(sensitivity.width > 0, "a cohort with real attrition must report a nonzero sensitivity width, not a false point estimate");
 });
