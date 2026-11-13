@@ -62,6 +62,7 @@ import { ALGORITHM_TRACING_TASK_KIND, ALGORITHM_TRACING_TUTOR_VERSION, algorithm
 import { MODEL_ADVISORY_SUBJECT, MODEL_ADVISORY_VERSION, buildModelAdvisory, classifyModelLicense, evaluateModelForQuarantine, signModelAdvisory, verifyModelAdvisory } from "../electron/model-advisory.mjs";
 import { SEQUENTIAL_CAUSAL_EXPERIMENT_VERSION, analyzeSubgroups, preregisterSequentialExperiment, runSequentialLooks, sequentialAttritionSensitivity, sequentialCriticalValue, verifyAgainstPreregistration } from "../electron/sequential-causal-experiments.mjs";
 import { CURRICULUM_REVIEW_VERSION, applyApprovedReview, blindReviewItem, buildReviewQueue, lowConfidenceClaimItems, measureOverrideRate, recordAdjudication, rubricDisagreementItems, staleLessonItems, unsafeHintItems } from "../electron/curriculum-review.mjs";
+import { CURRICULUM_PORTFOLIO_SUBJECT, CURRICULUM_PORTFOLIO_VERSION, buildCurriculumPortfolio, buildPortfolioContent, decideCurriculumPromotion, evaluatePromotionGates, portfolioDigest, scanPortfolioForAnswerLeakage, verifyCurriculumPortfolio } from "../electron/curriculum-portfolio.mjs";
 import { RACE_GRADER_VERSION, buildRaceTask, gradeRaceSubmission, publicRaceTask, signatureParameters } from "../electron/race-grader.mjs";
 import { LOCALIZATION_VERSION, buildLocalizationExercise, nextHint, publicLocalizationExercise, scoreLocalization } from "../electron/localization.mjs";
 import { CALL_CHAIN_VERSION, buildCallChainExercises, buildCallChains, extractReturnExpressions, gradeCallChainAnswer, publicExercise, symbolBodyRange } from "../electron/call-chain.mjs";
@@ -12345,4 +12346,184 @@ test("instructor adjudication and curriculum review provides a blinded queue ove
   const scopedToHints = measureOverrideRate(enoughEvents, "unsafe-hint");
   assert.equal(scopedToHints.reviewKind, "unsafe-hint");
   assert.ok(scopedToHints.samples <= enoughEvents.length, "scoping to one kind must never count more events than exist in total");
+});
+
+test("learner-safety and efficacy portfolios combine retention, transfer, calibration, accessibility, privacy, provenance, and answer-leakage into six named gates and one signed promotion decision", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "curriculum-portfolio-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "app"), { recursive: true });
+  await writeFile(path.join(rootPath, "app", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "app", "queue.py"), "def enqueue(job):\n    return job\n");
+  await writeFile(path.join(rootPath, "app", "worker.py"), "from app.queue import enqueue\n\n\ndef work(job):\n    return enqueue(job)\n");
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const skillGraph = buildSkillGraph(repository, generateStarterCourse(repository));
+  assert.equal(CURRICULUM_PORTFOLIO_VERSION, 1);
+  assert.equal(CURRICULUM_PORTFOLIO_SUBJECT, "curriculum-portfolio");
+  assert.ok(SIGNABLE_SUBJECTS.includes(CURRICULUM_PORTFOLIO_SUBJECT));
+
+  const base = Date.parse("2026-07-01T09:00:00.000Z");
+  const at = (minutes) => new Date(base + minutes * 60_000).toISOString();
+  const events = [
+    { at: at(0), kind: "prediction", path: "app/queue.py", correct: true },
+    { at: at(1), kind: "prediction", path: "app/queue.py", correct: true },
+    { at: at(2), kind: "prediction", path: "app/worker.py", correct: true },
+    { at: at(3), kind: "review", correct: true, elapsedDays: 2, stability: 10 },
+    { at: at(4), kind: "review", correct: true, elapsedDays: 3, stability: 10 },
+    { at: at(5), kind: "review", correct: true, elapsedDays: 4, stability: 10 },
+  ];
+  const learnerState = {
+    repositoryId: repository.id,
+    diagnosticCompleted: true,
+    mastery: Object.fromEntries(skillGraph.nodes.map((node, index) => [node.id, {
+      skillId: node.id,
+      mastery: 0.6,
+      confidence: 0.6,
+      status: index === 0 ? "active" : "available",
+      evidence: index === 0
+        ? [
+          { id: "e1", skillId: node.id, kind: "quiz", strength: 0.85, detail: "", createdAt: "" },
+          { id: "e2", skillId: node.id, kind: "practice", strength: 0.9, detail: "", createdAt: "" },
+          { id: "e3", skillId: node.id, kind: "review", strength: 0.92, detail: "", createdAt: "" },
+        ]
+        : [],
+    }])),
+    memory: [],
+    updatedAt: "",
+  };
+
+  // --- scanPortfolioForAnswerLeakage: answer-guard.mjs's own
+  // ALWAYS_FORBIDDEN/findForbiddenKeys, reused unmodified --------------------
+  const cleanCourse = { id: "course-1", title: "Queueing", modules: [{ id: "m1", lessons: [{ id: "l1", title: "Enqueue" }] }] };
+  assert.deepEqual(scanPortfolioForAnswerLeakage(cleanCourse), { clean: true, found: [] });
+  const leakyCourse = { id: "course-1", modules: [{ id: "m1", lessons: [{ id: "l1", answerKey: "42" }] }] };
+  const leaky = scanPortfolioForAnswerLeakage(leakyCourse);
+  assert.equal(leaky.clean, false);
+  assert.ok(leaky.found.length >= 1);
+
+  // --- buildPortfolioContent: deterministic, no wall-clock field inside ----
+  const accessibilityInput = {
+    baselineScores: [0.8, 0.82, 0.79, 0.81, 0.8],
+    perPathScores: Object.fromEntries(ACCESSIBILITY_PATHS.map((path) => [path, [0.79, 0.81, 0.8, 0.82, 0.78]])),
+    snapshots: {},
+    options: {},
+  };
+  const inputA = { events, learnerState, skillGraph, repository, studiedPaths: ["app/queue.py"], course: cleanCourse, accessibility: accessibilityInput, now: at(2000) };
+  const inputB = { ...inputA, events: [...events], learnerState: JSON.parse(JSON.stringify(learnerState)), now: at(3000) };
+  const contentA = buildPortfolioContent(inputA);
+  const contentB = buildPortfolioContent(inputB);
+  assert.deepEqual(contentA, contentB, "identical inputs (differing only in `now`) must produce identical content");
+  assert.equal("generatedAt" in contentA, false, "the digested content must carry no wall-clock field");
+  assert.equal(portfolioDigest(contentA), portfolioDigest(contentB));
+  const contentC = buildPortfolioContent({ ...inputA, events: events.slice(0, 2) });
+  assert.notEqual(portfolioDigest(contentA), portfolioDigest(contentC));
+
+  // --- The six required sections are present and are not re-derived -------
+  assert.equal(contentA.effectiveness.retention.kind, "retention");
+  assert.equal(contentA.effectiveness.transfer.kind, "transfer");
+  assert.ok(contentA.calibration.assessed >= 1);
+  assert.equal(contentA.accessibility.length, 6);
+  assert.ok(contentA.accessibility.find((report) => report.path === "keyboard-only").ok);
+  assert.deepEqual(contentA.leakage, { clean: true, found: [] });
+  assert.equal(contentA.privacy, null, "privacy is supplied by the caller, not re-run inside buildPortfolioContent");
+  assert.equal(contentA.provenance, null);
+
+  // --- evaluatePromotionGates: six named gates, never blended -------------
+  const gatesNoEvidence = evaluatePromotionGates(contentA);
+  assert.equal(gatesNoEvidence.length, 6);
+  assert.deepEqual(gatesNoEvidence.map((gate) => gate.gate).sort(), ["accessibility", "answer-leakage", "calibration", "effectiveness", "privacy", "provenance"]);
+  assert.equal(gatesNoEvidence.find((gate) => gate.gate === "privacy").verdict, "insufficient-evidence", "no privacy verdict was supplied yet");
+  assert.equal(gatesNoEvidence.find((gate) => gate.gate === "provenance").verdict, "insufficient-evidence");
+  assert.equal(gatesNoEvidence.find((gate) => gate.gate === "answer-leakage").verdict, "pass");
+  assert.equal(gatesNoEvidence.find((gate) => gate.gate === "calibration").verdict, "pass");
+  assert.equal(gatesNoEvidence.find((gate) => gate.gate === "effectiveness").verdict, "pass", JSON.stringify(gatesNoEvidence));
+  assert.equal("overallScore" in { gates: gatesNoEvidence }, false);
+
+  // --- decideCurriculumPromotion: insufficient evidence blocks promotion,
+  // and is named separately from an actual failure ---------------------------
+  const blockedDecision = decideCurriculumPromotion(gatesNoEvidence);
+  assert.equal(blockedDecision.promote, false);
+  assert.deepEqual(blockedDecision.failedGates, []);
+  assert.deepEqual(blockedDecision.unprovenGates.sort(), ["privacy", "provenance"]);
+  assert.match(blockedDecision.reason, /insufficient evidence/);
+
+  // --- A real privacy verdict (verifyAdversarialOfflinePrivacy, reused
+  // unmodified) and a real provenance attestation (buildProvenance/
+  // verifyProvenance, reused unmodified) complete the missing gates --------
+  const privacy = await verifyAdversarialOfflinePrivacy({
+    electronDirectory: path.resolve("electron"),
+    probeOptions: { homeDirectory: os.homedir(), writableRoot: workspace },
+  });
+  assert.equal(privacy.staticOfflineModeSafe, true, JSON.stringify(privacy.staticFindings));
+
+  const provenanceKeyPair = createKeyPair();
+  const artifacts = [{ name: "course-1.tar.gz", digest: "sha512:" + Buffer.from("course bytes").toString("base64"), size: 12 }];
+  const statement = signProvenance(buildProvenance({ artifacts, sbom: { components: [] }, builderId: "local/portfolio-test", invocation: { source: "test", targets: ["course-1"] } }), provenanceKeyPair);
+  const provenance = verifyProvenance(statement, { artifacts, sbom: { components: [] }, trustedKeyIds: [provenanceKeyPair.keyId] });
+  assert.equal(provenance.accepted, true, provenance.detail);
+
+  const completeInput = { ...inputA, privacy, provenance };
+  const completeContent = buildPortfolioContent(completeInput);
+  const completeGates = evaluatePromotionGates(completeContent);
+  assert.equal(completeGates.find((gate) => gate.gate === "privacy").verdict, "pass");
+  assert.equal(completeGates.find((gate) => gate.gate === "provenance").verdict, "pass");
+  const promotedDecision = decideCurriculumPromotion(completeGates);
+  assert.equal(promotedDecision.promote, true, JSON.stringify(promotedDecision));
+  assert.equal(promotedDecision.reason, null);
+
+  // A real failure (a denied provenance attestation) blocks promotion and is
+  // named as a failure, not insufficient evidence.
+  const deniedProvenance = verifyProvenance(statement, { artifacts, sbom: { components: [] }, trustedKeyIds: [] });
+  assert.equal(deniedProvenance.accepted, false);
+  const failingGates = evaluatePromotionGates(buildPortfolioContent({ ...completeInput, provenance: deniedProvenance }));
+  const failingDecision = decideCurriculumPromotion(failingGates);
+  assert.equal(failingDecision.promote, false);
+  assert.deepEqual(failingDecision.failedGates, ["provenance"]);
+  assert.match(failingDecision.reason, /failed/);
+
+  // A leaky course fails the answer-leakage gate specifically.
+  const leakyGates = evaluatePromotionGates(buildPortfolioContent({ ...completeInput, course: leakyCourse }));
+  assert.equal(leakyGates.find((gate) => gate.gate === "answer-leakage").verdict, "fail");
+  assert.equal(decideCurriculumPromotion(leakyGates).failedGates.includes("answer-leakage"), true);
+
+  // --- Signing and verification: reuses signPayload/verifyPayload exactly -
+  const keyPair = createKeyPair();
+  const portfolio = buildCurriculumPortfolio({ ...completeInput, keyPair });
+  assert.equal(portfolio.version, CURRICULUM_PORTFOLIO_VERSION);
+  assert.ok(portfolio.digest);
+  assert.ok(portfolio.generatedAt);
+  assert.equal(portfolio.decision.promote, true, JSON.stringify(portfolio.decision));
+  assert.equal(portfolio.signature.subject, CURRICULUM_PORTFOLIO_SUBJECT);
+
+  const verified = verifyCurriculumPortfolio(portfolio, { trustedKeyIds: [keyPair.keyId] });
+  assert.equal(verified.digestOk, true);
+  assert.equal(verified.reproducible, true);
+  assert.equal(verified.seal.verified, true);
+  assert.equal(verified.seal.trust, "trusted");
+  assert.equal(verified.verdict, "verified");
+
+  const untrusted = verifyCurriculumPortfolio(portfolio, {});
+  assert.equal(untrusted.seal.trust, "untrusted");
+  assert.equal(untrusted.verdict, "untrusted-signer");
+
+  const unsigned = buildCurriculumPortfolio(completeInput);
+  assert.equal(unsigned.signature, null);
+  const unsignedVerdict = verifyCurriculumPortfolio(unsigned, {});
+  assert.equal(unsignedVerdict.digestOk, true);
+  assert.equal(unsignedVerdict.seal.reason, "not-signed");
+  assert.equal(unsignedVerdict.verdict, "unsigned-or-unverifiable");
+
+  // Tampering after signing breaks the digest, independent of the signature
+  // and independent of the (separately stored) decision field.
+  const tampered = { ...portfolio, leakage: { clean: false, found: ["answerKey"] } };
+  const tamperedVerdict = verifyCurriculumPortfolio(tampered, { trustedKeyIds: [keyPair.keyId] });
+  assert.equal(tamperedVerdict.digestOk, false);
+  assert.equal(tamperedVerdict.verdict, "altered");
+
+  // Reproducibility across two independently built portfolios.
+  const rebuilt = buildCurriculumPortfolio({ ...completeInput, events: [...events], keyPair, now: at(9000) });
+  assert.equal(portfolio.digest, rebuilt.digest, "two portfolios from equivalent inputs must share a digest even though generatedAt differs");
+  assert.notEqual(portfolio.generatedAt, rebuilt.generatedAt);
 });

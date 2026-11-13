@@ -139,6 +139,10 @@ artifact to another.
   digest over content that carries no wall-clock field.
 - `model-advisory` — a local model artifact's content fingerprint,
   configuration fingerprint, capability compatibility, and license bucket.
+- `curriculum-portfolio` — retention/transfer/calibration, accessibility
+  equivalence, offline privacy, build provenance, and answer-leakage, folded
+  into six independently named promotion gates and one promote/do-not-promote
+  decision.
 
 Validity and trust are separate. An intact signature from an unknown key is
 `untrusted`, which is a warning for a course package and a **refusal** for
