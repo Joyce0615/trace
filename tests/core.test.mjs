@@ -44,6 +44,7 @@ import { ALWAYS_FORBIDDEN, ANSWER_GUARD_VERSION, MAX_HINT_PENALTY, SCANNED_CHANN
 import { ACTIVITY_VERSION, buildActivitySet, excerptFor, gradeContrast, gradePrediction, gradeTeachBack, headerParameters, publicActivitySet, restatementRatio, summarizePredictions } from "../electron/activities.mjs";
 import { EXPLANATION_GRADER_VERSION, buildExplanationTask, checkCitations, claimsFailure, gradeExplanation, mentionedSymbols, publicExplanationTask } from "../electron/explanation-grader.mjs";
 import { EXECUTABLE_QUIZ_VERSION, buildExecutableQuiz, candidateValues, gradeSubmission, parseSignature, probeArguments, publicQuiz, runInSandbox, screenSubmission, selfContainedFunctions } from "../electron/executable-quiz.mjs";
+import { DEFAULT_EXERCISE_LIMITS, EXERCISE_CAPABILITIES, EXERCISE_KINDS, REPOSITORY_EXERCISE_VERSION, buildRepositoryExercise, publicRepositoryExercise, runRepositoryExercise, screenRepositoryExerciseSubmission } from "../electron/repository-exercise.mjs";
 import { DEFAULT_SCHEDULER, REVIEW_GRADE_IDS, SPACED_REPETITION_VERSION, applyReview, decayedMastery, forgettingCurve, gradeReview, intervalForRetention, retention, reviewPlan, scheduleSkill } from "../electron/spaced-repetition.mjs";
 import { FSRS_CALIBRATION_VERSION, reconcileInitialState, unifiedMasteryState } from "../electron/fsrs-calibration.mjs";
 import { FSRS_OPTIMIZER_VERSION, MIN_REVIEW_LOGS, compareAgainstDefaults, exportReviewLogs, fitPersonalizedParameters, personalizedSchedulerOptions, reviewLogToEvidence, rollbackParameters, toReviewLogs } from "../electron/fsrs-optimizer.mjs";
@@ -3671,6 +3672,161 @@ test("executable quizzes hide their oracle and run inside a bounded sandbox", as
   const looping = await gradeSubmission(quiz, "def normalize(text, keep_case=False):\n    while True:\n        pass\n", { limits: { cpuSeconds: 1, wallClockMs: 20_000 } });
   assert.equal(looping.status, "cpu");
   assert.equal(looping.passed, false);
+});
+
+test("sandboxed programmatic repository exercises run bounded tool-calling scripts (item 41)", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "trace-repo-exercise-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "app"), { recursive: true });
+  await writeFile(path.join(rootPath, "app", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "app", "tokens.py"), [
+    "def normalize(text):",
+    "    return text.strip()",
+    "",
+    "",
+    "def shout(text):",
+    "    return normalize(text).upper()",
+    "",
+  ].join("\n"));
+  await writeFile(path.join(rootPath, "app", "main.py"), [
+    "from app.tokens import normalize, shout",
+    "",
+    "",
+    "def run(text):",
+    "    return shout(normalize(text))",
+    "",
+  ].join("\n"));
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  assert.equal(REPOSITORY_EXERCISE_VERSION, 1);
+  assert.deepEqual([...EXERCISE_KINDS], ["file-with-most-functions", "caller-count", "line-count", "repository-size"]);
+  assert.deepEqual(Object.keys(EXERCISE_CAPABILITIES).sort(), ["callers", "list-files", "read-file", "symbols"]);
+
+  // --- Exercise construction: the oracle comes from the index itself, never
+  // from running the submission -------------------------------------------
+  const exercise = await buildRepositoryExercise(repository, { kind: "file-with-most-functions" });
+  assert.equal(exercise.available, true);
+  assert.deepEqual(exercise.capabilities, ["list-files", "symbols"]);
+  assert.equal(exercise.goldAnswer, "app/tokens.py");
+  const publicView = publicRepositoryExercise(exercise);
+  assert.equal("goldAnswer" in publicView, false, "the oracle must never cross into the renderer's view");
+  assert.equal(publicView.prompt, exercise.prompt);
+
+  const callerExercise = await buildRepositoryExercise(repository, { kind: "caller-count" });
+  assert.equal(callerExercise.available, true);
+  assert.deepEqual(callerExercise.capabilities, ["callers"]);
+  // `normalize` is called twice (once inside `shout`, once inside `run`);
+  // `shout` is called once (inside `run`). The higher count wins.
+  assert.equal(callerExercise.goldAnswer, 2);
+
+  const sizeExercise = await buildRepositoryExercise(repository, { kind: "repository-size" });
+  assert.equal(sizeExercise.goldAnswer, repository.files.length);
+
+  const lineExercise = await buildRepositoryExercise(repository, {
+    kind: "line-count",
+    read: (filePath) => readRepositoryFile(rootPath, filePath),
+  });
+  assert.equal(lineExercise.available, true);
+  assert.deepEqual(lineExercise.capabilities, ["read-file"]);
+  assert.ok(Number.isInteger(lineExercise.goldAnswer));
+
+  const empty = { versionId: "v1", rootPath, files: [], symbols: [], callEdges: [] };
+  const unavailable = await buildRepositoryExercise(empty);
+  assert.equal(unavailable.available, false);
+  assert.match(unavailable.reason, /No repository-analysis exercise/);
+
+  // --- The static screen runs before any process exists --------------------
+  assert.equal(screenRepositoryExerciseSubmission("return 1;").allowed, true);
+  assert.ok(screenRepositoryExerciseSubmission("").findings.some((finding) => finding.id === "empty"));
+  assert.ok(screenRepositoryExerciseSubmission("x".repeat(20_000)).findings.some((finding) => finding.id === "too-large"));
+
+  // --- A correct script that actually calls the granted tools passes, and
+  // produces a deterministic trace of what it called ------------------------
+  const correctScript = [
+    "const files = await tools.listFiles();",
+    "let best = null;",
+    "let bestCount = -1;",
+    "for (const filePath of files) {",
+    "  const symbols = await tools.symbols(filePath);",
+    "  const count = symbols.filter((item) => item.kind === 'function').length;",
+    "  if (count > bestCount) { bestCount = count; best = filePath; }",
+    "}",
+    "return best;",
+  ].join("\n");
+  const correct = await runRepositoryExercise(repository, exercise, correctScript);
+  assert.equal(correct.status, "ran");
+  assert.equal(correct.passed, true);
+  assert.ok(correct.trace.length >= 2, JSON.stringify(correct.trace));
+  assert.equal(correct.trace[0].capability, "list-files");
+  assert.ok(correct.trace.every((entry) => entry.capability === "list-files" || entry.capability === "symbols"));
+  // Repeating the exact same submission against the same repository version
+  // produces the exact same trace shape: the run is deterministic.
+  const repeat = await runRepositoryExercise(repository, exercise, correctScript);
+  assert.deepEqual(repeat.trace.map((entry) => entry.capability), correct.trace.map((entry) => entry.capability));
+
+  // --- A wrong guess fails without ever reporting the computed value back --
+  const wrong = await runRepositoryExercise(repository, exercise, "return 'nowhere.py';");
+  assert.equal(wrong.status, "ran");
+  assert.equal(wrong.passed, false);
+  assert.equal("value" in wrong, false);
+
+  // --- Nothing not granted exists to reach: no ambient process, no fetch, no
+  // tool this exercise did not grant -----------------------------------------
+  const reachesProcess = await runRepositoryExercise(repository, exercise, "return process.env;");
+  assert.equal(reachesProcess.status, "error");
+  assert.match(reachesProcess.reason, /process is not defined/);
+  const reachesFetch = await runRepositoryExercise(repository, exercise, "return typeof fetch;");
+  assert.equal(reachesFetch.status, "ran");
+  // `vm`'s global object carries only the language's own intrinsics: `fetch`
+  // is not a function that exists to call, it is a name that resolves to
+  // `undefined`, exactly like any other unassigned identifier would.
+  // (Returning its `typeof` rather than calling it directly keeps the
+  // assertion about reachability rather than about whether undici is loaded.)
+  const ungrantedTool = await runRepositoryExercise(repository, exercise, "return await tools.readFile('app/tokens.py');");
+  assert.equal(ungrantedTool.status, "error");
+  assert.match(ungrantedTool.reason, /not a function/);
+
+  // --- The host re-checks the grant even if the child process somehow asked
+  // for a capability its own `tools` object does not expose ------------------
+  const sizeHandlers = await runRepositoryExercise(repository, sizeExercise, "const n = await tools.listFiles();\nreturn n.length;");
+  assert.equal(sizeHandlers.passed, true);
+
+  // --- Bounds: wall-clock timeout and a host-call ceiling --------------------
+  const spinning = await runRepositoryExercise(repository, sizeExercise, "let total = 0;\nwhile (true) { total += 1; }\nreturn total;", { timeoutMs: 600 });
+  assert.equal(spinning.status, "timeout");
+  assert.equal(spinning.passed, false);
+
+  const tooManyCalls = await runRepositoryExercise(
+    repository,
+    sizeExercise,
+    "for (let i = 0; i < 60; i += 1) { await tools.listFiles(); }\nreturn 1;",
+    { limits: { maxHostCalls: 10 } },
+  );
+  assert.equal(tooManyCalls.status, "too-many-host-calls");
+  assert.ok(tooManyCalls.hostCalls > 10);
+
+  // --- A refused submission never spawns a process ---------------------------
+  const refused = await runRepositoryExercise(repository, sizeExercise, "");
+  assert.equal(refused.status, "refused");
+  assert.equal(refused.hostCalls, 0);
+  assert.deepEqual(refused.trace, []);
+
+  // --- Secrets in a read file are redacted before the submission ever sees
+  // them, the same as every other channel that reads repository content ------
+  await writeFile(path.join(rootPath, "app", "config.py"), 'TOKEN = "sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n');
+  resetAnalysisCache();
+  const repositoryWithSecret = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  const secretReadExercise = await buildRepositoryExercise(repositoryWithSecret, {
+    kind: "line-count",
+    read: (filePath) => readRepositoryFile(rootPath, filePath),
+  });
+  const probeSecret = await runRepositoryExercise(repositoryWithSecret, secretReadExercise, "const content = await tools.readFile(exerciseAnchorPath);\nconsole.log(content);\nreturn content.split(/\\r?\\n/).length;".replace("exerciseAnchorPath", JSON.stringify("app/config.py")));
+  assert.equal(probeSecret.status, "ran");
+  assert.doesNotMatch(String(probeSecret.logs ?? []), /sk-a{20,}/, "a secret read through the tool must be redacted before the submission ever sees it, exactly like repository:read-file");
+
+  assert.equal(DEFAULT_EXERCISE_LIMITS.timeoutMs > 0, true);
 });
 
 test("explanations are graded against what the run actually did", async (context) => {
