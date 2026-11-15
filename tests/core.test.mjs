@@ -45,6 +45,8 @@ import { ACTIVITY_VERSION, buildActivitySet, excerptFor, gradeContrast, gradePre
 import { EXPLANATION_GRADER_VERSION, buildExplanationTask, checkCitations, claimsFailure, gradeExplanation, mentionedSymbols, publicExplanationTask } from "../electron/explanation-grader.mjs";
 import { EXECUTABLE_QUIZ_VERSION, buildExecutableQuiz, candidateValues, gradeSubmission, parseSignature, probeArguments, publicQuiz, runInSandbox, screenSubmission, selfContainedFunctions } from "../electron/executable-quiz.mjs";
 import { DEFAULT_EXERCISE_LIMITS, EXERCISE_CAPABILITIES, EXERCISE_KINDS, REPOSITORY_EXERCISE_VERSION, buildRepositoryExercise, publicRepositoryExercise, runRepositoryExercise, screenRepositoryExerciseSubmission } from "../electron/repository-exercise.mjs";
+import { CONTINUITY_FIELDS, MAX_EVIDENCE, MAX_HYPOTHESES, MAX_THREAD_QUESTIONS, PROJECT_CONTINUITY_VERSION, appendThreadTurn, consentState as continuityConsentState, continuityAnchors, detectCurriculumDrift, detectStaleContinuity, emptyContinuity, markHypothesesStale, recordEvidence, recordHypothesis, recordMisconception, renderContinuitySummary, resolveHypothesis, setContinuityConsent, setContinuityGoal } from "../electron/project-continuity.mjs";
+import { PROJECT_CONTINUITY_STORE_VERSION, forgetContinuity, loadContinuity, saveContinuity } from "../electron/project-continuity-store.mjs";
 import { DEFAULT_SCHEDULER, REVIEW_GRADE_IDS, SPACED_REPETITION_VERSION, applyReview, decayedMastery, forgettingCurve, gradeReview, intervalForRetention, retention, reviewPlan, scheduleSkill } from "../electron/spaced-repetition.mjs";
 import { FSRS_CALIBRATION_VERSION, reconcileInitialState, unifiedMasteryState } from "../electron/fsrs-calibration.mjs";
 import { FSRS_OPTIMIZER_VERSION, MIN_REVIEW_LOGS, compareAgainstDefaults, exportReviewLogs, fitPersonalizedParameters, personalizedSchedulerOptions, reviewLogToEvidence, rollbackParameters, toReviewLogs } from "../electron/fsrs-optimizer.mjs";
@@ -3827,6 +3829,181 @@ test("sandboxed programmatic repository exercises run bounded tool-calling scrip
   assert.doesNotMatch(String(probeSecret.logs ?? []), /sk-a{20,}/, "a secret read through the tool must be redacted before the submission ever sees it, exactly like repository:read-file");
 
   assert.equal(DEFAULT_EXERCISE_LIMITS.timeoutMs > 0, true);
+});
+
+test("multi-session project-learning continuity preserves hypotheses, evidence, misconceptions, and goals across cumulative questions, and detects staleness after code and curriculum changes (item 42)", async (context) => {
+  assert.equal(PROJECT_CONTINUITY_VERSION, 1);
+  assert.equal(PROJECT_CONTINUITY_STORE_VERSION, 1);
+  assert.deepEqual(CONTINUITY_FIELDS, ["goal", "hypotheses", "evidence", "misconceptions", "thread"]);
+
+  // --- No consent, no continuity: every mutator refuses on a fresh record ---
+  const repositoryId = "repo-continuity-1";
+  const fresh = emptyContinuity(repositoryId);
+  assert.equal(continuityConsentState(fresh).granted, false);
+  assert.deepEqual(recordHypothesis(fresh, { text: "normalize runs once per call" }), { ok: false, reason: "no-consent", record: fresh });
+  assert.deepEqual(recordEvidence(fresh, { text: "saw it called twice" }), { ok: false, reason: "no-consent", record: fresh });
+  assert.deepEqual(appendThreadTurn(fresh, { question: "Where is normalize defined?" }), { ok: false, reason: "no-consent", record: fresh });
+  assert.equal(renderContinuitySummary(fresh), "No cross-session memory is kept for this repository (continuity is off).");
+
+  // --- Granting consent enables the thread; revoking deletes everything, not
+  // merely the flag --------------------------------------------------------
+  const consented = setContinuityConsent(fresh, true, "2026-11-15T00:00:00.000Z");
+  assert.equal(consented.consent.granted, true);
+  assert.equal(consented.consent.grantedAt, "2026-11-15T00:00:00.000Z");
+  assert.equal(continuityConsentState(consented).granted, true);
+
+  // --- A goal must be a real, known goal id ---------------------------------
+  const badGoal = setContinuityGoal(consented, "not-a-real-goal");
+  assert.deepEqual(badGoal, { ok: false, reason: "unknown-goal", record: consented });
+  const goaled = setContinuityGoal(consented, "debugging", "2026-11-15T00:05:00.000Z");
+  assert.equal(goaled.ok, true);
+  assert.equal(goaled.record.goal, "debugging");
+  // A pre-item-43 legacy alias still resolves through `canonicalGoalId`.
+  const aliased = setContinuityGoal(consented, "critical_path", "2026-11-15T00:06:00.000Z");
+  assert.equal(aliased.record.goal, "performance");
+
+  // --- Recording a hypothesis, then updating it by id (not duplicating) -----
+  const anchorA = { path: "app/tokens.py", name: "normalize" };
+  const anchorB = { path: "app/tokens.py", name: "shout" };
+  let record = goaled.record;
+  const firstHyp = recordHypothesis(record, { text: "normalize strips whitespace once", anchors: [anchorA] }, "2026-11-15T01:00:00.000Z");
+  assert.equal(firstHyp.ok, true);
+  assert.equal(firstHyp.record.hypotheses.length, 1);
+  assert.equal(firstHyp.record.hypotheses[0].status, "open");
+  const hypothesisId = firstHyp.record.hypotheses[0].id;
+  const updatedHyp = recordHypothesis(firstHyp.record, { id: hypothesisId, text: "normalize strips whitespace and lowercases", anchors: [anchorA] }, "2026-11-15T01:05:00.000Z");
+  assert.equal(updatedHyp.record.hypotheses.length, 1, "re-recording by id must update, not duplicate");
+  assert.equal(updatedHyp.record.hypotheses[0].text, "normalize strips whitespace and lowercases");
+  assert.equal(updatedHyp.record.hypotheses[0].createdAt, "2026-11-15T01:00:00.000Z", "createdAt must survive an update");
+
+  // Empty text is refused.
+  assert.deepEqual(recordHypothesis(updatedHyp.record, { text: "   " }), { ok: false, reason: "empty-text", record: updatedHyp.record });
+
+  // --- Resolving a hypothesis is the only path that moves it out of "open" --
+  assert.deepEqual(resolveHypothesis(updatedHyp.record, hypothesisId, "not-a-real-resolution"), { ok: false, reason: "unknown-resolution", record: updatedHyp.record });
+  assert.deepEqual(resolveHypothesis(updatedHyp.record, "unknown-id", "confirmed"), { ok: false, reason: "unknown-hypothesis", record: updatedHyp.record });
+  const confirmed = resolveHypothesis(updatedHyp.record, hypothesisId, "confirmed", "2026-11-15T01:10:00.000Z");
+  assert.equal(confirmed.ok, true);
+  assert.equal(confirmed.record.hypotheses[0].status, "confirmed");
+
+  // --- Evidence can link to a real hypothesis or stand alone, never to an
+  // unknown one ----------------------------------------------------------
+  record = confirmed.record;
+  assert.deepEqual(
+    recordEvidence(record, { text: "ran it twice and saw .strip() both times", hypothesisId: "not-real" }),
+    { ok: false, reason: "unknown-hypothesis", record },
+  );
+  const evidenced = recordEvidence(record, { text: "ran it twice and saw .strip() both times", hypothesisId, anchors: [anchorA], supports: true }, "2026-11-15T01:20:00.000Z");
+  assert.equal(evidenced.ok, true);
+  assert.equal(evidenced.record.evidence.length, 1);
+  assert.equal(evidenced.record.evidence[0].supports, true);
+  assert.equal(evidenced.record.evidence[0].hypothesisId, hypothesisId);
+
+  // --- Misconceptions are validated against the real taxonomy by id only ---
+  record = evidenced.record;
+  assert.deepEqual(recordMisconception(record, "not-a-real-misconception", anchorA), { ok: false, reason: "unknown-misconception", record });
+  const misconceived = recordMisconception(record, "single-caller", anchorB, "2026-11-15T01:30:00.000Z");
+  assert.equal(misconceived.ok, true);
+  assert.equal(misconceived.record.misconceptions.length, 1);
+  assert.equal(misconceived.record.misconceptions[0].id, "single-caller");
+  // Re-recording the same id updates lastSeenAt/anchors rather than duplicating.
+  const misconceivedAgain = recordMisconception(misconceived.record, "single-caller", anchorA, "2026-11-15T01:40:00.000Z");
+  assert.equal(misconceivedAgain.record.misconceptions.length, 1);
+  assert.equal(misconceivedAgain.record.misconceptions[0].lastSeenAt, "2026-11-15T01:40:00.000Z");
+  assert.equal(misconceivedAgain.record.misconceptions[0].firstSeenAt, "2026-11-15T01:30:00.000Z");
+  assert.equal(misconceivedAgain.record.misconceptions[0].anchors.length, 2);
+
+  // --- Cumulative questions accumulate as a bounded thread ------------------
+  record = misconceivedAgain.record;
+  const turned = appendThreadTurn(record, { question: "Where is normalize defined?", answerSummary: "app/tokens.py:1", anchors: [anchorA] }, "2026-11-15T02:00:00.000Z");
+  assert.equal(turned.ok, true);
+  assert.equal(turned.record.thread.length, 1);
+  assert.deepEqual(appendThreadTurn(turned.record, { question: "   " }), { ok: false, reason: "empty-question", record: turned.record });
+
+  // --- Bounding: none of the three bounded lists grow past their maximum ---
+  let bounded = turned.record;
+  for (let index = 0; index < MAX_HYPOTHESES + 20; index += 1) {
+    bounded = recordHypothesis(bounded, { text: `hypothesis number ${index}` }, `2026-11-15T03:00:${String(index % 60).padStart(2, "0")}.000Z`).record;
+  }
+  assert.equal(bounded.hypotheses.length, MAX_HYPOTHESES);
+  for (let index = 0; index < MAX_EVIDENCE + 20; index += 1) {
+    bounded = recordEvidence(bounded, { text: `evidence number ${index}` }, `2026-11-15T04:00:${String(index % 60).padStart(2, "0")}.000Z`).record;
+  }
+  assert.equal(bounded.evidence.length, MAX_EVIDENCE);
+  for (let index = 0; index < MAX_THREAD_QUESTIONS + 20; index += 1) {
+    bounded = appendThreadTurn(bounded, { question: `question number ${index}` }, `2026-11-15T05:00:${String(index % 60).padStart(2, "0")}.000Z`).record;
+  }
+  assert.equal(bounded.thread.length, MAX_THREAD_QUESTIONS);
+
+  // --- continuityAnchors collects every distinct symbol named anywhere -----
+  const anchorKeys = continuityAnchors(turned.record);
+  assert.ok(anchorKeys.includes("app/tokens.py#normalize"));
+  assert.ok(anchorKeys.includes("app/tokens.py#shout"));
+
+  // --- Staleness after a code change reuses `change-impact.mjs`'s own
+  // `changedSymbols`, never a second notion of "changed" -------------------
+  const changedNormalize = [{ path: "app/tokens.py", name: "normalize", changeKind: "modified" }];
+  const stale = detectStaleContinuity(turned.record, changedNormalize);
+  assert.deepEqual(stale.staleEvidence, [evidenced.record.evidence[0].id]);
+  assert.deepEqual(stale.staleThreadTurns, [turned.record.thread[0].id]);
+  // The confirmed hypothesis is not reported as an *open* staleness concern —
+  // it was already resolved, so there is no live claim left to flag.
+  assert.deepEqual(stale.staleHypotheses, []);
+
+  // Re-opening the same hypothesis anchored at the changed symbol and
+  // detecting again must flag it.
+  const reopened = recordHypothesis(turned.record, { text: "a fresh open claim about normalize", anchors: [anchorA] }, "2026-11-15T06:00:00.000Z");
+  const staleAfterReopen = detectStaleContinuity(reopened.record, changedNormalize);
+  assert.deepEqual(staleAfterReopen.staleHypotheses, [reopened.record.hypotheses.at(-1).id]);
+  const marked = markHypothesesStale(reopened.record, staleAfterReopen.staleHypotheses, "2026-11-15T06:05:00.000Z");
+  assert.equal(marked.hypotheses.find((item) => item.id === reopened.record.hypotheses.at(-1).id).status, "stale");
+  // An unrelated symbol change must not flag anything.
+  const unrelatedChange = detectStaleContinuity(turned.record, [{ path: "app/other.py", name: "irrelevant", changeKind: "modified" }]);
+  assert.deepEqual(unrelatedChange.staleEvidence, []);
+  assert.deepEqual(unrelatedChange.staleHypotheses, []);
+
+  // --- Staleness after a curriculum change: anything anchored outside the
+  // current course's own anchor set is orphaned, not silently kept --------
+  const driftedAway = detectCurriculumDrift(reopened.record, ["app/tokens.py#shout"]); // normalize dropped from the curriculum
+  assert.ok(driftedAway.orphanedHypotheses.includes(reopened.record.hypotheses.at(-1).id));
+  const stillCovered = detectCurriculumDrift(reopened.record, ["app/tokens.py#normalize", "app/tokens.py#shout"]);
+  assert.deepEqual(stillCovered.orphanedHypotheses, []);
+
+  // --- The render summary never leaks raw thread text, only counts/state ---
+  const summary = renderContinuitySummary(reopened.record);
+  assert.match(summary, /question\(s\) carried across sessions/);
+  assert.match(summary, /open hypothesis/);
+  assert.equal(summary.includes("normalize strips whitespace"), false, "the summary must not leak raw hypothesis text");
+
+  // --- Persistence: redacted on disk, atomic through `durable-store.mjs`,
+  // and consent withdrawal deletes the file rather than blanking it -------
+  const directory = await mkdtemp(path.join(os.tmpdir(), "trace-continuity-"));
+  context.after(() => rm(directory, { recursive: true, force: true }));
+  await saveContinuity(directory, reopened.record);
+  const reloaded = await loadContinuity(directory, repositoryId);
+  assert.equal(reloaded.hypotheses.length, reopened.record.hypotheses.length);
+  assert.equal(reloaded.goal, "debugging");
+
+  // A secret embedded in a hypothesis/evidence text is redacted at rest, the
+  // same discipline `learning-store.mjs`/`notes-store.mjs` already apply.
+  const withSecret = recordEvidence(reloaded, { text: "found token sk-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb in config" }, "2026-11-15T07:00:00.000Z");
+  await saveContinuity(directory, withSecret.record);
+  const reloadedSecret = await loadContinuity(directory, repositoryId);
+  assert.equal(reloadedSecret.evidence.at(-1).text.includes("sk-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"), false);
+  assert.ok(reloadedSecret.evidence.at(-1).text.includes("REDACTED"));
+
+  const forgotten = await forgetContinuity(directory, repositoryId);
+  assert.ok(forgotten.deletedHypotheses > 0);
+  assert.equal(forgotten.hadConsent, true);
+  const afterForget = await loadContinuity(directory, repositoryId);
+  assert.equal(afterForget.consent.granted, false, "forgetting must leave a fresh, unconsented record behind, not a half-deleted one");
+  assert.equal(afterForget.hypotheses.length, 0);
+
+  // Loading continuity for a repository that was never granted consent (and
+  // never saved) must return an empty, unconsented record rather than throw.
+  const neverSaved = await loadContinuity(directory, "repo-never-opened");
+  assert.equal(neverSaved.consent.granted, false);
+  assert.equal(neverSaved.repositoryId, "repo-never-opened");
 });
 
 test("explanations are graded against what the run actually did", async (context) => {
