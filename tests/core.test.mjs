@@ -88,6 +88,7 @@ import { ACCESSIBILITY_LEARNING_EXPERIMENTS_VERSION, ACCESSIBILITY_PATHS, DEFAUL
 import { CURRICULUM_UPDATE_FORMAT, CURRICULUM_UPDATE_VERSION, assessCurriculumUpdateCompatibility, assessMigrationReadiness, buildCurriculumUpdate, describeCurriculumUpdateDecision, evaluateCurriculumUpdate, installCurriculumUpdate, proveCurriculumUpdateInstallerOffline, rollbackCurriculumUpdate, scanCurriculumUpdateForAnswerLeakage, signCurriculumUpdate, verifyCurriculumUpdateSignature } from "../electron/curriculum-update.mjs";
 import { loadLearnerState, loadLearnerStateReport, saveLearnerState } from "../electron/learning-store.mjs";
 import { COGNITIVE_LOAD_REGULATION_VERSION, HIGH_LOAD_THRESHOLD, LOW_LOAD_THRESHOLD, classifyLoad, estimateExtraneousLoad, estimateGermaneLoad, estimateIntrinsicLoad, recordLoadRegulation, regulateCognitiveLoad, regulateDisclosure, regulateHintAvailability, regulatePacing, regulateTracingState } from "../electron/cognitive-load-regulation.mjs";
+import { COLLABORATIVE_AUTHORIZATION_VERSION, PERMISSIONS, RESOURCE_KINDS, ROLES, authorizeExport, authorizePermission, authorizeRetrieval, authorizeWorkflowChain, reanchorConsent, recordAuthorizationDecision } from "../electron/collaborative-authorization.mjs";
 import { addEvidence, completeDiagnostic, recommend } from "../src/learning.ts";
 import { DURABLE_VERSION, inspectDurable, readDurable, sweepInterruptedWrites, writeDurable } from "../electron/durable-store.mjs";
 import { BUILD_TYPE, DEFAULT_LICENSE_POLICY, IN_TOTO_STATEMENT_TYPE, SBOM_SPEC_VERSION, SLSA_PREDICATE_TYPE, SUPPLY_CHAIN_VERSION, buildProvenance, buildSbom, compareBuilds, describeScan, firstByteDifference, hashesFromIntegrity, importNpmAudit, licenseBreakdown, publicSupplyChainReport, purlFor, runtimeComponents, satisfiesRange, sbomDigest, scanDependencies, scanPasses, signProvenance, verifyProvenance } from "../electron/supply-chain.mjs";
@@ -13192,4 +13193,109 @@ test("adaptive cognitive-load regulation estimates intrinsic/extraneous/germane 
   assert.ok(slower.dailyLimit >= 3);
   const faster = regulatePacing({}, { extraneous: 0.1, germane: 0.9 });
   assert.ok(faster.dailyLimit > DEFAULT_SCHEDULER.dailyLimit);
+});
+
+test("authorization-aware collaborative learning preserves repository/solution/assessment/learner-data permissions across tutor/sub-agent/instructor delegation chains and re-anchors sensitive retrieval/export to original consent", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "collab-authz-"));
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+
+  assert.equal(COLLABORATIVE_AUTHORIZATION_VERSION, 1);
+  assert.deepEqual([...ROLES].sort(), ["instructor", "learner", "sub-agent", "tutor-agent"]);
+  assert.deepEqual([...RESOURCE_KINDS].sort(), ["assessment", "learner-data", "repository", "solution"]);
+
+  // --- The structural invariant: no role, including the learner, ever has
+  // read access to `solution` -- restating answer-guard.mjs's own rule at
+  // the role level, not merely by convention -------------------------------
+  for (const role of ROLES) {
+    assert.equal(PERMISSIONS[role].solution, "none", `${role} must never read solution`);
+    assert.equal(authorizePermission(role, "solution", "read").ok, false);
+  }
+
+  // --- A single role's own permission, checked against the real table ---
+  assert.equal(authorizePermission("learner", "repository", "read").ok, true);
+  assert.equal(authorizePermission("learner", "learner-data", "write").ok, true);
+  assert.equal(authorizePermission("sub-agent", "learner-data", "read").ok, false);
+  assert.equal(authorizePermission("instructor", "assessment", "write").ok, true);
+  assert.equal(authorizePermission("tutor-agent", "assessment", "write").ok, false);
+  assert.equal(authorizePermission("nonexistent-role", "repository", "read").ok, false);
+  assert.equal(authorizePermission("learner", "nonexistent-kind", "read").ok, false);
+
+  // --- Delegation cannot acquire more than its weakest link: tutor-agent
+  // only reads learner-data, so a sub-agent cannot inherit write through it,
+  // and sub-agent's own "none" on learner-data grounds the whole chain ----
+  const tutorOnly = authorizeWorkflowChain(["learner", "tutor-agent"], "learner-data", "read");
+  assert.equal(tutorOnly.ok, true);
+  assert.equal(tutorOnly.effectiveLevel, "read");
+  const throughSubAgent = authorizeWorkflowChain(["learner", "tutor-agent", "sub-agent"], "learner-data", "read");
+  assert.equal(throughSubAgent.ok, false, "sub-agent has none on learner-data, so the whole chain is denied");
+  assert.equal(throughSubAgent.deniedAtIndex, 2);
+  const writeAttempt = authorizeWorkflowChain(["learner"], "learner-data", "write");
+  assert.equal(writeAttempt.ok, true);
+  const instructorWriteViaTutor = authorizeWorkflowChain(["instructor", "tutor-agent"], "assessment", "write");
+  assert.equal(instructorWriteViaTutor.ok, false, "tutor-agent has no assessment access, so delegating through it cannot preserve instructor's write");
+  assert.equal(authorizeWorkflowChain([], "repository", "read").ok, false);
+
+  // --- Re-anchoring: a resource captured under one consent grant is not
+  // carried forward silently once consent has been revoked and re-granted,
+  // even though the current state again reads granted: true --------------
+  let continuity = emptyContinuity("repo-collab-authz");
+  continuity = setContinuityConsent(continuity, true, "2024-01-01T00:00:00.000Z");
+  const capturedUnderFirstGrant = { consentGrantedAt: continuityConsentState(continuity).grantedAt };
+  assert.equal(reanchorConsent(capturedUnderFirstGrant, continuity).ok, true);
+
+  continuity = setContinuityConsent(continuity, false, "2024-02-01T00:00:00.000Z");
+  const revokedCheck = reanchorConsent(capturedUnderFirstGrant, continuity);
+  assert.equal(revokedCheck.ok, false);
+  assert.equal(revokedCheck.reason, "consent-revoked");
+  assert.equal(revokedCheck.requiresReauthorization, true);
+
+  continuity = setContinuityConsent(continuity, true, "2024-03-01T00:00:00.000Z");
+  const regrantedCheck = reanchorConsent(capturedUnderFirstGrant, continuity);
+  assert.equal(regrantedCheck.ok, false, "a new grantedAt means the resource's original anchor no longer matches");
+  assert.equal(regrantedCheck.reason, "consent-regranted-since-capture");
+
+  const capturedUnderCurrentGrant = { consentGrantedAt: continuityConsentState(continuity).grantedAt };
+  assert.equal(reanchorConsent(capturedUnderCurrentGrant, continuity).ok, true);
+
+  // --- authorizeRetrieval: permission first, then consent only for
+  // learner-data or an explicitly sensitive resource -----------------------
+  const repoRetrieval = authorizeRetrieval({ chain: ["learner", "tutor-agent"], resourceKind: "repository", consent: continuity });
+  assert.equal(repoRetrieval.ok, true, "repository retrieval needs no consent re-anchor by default");
+  const learnerDataRetrievalOk = authorizeRetrieval({
+    chain: ["learner"],
+    resourceKind: "learner-data",
+    consent: continuity,
+    resource: capturedUnderCurrentGrant,
+  });
+  assert.equal(learnerDataRetrievalOk.ok, true);
+  const learnerDataRetrievalStale = authorizeRetrieval({
+    chain: ["learner"],
+    resourceKind: "learner-data",
+    consent: continuity,
+    resource: capturedUnderFirstGrant,
+  });
+  assert.equal(learnerDataRetrievalStale.ok, false);
+  assert.equal(learnerDataRetrievalStale.stage, "consent");
+  const deniedPermissionRetrieval = authorizeRetrieval({ chain: ["sub-agent"], resourceKind: "learner-data", consent: continuity });
+  assert.equal(deniedPermissionRetrieval.ok, false);
+  assert.equal(deniedPermissionRetrieval.stage, "permission");
+
+  // --- authorizeExport: consent is always re-anchored, even for a resource
+  // kind that would not otherwise require it ------------------------------
+  const repoExportFresh = authorizeExport({ chain: ["learner"], resourceKind: "repository", consent: continuity, resource: capturedUnderCurrentGrant });
+  assert.equal(repoExportFresh.ok, true);
+  const repoExportStale = authorizeExport({ chain: ["learner"], resourceKind: "repository", consent: continuity, resource: capturedUnderFirstGrant });
+  assert.equal(repoExportStale.ok, false, "export re-anchors consent even for a resource kind that retrieval would not have required it for");
+  assert.equal(repoExportStale.stage, "consent");
+
+  // --- Decisions are preserved through activity-log.mjs's own appendEvent -
+  const logDirectory = path.join(workspace, "activity-log");
+  await recordAuthorizationDecision(logDirectory, "repo-collab-authz", deniedPermissionRetrieval.ok
+    ? { ok: true, chain: ["sub-agent"], resourceKind: "learner-data", action: "read" }
+    : { ok: false, chain: ["sub-agent"], resourceKind: "learner-data", action: "read", reason: deniedPermissionRetrieval.reason, stage: deniedPermissionRetrieval.stage });
+  const logged = await readEvents(logDirectory, "repo-collab-authz");
+  assert.equal(logged.length, 1);
+  assert.equal(logged[0].kind, "collaborative-authorization");
+  assert.equal(logged[0].ok, false);
+  assert.equal(logged[0].stage, "permission");
 });
