@@ -87,6 +87,7 @@ import { DEFAULT_MASTERY_THRESHOLD, MIN_COHORT_SIZE, PRIVATE_COHORT_ANALYTICS_VE
 import { ACCESSIBILITY_LEARNING_EXPERIMENTS_VERSION, ACCESSIBILITY_PATHS, DEFAULT_EQUIVALENCE_MARGIN, PATH_AUDIT_RULES, auditPathCompliance, buildPathComparison, evaluateDifficultyEquivalence, measureContrastCompliance, pathAccommodation, renderAccessibilityLearningExperiments, runAccessibilityLearningExperiment, runAllAccessibilityPaths } from "../electron/accessibility-learning-experiments.mjs";
 import { CURRICULUM_UPDATE_FORMAT, CURRICULUM_UPDATE_VERSION, assessCurriculumUpdateCompatibility, assessMigrationReadiness, buildCurriculumUpdate, describeCurriculumUpdateDecision, evaluateCurriculumUpdate, installCurriculumUpdate, proveCurriculumUpdateInstallerOffline, rollbackCurriculumUpdate, scanCurriculumUpdateForAnswerLeakage, signCurriculumUpdate, verifyCurriculumUpdateSignature } from "../electron/curriculum-update.mjs";
 import { loadLearnerState, loadLearnerStateReport, saveLearnerState } from "../electron/learning-store.mjs";
+import { COGNITIVE_LOAD_REGULATION_VERSION, HIGH_LOAD_THRESHOLD, LOW_LOAD_THRESHOLD, classifyLoad, estimateExtraneousLoad, estimateGermaneLoad, estimateIntrinsicLoad, recordLoadRegulation, regulateCognitiveLoad, regulateDisclosure, regulateHintAvailability, regulatePacing, regulateTracingState } from "../electron/cognitive-load-regulation.mjs";
 import { addEvidence, completeDiagnostic, recommend } from "../src/learning.ts";
 import { DURABLE_VERSION, inspectDurable, readDurable, sweepInterruptedWrites, writeDurable } from "../electron/durable-store.mjs";
 import { BUILD_TYPE, DEFAULT_LICENSE_POLICY, IN_TOTO_STATEMENT_TYPE, SBOM_SPEC_VERSION, SLSA_PREDICATE_TYPE, SUPPLY_CHAIN_VERSION, buildProvenance, buildSbom, compareBuilds, describeScan, firstByteDifference, hashesFromIntegrity, importNpmAudit, licenseBreakdown, publicSupplyChainReport, purlFor, runtimeComponents, satisfiesRange, sbomDigest, scanDependencies, scanPasses, signProvenance, verifyProvenance } from "../electron/supply-chain.mjs";
@@ -13040,4 +13041,155 @@ test("learner-safety and efficacy portfolios combine retention, transfer, calibr
   const rebuilt = buildCurriculumPortfolio({ ...completeInput, events: [...events], keyPair, now: at(9000) });
   assert.equal(portfolio.digest, rebuilt.digest, "two portfolios from equivalent inputs must share a digest even though generatedAt differs");
   assert.notEqual(portfolio.generatedAt, rebuilt.generatedAt);
+});
+
+test("adaptive cognitive-load regulation estimates intrinsic/extraneous/germane load from real task structure and behavior, and adjusts disclosure/hints/tracing state/pacing without ever using intrinsic load as an adjustment input", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "cognitive-load-"));
+  const rootPath = path.join(workspace, "repo");
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(path.join(rootPath, "src"), { recursive: true });
+  await writeFile(path.join(rootPath, "src", "__init__.py"), "");
+  await writeFile(path.join(rootPath, "src", "tokens.py"), "def tokenize(text):\n    return text.split()\n");
+  await writeFile(path.join(rootPath, "src", "reader.py"), "from src.tokens import tokenize\n\n\ndef read(text):\n    return tokenize(text)\n");
+  await writeFile(path.join(rootPath, "src", "writer.py"), "from src.tokens import tokenize\n\n\ndef write(text):\n    return len(tokenize(text))\n");
+  await writeFile(path.join(rootPath, "src", "noise.py"), `def noise():\n    return 1\n${"# filler\n".repeat(400)}`);
+
+  resetAnalysisCache();
+  const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+  assert.equal(COGNITIVE_LOAD_REGULATION_VERSION, 1);
+  assert.equal(HIGH_LOAD_THRESHOLD, 0.6);
+  assert.equal(LOW_LOAD_THRESHOLD, 0.3);
+
+  // --- Intrinsic load reads real task structure, never behavior ----------
+  const exercise = buildLocalizationExercise(repository);
+  const chains = buildCallChains(repository);
+  const intrinsicFromStructure = estimateIntrinsicLoad({ localization: exercise, chain: chains[0] ?? null });
+  assert.equal(intrinsicFromStructure.value !== null, true);
+  assert.equal(intrinsicFromStructure.components.goldFileCount, exercise.goldFiles.length);
+  assert.equal(estimateIntrinsicLoad({}).reason, "no-structural-evidence");
+  assert.equal(estimateIntrinsicLoad({}).value, null);
+
+  // --- Extraneous load reads real behavioral friction: reading a lot of
+  // noise but still selecting correctly produces high extraneous friction -
+  const efficient = scoreLocalization(exercise, { inspected: exercise.goldFiles, selected: exercise.goldFiles }, repository);
+  const wasteful = scoreLocalization(
+    exercise,
+    { inspected: [...repository.files.map((file) => file.path)], selected: exercise.goldFiles },
+    repository,
+  );
+  const extraneousLow = estimateExtraneousLoad({ localizationScore: efficient });
+  const extraneousHigh = estimateExtraneousLoad({ localizationScore: wasteful });
+  assert.ok(extraneousHigh.value > extraneousLow.value, `${extraneousHigh.value} should exceed ${extraneousLow.value}`);
+  assert.equal(estimateExtraneousLoad({}).reason, "no-behavioral-evidence");
+
+  // Hint reliance contributes to extraneous load, read from analytics.mjs's
+  // own hintAnalytics output (unmodified). Three hints per attempt is the
+  // module's own reliance cap, so this reads as maximal hint reliance.
+  const events = [0, 1, 2, 3, 4].map((index) => ({ kind: "localization", correct: true, hints: 5, at: new Date(index * 1000).toISOString() }));
+  const heavyHints = hintAnalytics(events);
+  const extraneousFromHints = estimateExtraneousLoad({ hintAnalytics: heavyHints });
+  assert.ok(extraneousFromHints.value > 0, String(extraneousFromHints.value));
+
+  // --- Germane load reads real productive-engagement behavior: a targeted
+  // revision that fixes exactly what was wrong raises germane load --------
+  const runtimes = await detectRuntimes({ refresh: true });
+  if (runtimes.python?.available) {
+    const traceSnippet = "from src.tokens import tokenize\nfrom src.reader import read\nprint(read('a b c'))";
+    const trace = await runExecutionTrace(repository, { language: "python", snippet: traceSnippet });
+    assert.equal(trace.status, "ok", JSON.stringify({ error: trace.error, stderr: trace.stderr }));
+    const task = buildStateTraceTask(trace);
+    const toAnswer = (checkpoint) => ({ checkpointId: checkpoint.id, controlFlow: checkpoint.kind, function: checkpoint.function, depth: checkpoint.depth, value: checkpoint.value });
+    // Half the checkpoints omitted, so tracing friction alone is substantial.
+    const half = Math.ceil(task.checkpoints.length / 2);
+    const withOmission = task.checkpoints.filter((checkpoint, index) => index >= half).map(toAnswer);
+    const before = gradeStateTrace(task, withOmission);
+    const after = gradeStateTrace(task, task.checkpoints.map(toAnswer));
+    const revision = scoreRevisionStep(before, after);
+
+    const germaneFromRevision = estimateGermaneLoad({ revision });
+    assert.ok(germaneFromRevision.value > 0, String(germaneFromRevision.value));
+
+    const germaneFromTracing = estimateGermaneLoad({ tracingGrade: after });
+    assert.equal(germaneFromTracing.value, 1);
+
+    // --- The combined report: intrinsic is reported but never fed into
+    // classifyLoad or any regulate* adjustment -------------------------------
+    const highExtraneousBehavior = { localizationScore: wasteful, hintAnalytics: heavyHints, tracingGrade: before };
+    const report = regulateCognitiveLoad({
+      structure: { localization: exercise, chain: chains[0] ?? null, trace: task },
+      behavior: highExtraneousBehavior,
+    });
+    assert.equal(report.version, COGNITIVE_LOAD_REGULATION_VERSION);
+    assert.ok(report.intrinsic.value !== null);
+    assert.equal(report.verdict, "extraneous-overload");
+
+    // Two reports that share identical behavior but wildly different
+    // intrinsic load (fabricated: a huge checkpoint count) adjust the same
+    // way -- proving intrinsic load never leaks into any regulate* decision.
+    const hugeIntrinsicTask = { checkpoints: new Array(500).fill(0).map((_, index) => ({ id: `c${index}` })) };
+    const reportTinyIntrinsic = regulateCognitiveLoad({ structure: { trace: task }, behavior: highExtraneousBehavior });
+    const reportHugeIntrinsic = regulateCognitiveLoad({ structure: { trace: hugeIntrinsicTask }, behavior: highExtraneousBehavior });
+    assert.notEqual(reportTinyIntrinsic.intrinsic.value, reportHugeIntrinsic.intrinsic.value);
+    assert.deepEqual(reportTinyIntrinsic.disclosure, reportHugeIntrinsic.disclosure);
+    assert.deepEqual(reportTinyIntrinsic.hints, reportHugeIntrinsic.hints);
+    assert.deepEqual(reportTinyIntrinsic.pacing, reportHugeIntrinsic.pacing);
+
+    // --- Recording preserves the decision through activity-log.mjs's own
+    // appendEvent (unmodified) -------------------------------------------------
+    const directory = path.join(workspace, "activity-log");
+    const recorded = await recordLoadRegulation(directory, "repo-cogload", report);
+    assert.equal(recorded.kind, "cognitive-load-regulation");
+    const stored = await readEvents(directory, "repo-cogload");
+    assert.equal(stored.length, 1);
+    assert.equal(stored[0].verdict, "extraneous-overload");
+  } else {
+    context.skip("No python runtime is installed, so the tracing-derived germane-load fixtures cannot be verified here.");
+  }
+
+  // --- classifyLoad never accepts intrinsic at all (checked by call shape,
+  // not just by effect): calling with an intrinsic field present changes
+  // nothing because the function destructures only extraneous/germane -----
+  assert.equal(classifyLoad({ extraneous: 0.8, germane: 0.1, intrinsic: 0.99 }), "extraneous-overload");
+  assert.equal(classifyLoad({ extraneous: 0.1, germane: 0.1 }), "underengaged");
+  assert.equal(classifyLoad({ extraneous: 0.4, germane: 0.4 }), "balanced");
+  assert.equal(classifyLoad({ extraneous: 0.1, germane: 0.9 }), "productive-engagement");
+  assert.equal(classifyLoad({}), "balanced");
+
+  // --- Disclosure: progressive-discovery.mjs's own budget names, shrunk
+  // under high extraneous load, never made more generous than the default -
+  const shrunk = regulateDisclosure({}, { extraneous: 0.9, germane: 0.1 });
+  assert.ok(shrunk.cognitiveBudget < DEFAULT_COGNITIVE_BUDGET);
+  assert.ok(shrunk.contextTokenBudget <= CONTEXT_PACK_BUDGETS.lean);
+  assert.equal(shrunk.reason, "extraneous-load-high");
+  const relaxed = regulateDisclosure({ cognitiveBudget: 1, contextTokenBudget: 100 }, { extraneous: 0.1, germane: 0.9 });
+  assert.ok(relaxed.cognitiveBudget <= DEFAULT_COGNITIVE_BUDGET);
+  assert.equal(relaxed.reason, "productive-engagement");
+  const steady = regulateDisclosure({}, { extraneous: 0.4, germane: 0.4 });
+  assert.equal(steady.changed, false);
+
+  // --- Hints: only *when* a hint becomes available changes, never cost or
+  // content (answer-guard.mjs's own ladder is not touched by this module) -
+  const earlierHints = regulateHintAvailability({}, { extraneous: 0.9, germane: 0.1 });
+  assert.equal(earlierHints.offerAfterAttempts, 1);
+  const laterHints = regulateHintAvailability({}, { extraneous: 0.1, germane: 0.9 });
+  assert.equal(laterHints.offerAfterAttempts, 3);
+  assert.equal("penalty" in earlierHints, false);
+  assert.equal("text" in earlierHints, false);
+
+  // --- Tracing state: chunk size shrinks, but the real checkpoint total
+  // this function is given is never altered ---------------------------------
+  const chunked = regulateTracingState(10, {}, { extraneous: 0.9, germane: 0.1 });
+  assert.equal(chunked.totalCheckpoints, 10);
+  assert.ok(chunked.chunkLimit < 10);
+  const full = regulateTracingState(10, {}, { extraneous: 0.1, germane: 0.9 });
+  assert.equal(full.chunkLimit, 10);
+  assert.equal(regulateTracingState(0, {}, {}).chunkLimit, 0);
+
+  // --- Pacing: spaced-repetition.mjs's own DEFAULT_SCHEDULER.dailyLimit is
+  // the baseline, floor/ceiling bounded ------------------------------------
+  const slower = regulatePacing({}, { extraneous: 0.9, germane: 0.1 });
+  assert.ok(slower.dailyLimit < DEFAULT_SCHEDULER.dailyLimit);
+  assert.ok(slower.dailyLimit >= 3);
+  const faster = regulatePacing({}, { extraneous: 0.1, germane: 0.9 });
+  assert.ok(faster.dailyLimit > DEFAULT_SCHEDULER.dailyLimit);
 });
