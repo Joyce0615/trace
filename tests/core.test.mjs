@@ -89,6 +89,7 @@ import { CURRICULUM_UPDATE_FORMAT, CURRICULUM_UPDATE_VERSION, assessCurriculumUp
 import { loadLearnerState, loadLearnerStateReport, saveLearnerState } from "../electron/learning-store.mjs";
 import { COGNITIVE_LOAD_REGULATION_VERSION, HIGH_LOAD_THRESHOLD, LOW_LOAD_THRESHOLD, classifyLoad, estimateExtraneousLoad, estimateGermaneLoad, estimateIntrinsicLoad, recordLoadRegulation, regulateCognitiveLoad, regulateDisclosure, regulateHintAvailability, regulatePacing, regulateTracingState } from "../electron/cognitive-load-regulation.mjs";
 import { COLLABORATIVE_AUTHORIZATION_VERSION, PERMISSIONS, RESOURCE_KINDS, ROLES, authorizeExport, authorizePermission, authorizeRetrieval, authorizeWorkflowChain, reanchorConsent, recordAuthorizationDecision } from "../electron/collaborative-authorization.mjs";
+import { DECLARED_ATTRIBUTES, NESTED_TUTORING_TELEMETRY_VERSION, OPERATION_KINDS, attachChild, attributeCostAndLatency, auditSpanForLeakage, auditSpanTreeForLeakage, endSpan, flattenSpanTree, privacySafeAttributes, recordTutoringSpanTree, startSpan } from "../electron/nested-tutoring-telemetry.mjs";
 import { addEvidence, completeDiagnostic, recommend } from "../src/learning.ts";
 import { DURABLE_VERSION, inspectDurable, readDurable, sweepInterruptedWrites, writeDurable } from "../electron/durable-store.mjs";
 import { BUILD_TYPE, DEFAULT_LICENSE_POLICY, IN_TOTO_STATEMENT_TYPE, SBOM_SPEC_VERSION, SLSA_PREDICATE_TYPE, SUPPLY_CHAIN_VERSION, buildProvenance, buildSbom, compareBuilds, describeScan, firstByteDifference, hashesFromIntegrity, importNpmAudit, licenseBreakdown, publicSupplyChainReport, purlFor, runtimeComponents, satisfiesRange, sbomDigest, scanDependencies, scanPasses, signProvenance, verifyProvenance } from "../electron/supply-chain.mjs";
@@ -13298,4 +13299,105 @@ test("authorization-aware collaborative learning preserves repository/solution/a
   assert.equal(logged[0].kind, "collaborative-authorization");
   assert.equal(logged[0].ok, false);
   assert.equal(logged[0].stage, "permission");
+});
+
+test("nested tutoring telemetry traces retrieval/memory/planning/tool/evaluator/model operations with privacy-safe variables, correct cost/latency attribution, and no answer leakage through observability", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "nested-tutoring-telemetry-"));
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+
+  assert.equal(NESTED_TUTORING_TELEMETRY_VERSION, 1);
+  assert.deepEqual([...OPERATION_KINDS].sort(), ["evaluator", "memory", "model", "planning", "retrieval", "tool"]);
+  assert.ok(Object.keys(DECLARED_ATTRIBUTES).includes("modelFamily"));
+
+  // --- Only a declared kind may open a span -------------------------------
+  assert.throws(() => startSpan("nonexistent-kind", "x"));
+
+  // --- privacySafeAttributes: an undeclared key is dropped (not folded),
+  // an unlisted value of a declared key is folded to "other", and a path
+  // that looks like a home directory is redacted even though "toolName" is
+  // declared --------------------------------------------------------------
+  const safe = privacySafeAttributes({
+    toolName: "agent-cli",
+    strategy: "nonexistent-strategy",
+    question: "where is parseConfig defined",
+    secretQuestionText: "this key should be dropped entirely",
+  });
+  assert.equal(safe.toolName, "agent-cli");
+  assert.equal(safe.strategy, "other");
+  assert.equal(safe.question, undefined, "undeclared keys are dropped, not folded");
+  assert.equal(safe.secretQuestionText, undefined);
+
+  // --- Build a nested span tree: one tutoring turn = retrieval -> memory
+  // -> planning -> tool -> evaluator -> model, each a declared kind ------
+  let t = 1_000;
+  const root = endSpan(startSpan("planning", "assemble-context-pack", { at: t }), { planMode: "balanced" }, { at: (t += 5) });
+  const retrieval = endSpan(startSpan("retrieval", "buildContextPack", { parentId: root.id, at: t }), { strategy: "fused" }, { at: (t += 40) });
+  const memory = endSpan(startSpan("memory", "learner-state-lookup", { parentId: root.id, at: t }), { memoryKind: "learner-state" }, { at: (t += 5) });
+  const tool = endSpan(startSpan("tool", "agent-cli-invoke", { parentId: root.id, at: t }), { toolName: "agent-cli" }, { at: (t += 200) });
+  const model = endSpan(startSpan("model", "local-index-answer", { parentId: tool.id, at: t }), { modelFamily: "local-index", contextTokens: 900, completionTokens: 120 }, { at: (t += 50) });
+  const evaluator = endSpan(startSpan("evaluator", "claim-check", { parentId: root.id, at: t }), { evaluatorName: "claim", outcome: "ok" }, { at: (t += 10) });
+
+  let tree = root;
+  for (const child of [retrieval, memory, tool, evaluator]) {
+    const attached = attachChild(tree, root.id, child);
+    assert.equal(attached.ok, true);
+    tree = attached;
+  }
+  const withModel = attachChild(tree, tool.id, model);
+  assert.equal(withModel.ok, true, "model attaches under its own tool parent, not the root");
+  tree = withModel;
+
+  // A parent id that does not exist in the tree is reported, not silently dropped.
+  const misattached = attachChild(tree, "nonexistent-parent-id", evaluator);
+  assert.equal(misattached.ok, false);
+
+  // --- Cost/latency attribution: the model's own cost (local-index is
+  // priced at a true structural zero) rolls up to its tool parent and to
+  // the root exactly once -- never summed twice through two paths --------
+  const attributed = attributeCostAndLatency(tree);
+  assert.equal(attributed.totalMs, 5, "a parent's own totalMs is its own measured duration, not a sum of children");
+  const attributedTool = attributed.children.find((child) => child.kind === "tool");
+  assert.equal(attributedTool.rolledUpCostUsd, 0, "local-index is priced at a true zero, not unknown");
+  assert.equal(attributed.rolledUpCostUsd, 0, "the zero-cost model rolls all the way up to the root");
+
+  // An unpriced model family makes the rolled-up cost null, not a fabricated zero.
+  const unpricedModel = endSpan(startSpan("model", "unpriced-call", { parentId: tool.id, at: t }), { modelFamily: "other", contextTokens: 10, completionTokens: 10 }, { at: (t += 1) });
+  const treeWithUnpriced = attachChild(tree, tool.id, unpricedModel);
+  assert.equal(treeWithUnpriced.ok, true);
+  const attributedUnpriced = attributeCostAndLatency(treeWithUnpriced);
+  assert.equal(attributedUnpriced.rolledUpCostUsd, null, "an unknown child cost makes the whole subtree's rolled-up cost unknown, never a silent zero");
+
+  // --- flattenSpanTree reports every node, parent before children --------
+  const flat = flattenSpanTree(attributed);
+  assert.equal(flat.length, 6);
+  assert.equal(flat[0].kind, "planning");
+  assert.ok(flat.some((span) => span.kind === "model"));
+
+  // --- auditSpanForLeakage reuses answer-guard.mjs's own two checks ------
+  const cleanAudit = auditSpanForLeakage(root);
+  assert.equal(cleanAudit.ok, true);
+  const leakySpan = { ...root, attributes: { ...root.attributes, solution: "the-hidden-answer" } };
+  const leakyAudit = auditSpanForLeakage(leakySpan);
+  assert.equal(leakyAudit.ok, false);
+  assert.ok(leakyAudit.forbiddenKeys.length > 0);
+
+  // auditSpanTreeForLeakage walks the whole tree and throws rather than
+  // recording a redacted-after-the-fact span.
+  assert.doesNotThrow(() => auditSpanTreeForLeakage(attributed));
+  const leakyChild = { ...memory, attributes: { ...memory.attributes, answerKey: "42" } };
+  const leakyTree = attachChild(root, root.id, leakyChild);
+  assert.throws(() => auditSpanTreeForLeakage(leakyTree), /would have leaked an answer/);
+
+  // --- Persisted through activity-log.mjs's own appendEvent --------------
+  const logDirectory = path.join(workspace, "activity-log");
+  const recorded = await recordTutoringSpanTree(logDirectory, "repo-nested-tutoring", attributed);
+  assert.equal(recorded.kind, "nested-tutoring-telemetry");
+  const logged = await readEvents(logDirectory, "repo-nested-tutoring");
+  assert.equal(logged.length, 1);
+  assert.equal(logged[0].spans.length, 6);
+  assert.equal(logged[0].rolledUpCostUsd, 0);
+
+  // A tree that would leak an answer refuses to be recorded at all.
+  await assert.rejects(() => recordTutoringSpanTree(logDirectory, "repo-nested-tutoring", leakyTree), /would have leaked an answer/);
+  assert.equal((await readEvents(logDirectory, "repo-nested-tutoring")).length, 1, "a refused tree leaves the log untouched");
 });
