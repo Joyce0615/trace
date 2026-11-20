@@ -90,6 +90,7 @@ import { loadLearnerState, loadLearnerStateReport, saveLearnerState } from "../e
 import { COGNITIVE_LOAD_REGULATION_VERSION, HIGH_LOAD_THRESHOLD, LOW_LOAD_THRESHOLD, classifyLoad, estimateExtraneousLoad, estimateGermaneLoad, estimateIntrinsicLoad, recordLoadRegulation, regulateCognitiveLoad, regulateDisclosure, regulateHintAvailability, regulatePacing, regulateTracingState } from "../electron/cognitive-load-regulation.mjs";
 import { COLLABORATIVE_AUTHORIZATION_VERSION, PERMISSIONS, RESOURCE_KINDS, ROLES, authorizeExport, authorizePermission, authorizeRetrieval, authorizeWorkflowChain, reanchorConsent, recordAuthorizationDecision } from "../electron/collaborative-authorization.mjs";
 import { DECLARED_ATTRIBUTES, NESTED_TUTORING_TELEMETRY_VERSION, OPERATION_KINDS, attachChild, attributeCostAndLatency, auditSpanForLeakage, auditSpanTreeForLeakage, endSpan, flattenSpanTree, privacySafeAttributes, recordTutoringSpanTree, startSpan } from "../electron/nested-tutoring-telemetry.mjs";
+import { DOMAINS, EVALUATION_SCALE_VERSION, RATING_LEVELS, SCORE_DIRECTIONS, levelForScore, normalizeAccessibilityScale, normalizeExplanationScale, normalizeQuizScale, normalizeRetentionScale, normalizeTracingScale, normalizeTransferScale, renderNormalizedScale } from "../electron/evaluation-scale.mjs";
 import { addEvidence, completeDiagnostic, recommend } from "../src/learning.ts";
 import { DURABLE_VERSION, inspectDurable, readDurable, sweepInterruptedWrites, writeDurable } from "../electron/durable-store.mjs";
 import { BUILD_TYPE, DEFAULT_LICENSE_POLICY, IN_TOTO_STATEMENT_TYPE, SBOM_SPEC_VERSION, SLSA_PREDICATE_TYPE, SUPPLY_CHAIN_VERSION, buildProvenance, buildSbom, compareBuilds, describeScan, firstByteDifference, hashesFromIntegrity, importNpmAudit, licenseBreakdown, publicSupplyChainReport, purlFor, runtimeComponents, satisfiesRange, sbomDigest, scanDependencies, scanPasses, signProvenance, verifyProvenance } from "../electron/supply-chain.mjs";
@@ -13400,4 +13401,183 @@ test("nested tutoring telemetry traces retrieval/memory/planning/tool/evaluator/
   // A tree that would leak an answer refuses to be recorded at all.
   await assert.rejects(() => recordTutoringSpanTree(logDirectory, "repo-nested-tutoring", leakyTree), /would have leaked an answer/);
   assert.equal((await readEvents(logDirectory, "repo-nested-tutoring")).length, 1, "a refused tree leaves the log untouched");
+});
+
+test("normalized learning-evaluation scales version score direction, bounds, rating levels, tags, evidence, uncertainty, and abstention across quizzes, explanations, tracing, transfer, retention, and accessibility studies", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "evaluation-scale-"));
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+
+  assert.equal(EVALUATION_SCALE_VERSION, 1);
+  assert.deepEqual([...DOMAINS].sort(), ["accessibility", "explanation", "quiz", "retention", "tracing", "transfer"]);
+  assert.deepEqual([...RATING_LEVELS], ["advanced", "proficient", "developing", "emerging"]);
+  assert.deepEqual(Object.values(SCORE_DIRECTIONS).sort(), ["closer-to-zero-is-better", "higher-is-better", "lower-is-better"]);
+
+  // --- levelForScore: direction and bounds are both honored, and a missing
+  // or degenerate bound never forces a rung --------------------------------
+  assert.equal(levelForScore(0.9, SCORE_DIRECTIONS.HIGHER_IS_BETTER, [0, 1]), "advanced");
+  assert.equal(levelForScore(0.1, SCORE_DIRECTIONS.LOWER_IS_BETTER, [0, 1]), "advanced", "a low Brier score is as good as it gets, so it lands on the top rung despite the raw number being small");
+  assert.equal(levelForScore(0.02, SCORE_DIRECTIONS.CLOSER_TO_ZERO_IS_BETTER, [-0.1, 0.1]), "proficient");
+  assert.equal(levelForScore(null, SCORE_DIRECTIONS.HIGHER_IS_BETTER, [0, 1]), null);
+  assert.equal(levelForScore(0.5, SCORE_DIRECTIONS.HIGHER_IS_BETTER, null), null, "an unbounded domain never fabricates a rung");
+
+  // --- normalizeQuizScale: reuses executable-quiz.mjs's own real grade ----
+  const runtimes = await detectRuntimes({ refresh: true });
+  if (runtimes.python?.available) {
+    const rootPath = path.join(workspace, "quiz-repo");
+    await mkdir(path.join(rootPath, "app"), { recursive: true });
+    await writeFile(path.join(rootPath, "app", "__init__.py"), "");
+    const source = "def double(n: int = 3):\n    return n * 2\n";
+    await writeFile(path.join(rootPath, "app", "math_ops.py"), source);
+    resetAnalysisCache();
+    const quizRepository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+    const quiz = await buildExecutableQuiz(quizRepository, { sources: { "app/math_ops.py": source } });
+    assert.equal(quiz.available, true, quiz.reason);
+
+    const passing = await gradeSubmission(quiz, source);
+    const passingScale = normalizeQuizScale(passing);
+    assert.equal(passingScale.domain, "quiz");
+    assert.equal(passingScale.scoreDirection, SCORE_DIRECTIONS.HIGHER_IS_BETTER);
+    assert.deepEqual(passingScale.bounds, [0, 1]);
+    assert.equal(passingScale.value, passing.score);
+    assert.equal(passingScale.abstention.abstained, false);
+    assert.ok(passingScale.tags.includes("quiz"));
+    assert.ok(passingScale.tags.includes("ran"));
+
+    const refused = await gradeSubmission(quiz, "x".repeat(20_000));
+    const refusedScale = normalizeQuizScale(refused);
+    assert.equal(refusedScale.value, null, "a refused submission's score is withheld, not reported as zero");
+    assert.equal(refusedScale.ratingLevel, null);
+    assert.equal(refusedScale.abstention.abstained, true);
+    assert.equal(refusedScale.abstention.reason, "refused", "the abstention reason is the grader's own real status, not an invented one");
+  }
+
+  // --- normalizeTracingScale: reuses program-state-tracing.mjs's own real
+  // checkpoint grade and hypothesis grade, including their stated
+  // confidence/Brier uncertainty, carried through unmodified -------------
+  const trace = {
+    supported: true,
+    status: "ok",
+    language: "python",
+    durationMs: 5,
+    events: [
+      { kind: "call", path: "app/core.py", line: 5, function: "outer", depth: 0, callerFunction: null, callerPath: null },
+      { kind: "call", path: "app/core.py", line: 1, function: "inner", depth: 1, callerFunction: "outer", callerPath: "app/core.py" },
+      { kind: "return", path: "app/core.py", line: 2, function: "inner", depth: 1, value: "4" },
+      { kind: "return", path: "app/core.py", line: 6, function: "outer", depth: 0, value: "8" },
+    ],
+  };
+  const tracingTask = buildStateTraceTask(trace);
+  assert.equal(tracingTask.available, true);
+  const perfectAnnotations = tracingTask.checkpoints.map((checkpoint) => ({
+    checkpointId: checkpoint.id,
+    controlFlow: checkpoint.kind,
+    function: checkpoint.function,
+    depth: checkpoint.depth,
+    value: checkpoint.value,
+  }));
+  const checkpointGrade = gradeStateTrace(tracingTask, perfectAnnotations);
+  const confidentRight = gradeHypothesis(tracingTask, { status: "ok", finalValue: "8", confidence: 0.9 });
+  const tracingScale = normalizeTracingScale(checkpointGrade, confidentRight);
+  assert.equal(tracingScale.domain, "tracing");
+  assert.equal(tracingScale.value, checkpointGrade.score);
+  assert.equal(tracingScale.ratingLevel, "advanced");
+  assert.deepEqual(tracingScale.uncertainty, { kind: "stated-confidence", value: confidentRight.confidence, calibration: confidentRight.calibration, brier: confidentRight.brier });
+  assert.ok(tracingScale.tags.includes("confident-and-right"));
+  // Without a hypothesis grade at all, uncertainty is honestly null, not a fabricated one.
+  assert.equal(normalizeTracingScale(checkpointGrade).uncertainty, null);
+
+  // --- normalizeExplanationScale: reuses explanation-grader.mjs's own real
+  // band, with no abstention concept today (reported honestly as such) ----
+  const explanationGrade = {
+    version: 1,
+    taskId: "explain-1",
+    score: 0.92,
+    band: "expert",
+    lengthFactor: 1,
+    words: 40,
+    criteria: [{ id: "names-entry", title: "Names the function that ran", weight: 0.1, credit: 1, passed: true, evidence: "x", detail: "y" }],
+    coverage: 1,
+    orderAccuracy: 1,
+    named: ["outer"],
+    missed: [],
+    unsupported: [],
+    contradictions: [],
+    citations: [],
+    weakest: null,
+    next: "This explanation matches the recorded run.",
+  };
+  const explanationScale = normalizeExplanationScale(explanationGrade);
+  assert.equal(explanationScale.domain, "explanation");
+  assert.equal(explanationScale.value, 0.92);
+  assert.equal(explanationScale.ratingLevel, "advanced");
+  assert.equal(explanationScale.abstention.abstained, false);
+  assert.ok(explanationScale.tags.includes("expert"));
+
+  // --- normalizeTransferScale: reuses transfer-curriculum.mjs's own real
+  // evaluateTransferGain output; bounds are honestly null (unbounded gain),
+  // so ratingLevel is honestly null too, never a fabricated rung ----------
+  async function buildRepo(id, files) {
+    const rootPath = path.join(workspace, id);
+    for (const [relativePath, contents] of Object.entries(files)) {
+      await mkdir(path.dirname(path.join(rootPath, relativePath)), { recursive: true });
+      await writeFile(path.join(rootPath, relativePath), contents);
+    }
+    resetAnalysisCache();
+    const repository = await inspectRepository(rootPath, path.join(workspace, "clones"));
+    return repository;
+  }
+  const homeRepository = await buildRepo("transfer-home", { "app/__init__.py": "", "app/users.py": "def validate_user(data):\n    return bool(data)\n" });
+  const targetRepository = await buildRepo("transfer-target", { "app/__init__.py": "", "app/payload.py": "def validate_payload(data):\n    return bool(data)\n" });
+  const preAnswer = { text: "I am not sure what validate_payload does." };
+  const postAnswer = { text: "validate_payload returns whether data is truthy." };
+  const transferGain = evaluateTransferGain(preAnswer, postAnswer, homeRepository, targetRepository);
+  const transferScale = normalizeTransferScale(transferGain);
+  assert.equal(transferScale.domain, "transfer");
+  assert.equal(transferScale.bounds, null, "gain is genuinely unbounded, never a fabricated range");
+  assert.equal(transferScale.ratingLevel, null, "a four-rung taxonomy cannot be thresholded onto an unbounded value");
+  assert.equal(transferScale.value, transferGain.gain);
+  assert.ok(transferScale.tags.includes(transferGain.verdict));
+
+  // --- normalizeRetentionScale: reuses analytics.mjs's own real rate() ----
+  const retentionOk = normalizeRetentionScale(rate(7, 10));
+  assert.equal(retentionOk.domain, "retention");
+  assert.equal(retentionOk.value, 0.7);
+  assert.equal(retentionOk.abstention.abstained, false);
+  const retentionAbstained = normalizeRetentionScale(rate(1, 2));
+  assert.equal(retentionAbstained.value, null);
+  assert.equal(retentionAbstained.ratingLevel, null);
+  assert.equal(retentionAbstained.abstention.abstained, true);
+  assert.equal(retentionAbstained.abstention.reason, "insufficient-evidence", "the same real reason rate() already names, not an invented one");
+
+  // --- normalizeAccessibilityScale: reuses accessibility-learning-
+  // experiments.mjs's own real equivalence verdict and its own already-
+  // computed confidence interval as uncertainty; closer-to-zero direction,
+  // bounds reused from the real margin, underpowered is a real abstention -
+  const equivalentComparison = buildPathComparison("keyboard-only", [0.8, 0.82, 0.79, 0.81, 0.8], [0.79, 0.81, 0.8, 0.82, 0.78]);
+  const equivalentVerdict = evaluateDifficultyEquivalence(equivalentComparison);
+  const equivalentScale = normalizeAccessibilityScale(equivalentVerdict);
+  assert.equal(equivalentScale.domain, "accessibility");
+  assert.equal(equivalentScale.scoreDirection, SCORE_DIRECTIONS.CLOSER_TO_ZERO_IS_BETTER);
+  assert.deepEqual(equivalentScale.bounds, [-equivalentVerdict.margin, equivalentVerdict.margin]);
+  assert.equal(equivalentScale.value, equivalentVerdict.difference);
+  assert.deepEqual(equivalentScale.uncertainty, { kind: "confidence-interval", interval: equivalentVerdict.interval });
+  assert.equal(equivalentScale.abstention.abstained, false);
+  assert.ok(equivalentScale.ratingLevel === "advanced" || equivalentScale.ratingLevel === "proficient", equivalentScale.ratingLevel);
+
+  const thinComparison = buildPathComparison("screen-reader", [0.8], [0.8]);
+  const thinVerdict = evaluateDifficultyEquivalence(thinComparison);
+  assert.equal(thinVerdict.verdict, "underpowered");
+  const thinScale = normalizeAccessibilityScale(thinVerdict);
+  assert.equal(thinScale.bounds, null, "an underpowered comparison has no real margin-anchored bound to report");
+  assert.equal(thinScale.value, null);
+  assert.equal(thinScale.ratingLevel, null);
+  assert.equal(thinScale.abstention.abstained, true);
+  assert.equal(thinScale.abstention.reason, "underpowered", "the same real reason evaluateDifficultyEquivalence already names");
+
+  // --- renderNormalizedScale rounds numeric fields for stable display -----
+  const rendered = renderNormalizedScale(equivalentScale);
+  assert.equal(rendered.value, Number(equivalentVerdict.difference.toFixed(4)));
+  assert.deepEqual(rendered.bounds, equivalentScale.bounds.map((bound) => Number(bound.toFixed(4))));
+  const renderedNullBounds = renderNormalizedScale(transferScale);
+  assert.equal(renderedNullBounds.bounds, null);
 });
