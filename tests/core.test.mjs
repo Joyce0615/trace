@@ -91,6 +91,7 @@ import { COGNITIVE_LOAD_REGULATION_VERSION, HIGH_LOAD_THRESHOLD, LOW_LOAD_THRESH
 import { COLLABORATIVE_AUTHORIZATION_VERSION, PERMISSIONS, RESOURCE_KINDS, ROLES, authorizeExport, authorizePermission, authorizeRetrieval, authorizeWorkflowChain, reanchorConsent, recordAuthorizationDecision } from "../electron/collaborative-authorization.mjs";
 import { DECLARED_ATTRIBUTES, NESTED_TUTORING_TELEMETRY_VERSION, OPERATION_KINDS, attachChild, attributeCostAndLatency, auditSpanForLeakage, auditSpanTreeForLeakage, endSpan, flattenSpanTree, privacySafeAttributes, recordTutoringSpanTree, startSpan } from "../electron/nested-tutoring-telemetry.mjs";
 import { DOMAINS, EVALUATION_SCALE_VERSION, RATING_LEVELS, SCORE_DIRECTIONS, levelForScore, normalizeAccessibilityScale, normalizeExplanationScale, normalizeQuizScale, normalizeRetentionScale, normalizeTracingScale, normalizeTransferScale, renderNormalizedScale } from "../electron/evaluation-scale.mjs";
+import { ASSISTANCE_OBSERVATION_FIELDS, ASSISTANCE_TYPES, CONTROL_ASSISTANCE_TYPE, COUNTERBALANCED_ASSISTANCE_VERSION, METRIC_HIGHER_IS_BETTER, OUTCOME_METRICS, buildAssistanceComparison, buildCounterbalancedSchedule, compareAllOutcomes, compareAssistanceTypes, recordAssistanceOutcome, sanitizeAssistanceObservation } from "../electron/counterbalanced-assistance-experiments.mjs";
 import { addEvidence, completeDiagnostic, recommend } from "../src/learning.ts";
 import { DURABLE_VERSION, inspectDurable, readDurable, sweepInterruptedWrites, writeDurable } from "../electron/durable-store.mjs";
 import { BUILD_TYPE, DEFAULT_LICENSE_POLICY, IN_TOTO_STATEMENT_TYPE, SBOM_SPEC_VERSION, SLSA_PREDICATE_TYPE, SUPPLY_CHAIN_VERSION, buildProvenance, buildSbom, compareBuilds, describeScan, firstByteDifference, hashesFromIntegrity, importNpmAudit, licenseBreakdown, publicSupplyChainReport, purlFor, runtimeComponents, satisfiesRange, sbomDigest, scanDependencies, scanPasses, signProvenance, verifyProvenance } from "../electron/supply-chain.mjs";
@@ -13580,4 +13581,119 @@ test("normalized learning-evaluation scales version score direction, bounds, rat
   assert.deepEqual(rendered.bounds, equivalentScale.bounds.map((bound) => Number(bound.toFixed(4))));
   const renderedNullBounds = renderNormalizedScale(transferScale);
   assert.equal(renderedNullBounds.bounds, null);
+});
+
+test("counterbalanced assistance experiments compare direct answers, Socratic prompts, prediction-first, tracing, worked examples, and tool-building under matched tasks with delayed retention, transfer, cognitive load, and overreliance outcomes reported separately", async (context) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "counterbalanced-assistance-"));
+  context.after(() => rm(workspace, { recursive: true, force: true }));
+
+  assert.equal(COUNTERBALANCED_ASSISTANCE_VERSION, 1);
+  assert.deepEqual([...ASSISTANCE_TYPES], ["direct-answer", "socratic-prompt", "prediction-first", "tracing", "worked-example", "tool-building"]);
+  assert.equal(CONTROL_ASSISTANCE_TYPE, "direct-answer");
+  assert.deepEqual([...OUTCOME_METRICS], ["delayed-retention", "transfer", "cognitive-load", "overreliance"]);
+  assert.deepEqual(ASSISTANCE_OBSERVATION_FIELDS, ["assistanceType", "taskId", "metric", "value", "at"]);
+  assert.deepEqual(METRIC_HIGHER_IS_BETTER, { "delayed-retention": true, transfer: true, "cognitive-load": false, overreliance: false });
+
+  const matchedTasks = ["task-a", "task-b", "task-c", "task-d", "task-e", "task-f"];
+
+  // --- buildCounterbalancedSchedule: a wrong task count is refused outright ---
+  const refusedCount = buildCounterbalancedSchedule(["only-one"], {});
+  assert.equal(refusedCount.available, false);
+  assert.match(refusedCount.reason, /Exactly 6 matched tasks/);
+
+  // --- No consent, no experiment: every position gets the control type, same
+  // rule experiments.mjs's own activeAssignments already enforces -----------
+  const unconsented = buildCounterbalancedSchedule(matchedTasks, {});
+  assert.equal(unconsented.enrolled, false);
+  assert.ok(unconsented.positions.every((position) => position.assistanceType === CONTROL_ASSISTANCE_TYPE));
+
+  // --- Consented: a deterministic cyclic Latin square rotation, independent
+  // per participant, and every rotation is a genuine permutation of all six
+  // assistance types (never a repeat, never a drop) -------------------------
+  const schedules = ["learner-a", "learner-b", "learner-c", "learner-d"].map((participantId) =>
+    buildCounterbalancedSchedule(matchedTasks, { consent: { granted: true, participantId } }),
+  );
+  for (const schedule of schedules) {
+    assert.equal(schedule.enrolled, true);
+    assert.deepEqual([...schedule.positions.map((position) => position.assistanceType)].sort(), [...ASSISTANCE_TYPES].sort());
+  }
+  // Reproducible: building the same participant's schedule again yields the identical rotation.
+  const rebuilt = buildCounterbalancedSchedule(matchedTasks, { consent: { granted: true, participantId: "learner-a" } });
+  assert.deepEqual(rebuilt.positions, schedules[0].positions);
+  // Across this small cohort, position 0 is not always the same assistance
+  // type — the whole point of counterbalancing order.
+  const firstPositionTypes = new Set(schedules.map((schedule) => schedule.positions[0].assistanceType));
+  assert.ok(firstPositionTypes.size > 1, "a real rotation must vary which assistance type lands first across participants");
+
+  // --- sanitizeAssistanceObservation: the privacy/validity allowlist -------
+  const cleanObservation = sanitizeAssistanceObservation({ assistanceType: "tracing", taskId: "task-d", metric: "cognitive-load", value: "0.3500", at: "2026-01-01T00:00:00.000Z" });
+  assert.equal(cleanObservation.ok, true);
+  assert.deepEqual(cleanObservation.observation, { assistanceType: "tracing", taskId: "task-d", metric: "cognitive-load", value: 0.35, at: "2026-01-01T00:00:00.000Z" });
+  assert.equal(sanitizeAssistanceObservation({ assistanceType: "guessing", taskId: "task-d", metric: "cognitive-load", value: 0.1 }).reason, "unknown-assistance-type");
+  assert.equal(sanitizeAssistanceObservation({ assistanceType: "tracing", taskId: "", metric: "cognitive-load", value: 0.1 }).reason, "missing-task-id");
+  assert.equal(sanitizeAssistanceObservation({ assistanceType: "tracing", taskId: "task-d", metric: "not-a-metric", value: 0.1 }).reason, "unknown-metric");
+  assert.equal(sanitizeAssistanceObservation({ assistanceType: "tracing", taskId: "task-d", metric: "cognitive-load", value: "not-a-number" }).reason, "non-numeric-value");
+  // An extra field is dropped, not carried through, matching experiments.mjs's own rebuild-from-scratch discipline.
+  assert.deepEqual(Object.keys(sanitizeAssistanceObservation({ assistanceType: "tracing", taskId: "task-d", metric: "cognitive-load", value: 0.1, learnerName: "Alex" }).observation).sort(), [...ASSISTANCE_OBSERVATION_FIELDS].sort());
+
+  // --- buildAssistanceComparison: the accessibility-learning-experiments.mjs
+  // buildPathComparison trick, applied to this module's own six arms --------
+  const retentionObservations = [
+    ...Array.from({ length: 6 }, () => ({ assistanceType: CONTROL_ASSISTANCE_TYPE, taskId: "task-a", metric: "delayed-retention", value: 0.5 })),
+    ...Array.from({ length: 6 }, () => ({ assistanceType: "prediction-first", taskId: "task-c", metric: "delayed-retention", value: 0.85 })),
+  ];
+  const retentionComparison = buildAssistanceComparison("delayed-retention", "prediction-first", retentionObservations);
+  assert.equal(retentionComparison.verdict, "variant-better", JSON.stringify(retentionComparison));
+  assert.equal(retentionComparison.control, CONTROL_ASSISTANCE_TYPE);
+  assert.equal(retentionComparison.variant, "prediction-first");
+
+  // Lower is better for cognitive-load; a variant with a *lower* mean must
+  // still read as "variant-better", not "control-better", because
+  // METRIC_HIGHER_IS_BETTER's own declared direction is honored.
+  const loadObservations = [
+    ...Array.from({ length: 6 }, () => ({ assistanceType: CONTROL_ASSISTANCE_TYPE, taskId: "task-a", metric: "cognitive-load", value: 0.7 })),
+    ...Array.from({ length: 6 }, () => ({ assistanceType: "tool-building", taskId: "task-f", metric: "cognitive-load", value: 0.3 })),
+  ];
+  const loadComparison = buildAssistanceComparison("cognitive-load", "tool-building", loadObservations);
+  assert.equal(loadComparison.verdict, "variant-better", JSON.stringify(loadComparison));
+
+  // Below the sample floor: underpowered, never a fabricated winner.
+  const thinObservations = [
+    { assistanceType: CONTROL_ASSISTANCE_TYPE, taskId: "task-a", metric: "overreliance", value: 0.4 },
+    { assistanceType: "socratic-prompt", taskId: "task-b", metric: "overreliance", value: 0.1 },
+  ];
+  assert.equal(buildAssistanceComparison("overreliance", "socratic-prompt", thinObservations).verdict, "underpowered");
+
+  // --- compareAssistanceTypes: only assistance types actually present in
+  // the observations are compared; the control itself is never compared
+  // against itself ----------------------------------------------------------
+  const transferObservations = [
+    ...Array.from({ length: 6 }, () => ({ assistanceType: CONTROL_ASSISTANCE_TYPE, taskId: "task-a", metric: "transfer", value: 0.4 })),
+    ...Array.from({ length: 6 }, () => ({ assistanceType: "tracing", taskId: "task-d", metric: "transfer", value: 0.6 })),
+    ...Array.from({ length: 6 }, () => ({ assistanceType: "worked-example", taskId: "task-e", metric: "transfer", value: 0.42 })),
+  ];
+  const transferComparisons = compareAssistanceTypes("transfer", transferObservations);
+  assert.deepEqual(transferComparisons.map((comparison) => comparison.variant).sort(), ["tracing", "worked-example"]);
+  assert.ok(transferComparisons.every((comparison) => comparison.control === CONTROL_ASSISTANCE_TYPE));
+  // An assistance type with zero observations for this metric is absent, not reported as underpowered.
+  assert.equal(compareAssistanceTypes("transfer", transferObservations).some((comparison) => comparison.variant === "tool-building"), false);
+
+  // --- compareAllOutcomes: four independent reports, never blended --------
+  const allOutcomes = compareAllOutcomes([...retentionObservations, ...loadObservations, ...transferObservations]);
+  assert.deepEqual(allOutcomes.map((entry) => entry.metric), [...OUTCOME_METRICS]);
+  const retentionEntry = allOutcomes.find((entry) => entry.metric === "delayed-retention");
+  assert.equal(retentionEntry.higherIsBetter, true);
+  assert.ok(retentionEntry.comparisons.some((comparison) => comparison.variant === "prediction-first" && comparison.verdict === "variant-better"));
+  const overrelianceEntry = allOutcomes.find((entry) => entry.metric === "overreliance");
+  assert.deepEqual(overrelianceEntry.comparisons, [], "a metric with no observations at all reports zero comparisons, not a fabricated verdict");
+
+  // --- recordAssistanceOutcome: preserved through activity-log.mjs's own
+  // appendEvent, unmodified -------------------------------------------------
+  const logDirectory = path.join(workspace, "activity-log");
+  const recorded = await recordAssistanceOutcome(logDirectory, "repo-counterbalanced-assistance", { assistanceType: "socratic-prompt", taskId: "task-b", metric: "overreliance", value: 0.1, at: "2026-01-01T00:00:00.000Z" });
+  assert.equal(recorded.kind, "counterbalanced-assistance-outcome");
+  assert.equal(recorded.assistanceType, "socratic-prompt");
+  const events = await readEvents(logDirectory, "repo-counterbalanced-assistance");
+  assert.equal(events.length, 1);
+  assert.equal(events[0].metric, "overreliance");
 });
