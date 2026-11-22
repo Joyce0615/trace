@@ -92,6 +92,7 @@ import { COLLABORATIVE_AUTHORIZATION_VERSION, PERMISSIONS, RESOURCE_KINDS, ROLES
 import { DECLARED_ATTRIBUTES, NESTED_TUTORING_TELEMETRY_VERSION, OPERATION_KINDS, attachChild, attributeCostAndLatency, auditSpanForLeakage, auditSpanTreeForLeakage, endSpan, flattenSpanTree, privacySafeAttributes, recordTutoringSpanTree, startSpan } from "../electron/nested-tutoring-telemetry.mjs";
 import { DOMAINS, EVALUATION_SCALE_VERSION, RATING_LEVELS, SCORE_DIRECTIONS, levelForScore, normalizeAccessibilityScale, normalizeExplanationScale, normalizeQuizScale, normalizeRetentionScale, normalizeTracingScale, normalizeTransferScale, renderNormalizedScale } from "../electron/evaluation-scale.mjs";
 import { ASSISTANCE_OBSERVATION_FIELDS, ASSISTANCE_TYPES, CONTROL_ASSISTANCE_TYPE, COUNTERBALANCED_ASSISTANCE_VERSION, METRIC_HIGHER_IS_BETTER, OUTCOME_METRICS, buildAssistanceComparison, buildCounterbalancedSchedule, compareAllOutcomes, compareAssistanceTypes, recordAssistanceOutcome, sanitizeAssistanceObservation } from "../electron/counterbalanced-assistance-experiments.mjs";
+import { ROLLBACK_DRILL_KINDS, ROLLBACK_DRILL_VERSION, drillBadLesson, drillFailedMigration, drillRubricDrift, drillStaleIndex, drillUnsafeLocalModel, renderRollbackDrillSuite, runRollbackDrillSuite } from "../electron/curriculum-rollback-drills.mjs";
 import { addEvidence, completeDiagnostic, recommend } from "../src/learning.ts";
 import { DURABLE_VERSION, inspectDurable, readDurable, sweepInterruptedWrites, writeDurable } from "../electron/durable-store.mjs";
 import { BUILD_TYPE, DEFAULT_LICENSE_POLICY, IN_TOTO_STATEMENT_TYPE, SBOM_SPEC_VERSION, SLSA_PREDICATE_TYPE, SUPPLY_CHAIN_VERSION, buildProvenance, buildSbom, compareBuilds, describeScan, firstByteDifference, hashesFromIntegrity, importNpmAudit, licenseBreakdown, publicSupplyChainReport, purlFor, runtimeComponents, satisfiesRange, sbomDigest, scanDependencies, scanPasses, signProvenance, verifyProvenance } from "../electron/supply-chain.mjs";
@@ -13696,4 +13697,136 @@ test("counterbalanced assistance experiments compare direct answers, Socratic pr
   const events = await readEvents(logDirectory, "repo-counterbalanced-assistance");
   assert.equal(events.length, 1);
   assert.equal(events[0].metric, "overreliance");
+});
+
+test("curriculum and model rollback drills detect an injected bad lesson, unsafe local model, stale index, rubric drift, and failed migration, and prove learner-state preservation and deterministic rollback", () => {
+  assert.equal(ROLLBACK_DRILL_VERSION, 1);
+  assert.deepEqual([...ROLLBACK_DRILL_KINDS], ["bad-lesson", "unsafe-local-model", "stale-index", "rubric-drift", "failed-migration"]);
+
+  // --- Bad lesson: answer-guard.mjs's own ALWAYS_FORBIDDEN, via
+  // curriculum-update.mjs's own scanCurriculumUpdateForAnswerLeakage --------
+  const badUpdate = { content: { course: { modules: [{ lessons: [{ id: "l1", answerKey: "42" }] }] } } };
+  const badLesson = drillBadLesson(badUpdate);
+  assert.equal(badLesson.detected, true);
+  assert.equal(badLesson.decision, "refuse-install");
+  assert.equal(badLesson.learnerStatePreserved, true);
+  const cleanUpdate = { content: { course: { modules: [{ lessons: [{ id: "l1" }] }] } } };
+  assert.equal(drillBadLesson(cleanUpdate).detected, false);
+
+  // --- Unsafe local model: model-advisory.mjs's own evaluateModelForQuarantine ---
+  const goodBytes = Buffer.from("weights-v1");
+  const incompatibleConfig = { provider: "codex", sandbox: "full-access", tools: [], available: true };
+  const unsafeAdvisory = buildModelAdvisory({ artifactBytes: goodBytes, declaredLicense: "GPL-3.0", config: incompatibleConfig });
+  const unsafeModel = drillUnsafeLocalModel(unsafeAdvisory, goodBytes);
+  assert.equal(unsafeModel.detected, true);
+  assert.equal(unsafeModel.decision, "quarantine");
+  assert.ok(unsafeModel.detail.reasons.some((reason) => reason.gate === "license"));
+  assert.ok(unsafeModel.detail.reasons.some((reason) => reason.gate === "compatibility"));
+  const compatibleConfig = { provider: "codex", sandbox: "read-only", tools: ["Read"], available: true };
+  const safeAdvisory = buildModelAdvisory({ artifactBytes: goodBytes, declaredLicense: "MIT", config: compatibleConfig });
+  assert.equal(drillUnsafeLocalModel(safeAdvisory, goodBytes).detected, false);
+  // Swapped artifact bytes: integrity gate fails even though the original configuration was fine.
+  assert.equal(drillUnsafeLocalModel(safeAdvisory, Buffer.from("weights-v1-tampered")).detected, true);
+
+  // --- Stale index: curriculum-update.mjs's own assessCurriculumUpdateCompatibility ---
+  const staleUpdate = { releaseVersion: "1.0.0", minimumFrom: null, requiredModelFingerprint: fingerprintModel({}), requiredIndexSignature: "ts1:cafebabe" };
+  const mismatchedEnvironment = { installedVersion: "0.5.0", modelConfig: {}, indexSignature: "ts1:deadbeef" };
+  const staleIndex = drillStaleIndex(staleUpdate, mismatchedEnvironment);
+  assert.equal(staleIndex.detected, true);
+  assert.equal(staleIndex.decision, "refuse-install");
+  const matchedEnvironment = { installedVersion: "0.5.0", modelConfig: {}, indexSignature: "ts1:cafebabe" };
+  assert.equal(drillStaleIndex(staleUpdate, matchedEnvironment).detected, false);
+
+  // --- Rubric drift: process-trace-assessment.mjs's own validateRubricAgreement ---
+  const driftedPairs = [
+    { id: "case-a", automatedScore: 0.9, automatedPassed: true, instructorScore: 0.9, instructorPassed: true },
+    { id: "case-b", automatedScore: 0.8, automatedPassed: true, instructorScore: 0.3, instructorPassed: false },
+    { id: "case-c", automatedScore: 0.5, automatedPassed: false, instructorScore: 0.5, instructorPassed: false },
+  ];
+  const rubricDrift = drillRubricDrift(driftedPairs);
+  assert.equal(rubricDrift.detected, true);
+  assert.equal(rubricDrift.decision, "queued-for-review");
+  assert.equal(rubricDrift.queued.length, 1);
+  assert.equal(rubricDrift.queued[0].kind, "rubric-disagreement");
+  const agreeingPairs = [
+    { id: "x", automatedScore: 0.9, automatedPassed: true, instructorScore: 0.9, instructorPassed: true },
+    { id: "y", automatedScore: 0.8, automatedPassed: true, instructorScore: 0.8, instructorPassed: true },
+    { id: "z", automatedScore: 0.5, automatedPassed: false, instructorScore: 0.5, instructorPassed: false },
+  ];
+  assert.equal(drillRubricDrift(agreeingPairs).detected, false);
+
+  // --- Failed migration: course-migration.mjs's own planMigration/
+  // applyMigration/revertMigration, plus this module's own rollbackExact ---
+  const orphanBefore = buildSymbolSnapshot(
+    [{ name: "foo", path: "a.py", line: 1, kind: "function" }],
+    { "a.py": "def foo():\n    return 1\n" },
+    { label: "v1", files: ["a.py"] },
+  );
+  const orphanAfter = buildSymbolSnapshot([], {}, { label: "v2", files: [] });
+  const migrationCourse = {
+    id: "course-1",
+    modules: [{ id: "m1", lessons: [{ id: "lost", title: "Lost lesson", anchors: [{ path: "a.py", line: 1, symbol: "foo" }] }] }],
+  };
+  const failedMigration = drillFailedMigration(migrationCourse, orphanBefore, orphanAfter);
+  assert.equal(failedMigration.detected, true);
+  assert.equal(failedMigration.rollbackExact, true);
+  assert.equal(failedMigration.detail.applied.retired, 1);
+  assert.equal(failedMigration.detail.reverted.reverted, true);
+  // A migration with nothing needing review or retiring is reported as not detected.
+  const noOpAfter = buildSymbolSnapshot(
+    [{ name: "foo", path: "a.py", line: 1, kind: "function" }],
+    { "a.py": "def foo():\n    return 1\n" },
+    { label: "v2", files: ["a.py"] },
+  );
+  assert.equal(drillFailedMigration(migrationCourse, orphanBefore, noOpAfter).detected, false);
+
+  // --- Full suite: all five drills together, plus learner-state preservation
+  // and deterministic rollback, each reported independently -----------------
+  const learnerState = { repositoryId: "repo-1", mastery: { "skill-1": { mastery: 0.8, confidence: 0.6 } } };
+  const suite = runRollbackDrillSuite({
+    badLessonUpdate: badUpdate,
+    unsafeModelAdvisory: unsafeAdvisory,
+    currentModelArtifactBytes: goodBytes,
+    staleIndexUpdate: staleUpdate,
+    staleIndexEnvironment: mismatchedEnvironment,
+    rubricPairs: driftedPairs,
+    migrationCourse,
+    migrationBeforeSnapshot: orphanBefore,
+    migrationAfterSnapshot: orphanAfter,
+    learnerState,
+  });
+  assert.equal(suite.version, ROLLBACK_DRILL_VERSION);
+  assert.equal(suite.allDetected, true);
+  assert.deepEqual(suite.missed, []);
+  assert.equal(suite.learnerStatePreserved, true);
+  assert.equal(suite.rollbackVerified, true);
+  assert.equal(suite.ok, true);
+  assert.equal(suite.results.length, 5);
+  assert.deepEqual(suite.results.map((result) => result.drill), [...ROLLBACK_DRILL_KINDS]);
+  // The learner-state object itself is never mutated by any drill in the suite.
+  assert.deepEqual(learnerState, { repositoryId: "repo-1", mastery: { "skill-1": { mastery: 0.8, confidence: 0.6 } } });
+
+  // A suite missing one fault is reported as a specific, named miss, not a blended score.
+  const partialSuite = runRollbackDrillSuite({
+    badLessonUpdate: cleanUpdate,
+    unsafeModelAdvisory: unsafeAdvisory,
+    currentModelArtifactBytes: goodBytes,
+    staleIndexUpdate: staleUpdate,
+    staleIndexEnvironment: mismatchedEnvironment,
+    rubricPairs: driftedPairs,
+    migrationCourse,
+    migrationBeforeSnapshot: orphanBefore,
+    migrationAfterSnapshot: orphanAfter,
+  });
+  assert.equal(partialSuite.allDetected, false);
+  assert.deepEqual(partialSuite.missed, ["bad-lesson"]);
+  assert.equal(partialSuite.learnerStatePreserved, null, "no learnerState supplied means the preservation check is not claimed either way");
+  assert.equal(partialSuite.ok, false);
+
+  const rendered = renderRollbackDrillSuite(suite);
+  assert.match(rendered, /every drill caught and rolled back cleanly/);
+  assert.match(rendered, /Learner state preserved: yes/);
+  assert.match(rendered, /Migration rollback exact: yes/);
+  const renderedPartial = renderRollbackDrillSuite(partialSuite);
+  assert.match(renderedPartial, /Missed: bad-lesson/);
 });
