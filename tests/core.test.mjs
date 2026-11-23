@@ -94,6 +94,7 @@ import { DOMAINS, EVALUATION_SCALE_VERSION, RATING_LEVELS, SCORE_DIRECTIONS, lev
 import { ASSISTANCE_OBSERVATION_FIELDS, ASSISTANCE_TYPES, CONTROL_ASSISTANCE_TYPE, COUNTERBALANCED_ASSISTANCE_VERSION, METRIC_HIGHER_IS_BETTER, OUTCOME_METRICS, buildAssistanceComparison, buildCounterbalancedSchedule, compareAllOutcomes, compareAssistanceTypes, recordAssistanceOutcome, sanitizeAssistanceObservation } from "../electron/counterbalanced-assistance-experiments.mjs";
 import { ROLLBACK_DRILL_KINDS, ROLLBACK_DRILL_VERSION, drillBadLesson, drillFailedMigration, drillRubricDrift, drillStaleIndex, drillUnsafeLocalModel, renderRollbackDrillSuite, runRollbackDrillSuite } from "../electron/curriculum-rollback-drills.mjs";
 import { ESCALATION_THRESHOLD, MAX_TRAJECTORY_TURNS, MIN_TRAJECTORY_TURNS, MULTI_TURN_SAFETY_VERSION, TRAJECTORY_FAILURE_MODES, detectDependencyEscalation, detectGoalDrift, detectMisconceptionReinforcement, detectProgressiveLeakage, detectScaffoldAbandonment, renderTrajectorySafety, scoreTrajectorySafety, validateTrajectoryLength } from "../electron/multi-turn-safety.mjs";
+import { ENGAGEMENT_PROXIES, PROXY_RISE_THRESHOLD, REWARD_HACKING_GUARD_VERSION, SATISFACTION_STRENGTH_FLOOR, detectRewardHacking, guardPromotionAgainstRewardHacking, measureDialogueLengthProxy, measureEngagementProxies, measureGenuineLearningSignals, measureImmediatePassRateProxy, measureRequestVolumeProxy, measureSatisfactionProxy, renderRewardHackingReport } from "../electron/reward-hacking-guard.mjs";
 import { addEvidence, completeDiagnostic, recommend } from "../src/learning.ts";
 import { DURABLE_VERSION, inspectDurable, readDurable, sweepInterruptedWrites, writeDurable } from "../electron/durable-store.mjs";
 import { BUILD_TYPE, DEFAULT_LICENSE_POLICY, IN_TOTO_STATEMENT_TYPE, SBOM_SPEC_VERSION, SLSA_PREDICATE_TYPE, SUPPLY_CHAIN_VERSION, buildProvenance, buildSbom, compareBuilds, describeScan, firstByteDifference, hashesFromIntegrity, importNpmAudit, licenseBreakdown, publicSupplyChainReport, purlFor, runtimeComponents, satisfiesRange, sbomDigest, scanDependencies, scanPasses, signProvenance, verifyProvenance } from "../electron/supply-chain.mjs";
@@ -13983,4 +13984,171 @@ test("cumulative pedagogical safety scores 8-12-turn trajectories for progressiv
   assert.match(rendered, /scaffold-abandonment: clear/);
   const renderedAbstained = renderTrajectorySafety(tooShort);
   assert.match(renderedAbstained, /abstained — too-few-turns/);
+});
+
+test("reward-hacking guard flags engagement proxies that rise without corroborating retention/transfer gains, and forbids promotion when any proxy is hacked", () => {
+  const base = Date.parse("2026-08-01T09:00:00.000Z");
+  const at = (minutes) => new Date(base + minutes * 60_000).toISOString();
+
+  assert.equal(REWARD_HACKING_GUARD_VERSION, 1);
+  assert.deepEqual(ENGAGEMENT_PROXIES, ["dialogue-length", "request-volume", "satisfaction", "immediate-pass-rate"]);
+  assert.equal(PROXY_RISE_THRESHOLD, 0.2);
+  assert.equal(SATISFACTION_STRENGTH_FLOOR, 0.7);
+
+  // --- Below the sample floor: a proxy honestly abstains, never guesses --
+  const tooFew = measureDialogueLengthProxy([{ at: at(0), kind: "explanation", correct: true }]);
+  assert.equal(tooFew.reason, "insufficient-evidence");
+  assert.equal(tooFew.rise, null);
+
+  // --- dialogue-length proxy: turns per task rises from early to late ----
+  const dialogueEvents = [
+    { at: at(0), kind: "explanation", correct: true, turns: 2 },
+    { at: at(1), kind: "explanation", correct: true, turns: 2 },
+    { at: at(2), kind: "explanation", correct: true, turns: 2 },
+    { at: at(3), kind: "explanation", correct: true, turns: 2 },
+    { at: at(4), kind: "explanation", correct: true, turns: 6 },
+    { at: at(5), kind: "explanation", correct: true, turns: 6 },
+    { at: at(6), kind: "explanation", correct: true, turns: 6 },
+    { at: at(7), kind: "explanation", correct: true, turns: 6 },
+  ];
+  const dialogueProxy = measureDialogueLengthProxy(dialogueEvents);
+  assert.equal(dialogueProxy.early, 2);
+  assert.equal(dialogueProxy.late, 6);
+  assert.equal(dialogueProxy.rise, 2);
+  assert.equal(dialogueProxy.reason, null);
+
+  // --- request-volume proxy: requestCount rises; an event that never
+  // declared one is excluded entirely, not treated as zero requests ------
+  const requestEvents = [
+    { at: at(0), kind: "explanation", correct: true, requestCount: 1 },
+    { at: at(1), kind: "explanation", correct: true, requestCount: 1 },
+    { at: at(2), kind: "explanation", correct: true, requestCount: 1 },
+    { at: at(3), kind: "explanation", correct: true },
+    { at: at(4), kind: "explanation", correct: true, requestCount: 5 },
+    { at: at(5), kind: "explanation", correct: true, requestCount: 5 },
+    { at: at(6), kind: "explanation", correct: true, requestCount: 5 },
+  ];
+  const requestProxy = measureRequestVolumeProxy(requestEvents);
+  assert.equal(requestProxy.samples, 6, "the event with no declared requestCount must not be counted");
+  assert.equal(requestProxy.early, 1);
+  assert.equal(requestProxy.late, 5);
+  assert.equal(requestProxy.rise, 4);
+
+  // --- satisfaction proxy: self-report strength rises from early to late,
+  // read from the exact evidence shape misconception.mjs already reads ---
+  const learnerState = {
+    mastery: {
+      "skill-a": {
+        evidence: [
+          { kind: "self-report", strength: 0.4, createdAt: at(0) },
+          { kind: "self-report", strength: 0.4, createdAt: at(1) },
+          { kind: "self-report", strength: 0.4, createdAt: at(2) },
+          { kind: "self-report", strength: 0.9, createdAt: at(3) },
+          { kind: "self-report", strength: 0.9, createdAt: at(4) },
+          { kind: "self-report", strength: 0.9, createdAt: at(5) },
+        ],
+      },
+    },
+  };
+  const satisfactionProxy = measureSatisfactionProxy(learnerState);
+  assert.equal(satisfactionProxy.early, 0);
+  assert.equal(satisfactionProxy.late, 1);
+  assert.equal(satisfactionProxy.rise, 1);
+
+  // --- immediate-pass-rate proxy: correctness rises from early to late ---
+  const passRateEvents = [
+    { at: at(0), kind: "explanation", correct: false },
+    { at: at(1), kind: "explanation", correct: false },
+    { at: at(2), kind: "explanation", correct: false },
+    { at: at(3), kind: "explanation", correct: false },
+    { at: at(4), kind: "explanation", correct: true },
+    { at: at(5), kind: "explanation", correct: true },
+    { at: at(6), kind: "explanation", correct: true },
+    { at: at(7), kind: "explanation", correct: true },
+  ];
+  const passRateProxy = measureImmediatePassRateProxy(passRateEvents);
+  assert.equal(passRateProxy.early, 0);
+  assert.equal(passRateProxy.late, 1);
+  assert.equal(passRateProxy.rise, 1);
+
+  // --- measureEngagementProxies: all four, reported independently --------
+  const allProxies = measureEngagementProxies({ events: passRateEvents, learnerState });
+  assert.deepEqual(Object.keys(allProxies).sort(), ["dialogue-length", "immediate-pass-rate", "request-volume", "satisfaction"]);
+
+  // --- Uncorroborated: every rising proxy is flagged hacked --------------
+  const noLearningGain = measureGenuineLearningSignals({ events: [], learnerState: null, skillGraph: null });
+  assert.equal(noLearningGain.retention.available, false);
+  assert.equal(noLearningGain.transfer.available, false);
+  const risingProxies = {
+    "dialogue-length": dialogueProxy,
+    "request-volume": requestProxy,
+    satisfaction: satisfactionProxy,
+    "immediate-pass-rate": passRateProxy,
+  };
+  const hackedResult = detectRewardHacking(risingProxies, noLearningGain);
+  assert.equal(hackedResult.anyHacked, true);
+  assert.deepEqual(hackedResult.hackedProxies.slice().sort(), ENGAGEMENT_PROXIES.slice().sort());
+  assert.equal(hackedResult.corroborated, false);
+  for (const finding of hackedResult.findings) {
+    assert.match(finding.reason, /without a corroborating rise in retention or transfer/);
+  }
+
+  // --- Corroborated: the same rising proxies are not reward hacking when
+  // a real transfer gain backs them up -------------------------------------
+  const transferEvents = [
+    { at: at(0), kind: "prediction", path: "src/a.py", correct: true },
+    { at: at(1), kind: "prediction", path: "src/a.py", correct: true },
+    { at: at(2), kind: "prediction", path: "src/a.py", correct: true },
+    { at: at(3), kind: "prediction", path: "src/b.py", correct: true },
+    { at: at(4), kind: "prediction", path: "src/c.py", correct: false },
+    { at: at(5), kind: "prediction", path: "src/d.py", correct: false },
+  ];
+  const corroboratingSignals = measureGenuineLearningSignals({ events: transferEvents, learnerState: null, skillGraph: null, studiedPaths: ["src/a.py"] });
+  assert.equal(corroboratingSignals.transfer.available, true);
+  assert.ok(corroboratingSignals.transfer.gap > 0, JSON.stringify(corroboratingSignals.transfer));
+  const notHackedResult = detectRewardHacking(risingProxies, corroboratingSignals);
+  assert.equal(notHackedResult.anyHacked, false);
+  assert.equal(notHackedResult.corroborated, true);
+  assert.deepEqual(notHackedResult.hackedProxies, []);
+
+  // --- A proxy that does not rise is never flagged, corroborated or not --
+  const steadyProxy = measureImmediatePassRateProxy([
+    { at: at(0), kind: "explanation", correct: true },
+    { at: at(1), kind: "explanation", correct: true },
+    { at: at(2), kind: "explanation", correct: true },
+    { at: at(3), kind: "explanation", correct: true },
+    { at: at(4), kind: "explanation", correct: true },
+    { at: at(5), kind: "explanation", correct: true },
+  ]);
+  assert.equal(steadyProxy.rise, 0);
+  const steadyResult = detectRewardHacking({ ...risingProxies, "immediate-pass-rate": steadyProxy }, noLearningGain);
+  assert.equal(steadyResult.findings.find((finding) => finding.proxy === "immediate-pass-rate").hacked, false);
+
+  // --- guardPromotionAgainstRewardHacking: adds exactly one more named
+  // gate to curriculum-portfolio.mjs's own evaluatePromotionGates, and
+  // forbids promotion when a proxy is hacked -------------------------------
+  const baseContent = {
+    effectiveness: { retention: { modelVerdict: "not-enough-reviews" }, transfer: { verdict: "insufficient-evidence" } },
+    calibration: { assessed: 0 },
+    accessibility: [],
+    privacy: null,
+    provenance: null,
+    leakage: { clean: true, found: [] },
+  };
+  const hackedGuard = guardPromotionAgainstRewardHacking(baseContent, { events: passRateEvents, learnerState });
+  assert.equal(hackedGuard.gates.length, 7, "six portfolio gates plus exactly one new reward-hacking gate");
+  assert.deepEqual(hackedGuard.gates.map((gate) => gate.gate).sort(), ["accessibility", "answer-leakage", "calibration", "effectiveness", "privacy", "provenance", "reward-hacking"]);
+  const rewardGate = hackedGuard.gates.find((gate) => gate.gate === "reward-hacking");
+  assert.equal(rewardGate.verdict, "fail");
+  assert.ok(rewardGate.detail.hackedProxies.length > 0);
+
+  // A clean, non-rising proxy set passes the new gate.
+  const cleanGuard = guardPromotionAgainstRewardHacking(baseContent, { events: [], learnerState: null });
+  const cleanGate = cleanGuard.gates.find((gate) => gate.gate === "reward-hacking");
+  assert.equal(cleanGate.verdict, "pass");
+
+  // --- Rendering -----------------------------------------------------------
+  const rendered = renderRewardHackingReport(allProxies, noLearningGain, hackedResult);
+  assert.match(rendered, /REWARD HACKING DETECTED/);
+  assert.match(rendered, /dialogue-length/);
 });
