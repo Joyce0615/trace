@@ -65,6 +65,7 @@ import { COUNTEREXAMPLE_LAB_VERSION, applyCounterexampleResolution, buildCounter
 import { MISCONCEPTION_REPAIR_GATE_VERSION, buildGatedMasteryEvidence, diagnoseClaimBeforePersistence, evaluateRepairCycle, gateClaimForPersistence, renderRepairGateDecision } from "../electron/misconception-repair-gate.mjs";
 import { HELP_POLICY_EVALUATION_VERSION, LOAD_STATES, REQUEST_CATEGORIES, RESPONSE_STYLES, classifyLoadState, classifyRequestCategory, evaluateHelpPolicies, helpPolicyCellKey, renderHelpPolicyReport, sanitizeHelpPolicyObservation, scoreHelpPolicyCell } from "../electron/help-policy-evaluation.mjs";
 import { ABSOLUTE_COLLAPSE_FLOOR, ASSISTANCE_CHANNELS, INDEPENDENT_DIMENSIONS, RELATIVE_COLLAPSE_DROP, SCAFFOLD_FADING_PROBE_VERSION, decideMasteryWithholding, evaluateScaffoldFadingProbe, renderScaffoldFadingReport, scoreDebuggingDimension, scoreIndependentDimension, verifyAssistanceWithdrawn } from "../electron/scaffold-fading-probe.mjs";
+import { EPISTEMIC_VIGILANCE_GATE_VERSION, FAILURE_MODE_CATEGORIES, VERIFICATION_STAGES, evaluateVerificationProcess, gatePatchAdoptionOnVerification, renderVerificationProcessReport, runFalsifyingTestStage, scoreEvidenceLocationStage, scoreFailureModePredictionStage } from "../electron/epistemic-vigilance-gate.mjs";
 import { ALGORITHM_TRACING_TASK_KIND, ALGORITHM_TRACING_TUTOR_VERSION, algorithmTracingPassRate, buildAlgorithmTracingTask, combineAlgorithmTracingGrades, gradeHiddenTestStage, gradeRetrievalStage, gradeStateStage, measureAlgorithmTransfer, nextAlgorithmHint, publicAlgorithmTracingTask, recordAlgorithmTracingAttempt } from "../electron/algorithm-tracing-tutor.mjs";
 import { MODEL_ADVISORY_SUBJECT, MODEL_ADVISORY_VERSION, buildModelAdvisory, classifyModelLicense, evaluateModelForQuarantine, signModelAdvisory, verifyModelAdvisory } from "../electron/model-advisory.mjs";
 import { SEQUENTIAL_CAUSAL_EXPERIMENT_VERSION, analyzeSubgroups, preregisterSequentialExperiment, runSequentialLooks, sequentialAttritionSensitivity, sequentialCriticalValue, verifyAgainstPreregistration } from "../electron/sequential-causal-experiments.mjs";
@@ -14502,4 +14503,118 @@ test("scaffold-fading probe withdraws hints/retrieval/tool execution after succe
   const renderedCollapsed = renderScaffoldFadingReport(oneDimensionCollapsed, decideMasteryWithholding(oneDimensionCollapsed));
   assert.match(renderedCollapsed, /explanation: probe=0\.1 assisted=0\.75 COLLAPSED \(below-floor\)/);
   assert.match(renderedCollapsed, /Mastery withheld: Performance collapsed/);
+});
+
+test("epistemic vigilance gate requires located evidence, a before-you-look failure-mode prediction, and a real falsifying test before a tutor patch is verified, and never reads whether the learner agreed with the tutor", async (context) => {
+  const runtimes = await detectRuntimes();
+  if (!runtimes.python?.available) {
+    context.skip("No python runtime is installed, so the epistemic vigilance gate's falsifying-test stage cannot be verified here.");
+    return;
+  }
+
+  assert.equal(EPISTEMIC_VIGILANCE_GATE_VERSION, 1);
+  assert.deepEqual(VERIFICATION_STAGES, ["evidence-location", "failure-mode-prediction", "falsifying-test"]);
+  assert.deepEqual(FAILURE_MODE_CATEGORIES, ["raises", "diverges", "matches"]);
+
+  const repository = { files: [{ path: "app/core.py" }, { path: "app/runner.py" }] };
+
+  // --- Stage 1: evidence location, reusing explanation-grader.mjs's own
+  // checkCitations unmodified ---------------------------------------------
+  const noEvidence = scoreEvidenceLocationStage("This patch looks fine to me.", repository);
+  assert.equal(noEvidence.available, false);
+
+  const mixedEvidence = scoreEvidenceLocationStage("See app/core.py:12 and app/missing.py:3 for the bug.", repository);
+  assert.equal(mixedEvidence.available, true);
+  assert.equal(mixedEvidence.totalCount, 2);
+  assert.equal(mixedEvidence.validCount, 1);
+  assert.equal(mixedEvidence.score, 0.5);
+
+  const goodEvidence = scoreEvidenceLocationStage("See app/core.py:12 and app/runner.py:4 for the bug.", repository);
+  assert.equal(goodEvidence.score, 1);
+
+  // --- Stage 3: falsifying-test design, run for real inside
+  // executable-quiz.mjs's own sandbox --------------------------------------
+  const correctPatch = { moduleSource: "def add(a, b):\n    return a + b\n", entry: "add", args: [1, 2], expectedIfCorrect: "3" };
+  const buggyPatch = { moduleSource: "def add(a, b):\n    return a - b\n", entry: "add", args: [1, 2], expectedIfCorrect: "3" };
+  const raisingPatch = { moduleSource: "def add(a, b):\n    return a / 0\n", entry: "add", args: [1, 2], expectedIfCorrect: "3" };
+  const brokenCallPatch = { moduleSource: "value = 1\n", entry: "add", args: [1, 2], expectedIfCorrect: "3" };
+
+  const matchesResult = await runFalsifyingTestStage(correctPatch);
+  assert.equal(matchesResult.available, true);
+  assert.equal(matchesResult.actualCategory, "matches");
+  assert.equal(matchesResult.falsified, false);
+
+  const divergesResult = await runFalsifyingTestStage(buggyPatch);
+  assert.equal(divergesResult.available, true);
+  assert.equal(divergesResult.actualCategory, "diverges");
+  assert.equal(divergesResult.falsified, true);
+
+  const raisesResult = await runFalsifyingTestStage(raisingPatch);
+  assert.equal(raisesResult.available, true);
+  assert.equal(raisesResult.actualCategory, "raises");
+  assert.equal(raisesResult.falsified, true);
+
+  const noEntryResult = await runFalsifyingTestStage(brokenCallPatch);
+  assert.equal(noEntryResult.available, false);
+
+  // --- Stage 2: failure-mode prediction, scored only against the real
+  // executed outcome, with a confidence-weighted Brier score --------------
+  const correctConfidentPrediction = scoreFailureModePredictionStage("matches", 0.9, "matches");
+  assert.equal(correctConfidentPrediction.correct, true);
+  assert.equal(correctConfidentPrediction.calibration, "confident-and-right");
+  assert.equal(correctConfidentPrediction.brier, 0.01);
+
+  const wrongConfidentPrediction = scoreFailureModePredictionStage("matches", 0.9, "diverges");
+  assert.equal(wrongConfidentPrediction.correct, false);
+  assert.equal(wrongConfidentPrediction.calibration, "overconfident");
+  assert.equal(wrongConfidentPrediction.brier, 0.81);
+
+  const unknownCategory = scoreFailureModePredictionStage("explodes", 0.9, "matches");
+  assert.equal(unknownCategory.available, false);
+
+  // --- The full process: each stage reported on its own, no averaging ----
+  const completeProcess = await evaluateVerificationProcess({
+    evidenceText: "See app/core.py:12 for the current implementation.",
+    repository,
+    predictedCategory: "diverges",
+    statedConfidence: 0.8,
+    patch: buggyPatch,
+  });
+  assert.equal(completeProcess.stages.evidenceLocation.available, true);
+  assert.equal(completeProcess.stages.falsifyingTest.actualCategory, "diverges");
+  assert.equal(completeProcess.stages.failureModePrediction.correct, true);
+  assert.deepEqual(completeProcess.unprovenStages, []);
+  assert.equal(completeProcess.falsified, true);
+  assert.equal("score" in completeProcess, false);
+  assert.equal("overallScore" in completeProcess, false);
+
+  const incompleteProcess = await evaluateVerificationProcess({
+    evidenceText: "No citation given.",
+    repository,
+    predictedCategory: "matches",
+    statedConfidence: 0.6,
+    patch: correctPatch,
+  });
+  assert.deepEqual(incompleteProcess.unprovenStages, ["evidence-location"]);
+
+  // --- The core invariant: the gate never reads whether the learner
+  // agreed with the tutor ---------------------------------------------------
+  const verifiedButDisagreed = gatePatchAdoptionOnVerification(completeProcess, { adopted: false });
+  assert.equal(verifiedButDisagreed.verified, true);
+  const verifiedAndAgreed = gatePatchAdoptionOnVerification(completeProcess, { adopted: true });
+  assert.equal(verifiedAndAgreed.verified, true);
+  // Identical verification outcome regardless of the adoption decision --
+  // agreement with the tutor is not part of this gate at all.
+  assert.deepEqual(verifiedButDisagreed, verifiedAndAgreed);
+
+  const unverified = gatePatchAdoptionOnVerification(incompleteProcess, { adopted: true });
+  assert.equal(unverified.verified, false);
+  assert.match(unverified.reason, /evidence-location/);
+
+  // --- Rendering -----------------------------------------------------------
+  const rendered = renderVerificationProcessReport(completeProcess, verifiedAndAgreed);
+  assert.match(rendered, /evidence-location: 1\/1 citation\(s\) valid/);
+  assert.match(rendered, /failure-mode-prediction: predicted=diverges actual=diverges correct/);
+  assert.match(rendered, /falsifying-test: actual=diverges falsified the patch/);
+  assert.match(rendered, /Verification process: complete/);
 });
