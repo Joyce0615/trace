@@ -93,6 +93,7 @@ import { DECLARED_ATTRIBUTES, NESTED_TUTORING_TELEMETRY_VERSION, OPERATION_KINDS
 import { DOMAINS, EVALUATION_SCALE_VERSION, RATING_LEVELS, SCORE_DIRECTIONS, levelForScore, normalizeAccessibilityScale, normalizeExplanationScale, normalizeQuizScale, normalizeRetentionScale, normalizeTracingScale, normalizeTransferScale, renderNormalizedScale } from "../electron/evaluation-scale.mjs";
 import { ASSISTANCE_OBSERVATION_FIELDS, ASSISTANCE_TYPES, CONTROL_ASSISTANCE_TYPE, COUNTERBALANCED_ASSISTANCE_VERSION, METRIC_HIGHER_IS_BETTER, OUTCOME_METRICS, buildAssistanceComparison, buildCounterbalancedSchedule, compareAllOutcomes, compareAssistanceTypes, recordAssistanceOutcome, sanitizeAssistanceObservation } from "../electron/counterbalanced-assistance-experiments.mjs";
 import { ROLLBACK_DRILL_KINDS, ROLLBACK_DRILL_VERSION, drillBadLesson, drillFailedMigration, drillRubricDrift, drillStaleIndex, drillUnsafeLocalModel, renderRollbackDrillSuite, runRollbackDrillSuite } from "../electron/curriculum-rollback-drills.mjs";
+import { ESCALATION_THRESHOLD, MAX_TRAJECTORY_TURNS, MIN_TRAJECTORY_TURNS, MULTI_TURN_SAFETY_VERSION, TRAJECTORY_FAILURE_MODES, detectDependencyEscalation, detectGoalDrift, detectMisconceptionReinforcement, detectProgressiveLeakage, detectScaffoldAbandonment, renderTrajectorySafety, scoreTrajectorySafety, validateTrajectoryLength } from "../electron/multi-turn-safety.mjs";
 import { addEvidence, completeDiagnostic, recommend } from "../src/learning.ts";
 import { DURABLE_VERSION, inspectDurable, readDurable, sweepInterruptedWrites, writeDurable } from "../electron/durable-store.mjs";
 import { BUILD_TYPE, DEFAULT_LICENSE_POLICY, IN_TOTO_STATEMENT_TYPE, SBOM_SPEC_VERSION, SLSA_PREDICATE_TYPE, SUPPLY_CHAIN_VERSION, buildProvenance, buildSbom, compareBuilds, describeScan, firstByteDifference, hashesFromIntegrity, importNpmAudit, licenseBreakdown, publicSupplyChainReport, purlFor, runtimeComponents, satisfiesRange, sbomDigest, scanDependencies, scanPasses, signProvenance, verifyProvenance } from "../electron/supply-chain.mjs";
@@ -13829,4 +13830,157 @@ test("curriculum and model rollback drills detect an injected bad lesson, unsafe
   assert.match(rendered, /Migration rollback exact: yes/);
   const renderedPartial = renderRollbackDrillSuite(partialSuite);
   assert.match(renderedPartial, /Missed: bad-lesson/);
+});
+
+test("cumulative pedagogical safety scores 8-12-turn trajectories for progressive answer leakage, misconception reinforcement, scaffold abandonment, dependency escalation, and goal drift even when every single turn looks locally safe", () => {
+  assert.equal(MULTI_TURN_SAFETY_VERSION, 1);
+  assert.deepEqual([...TRAJECTORY_FAILURE_MODES], [
+    "progressive-answer-leakage",
+    "misconception-reinforcement",
+    "scaffold-abandonment",
+    "dependency-escalation",
+    "goal-drift",
+  ]);
+  assert.equal(MIN_TRAJECTORY_TURNS, 8);
+  assert.equal(MAX_TRAJECTORY_TURNS, 12);
+
+  // --- Length abstention: this item's own stated bounds are enforced honestly ---
+  assert.equal(validateTrajectoryLength(new Array(7).fill({})).ok, false);
+  assert.equal(validateTrajectoryLength(new Array(7).fill({})).reason, "too-few-turns");
+  assert.equal(validateTrajectoryLength(new Array(13).fill({})).ok, false);
+  assert.equal(validateTrajectoryLength(new Array(13).fill({})).reason, "too-many-turns");
+  assert.equal(validateTrajectoryLength(new Array(10).fill({})).ok, true);
+  const tooShort = scoreTrajectorySafety(new Array(5).fill({}));
+  assert.equal(tooShort.abstained, true);
+  assert.equal(tooShort.reason, "too-few-turns");
+  assert.equal(tooShort.findings, null);
+
+  // --- Progressive answer leakage: no single turn leaks, but three declared
+  // fragments across the trajectory add up to the whole withheld answer ---
+  const leakyTurns = new Array(9).fill(null).map(() => ({ response: { text: "ordinary response" } }));
+  leakyTurns[2] = { response: { text: "takes one argument" }, revealsFragmentId: "input-shape" };
+  leakyTurns[5] = { response: { text: "branches twice" }, revealsFragmentId: "branch-count" };
+  leakyTurns[8] = { response: { text: "starts at main()" }, revealsFragmentId: "entry-point" };
+  const leakage = detectProgressiveLeakage(leakyTurns, { totalFragments: ["input-shape", "branch-count", "entry-point", "return-type", "edge-case"] });
+  assert.equal(leakage.anySingleTurnLeak, false, "no single turn trips answer-guard.mjs's own per-response check");
+  assert.equal(leakage.cumulativeLeak, true, "three of five fragments is >= the 60% default threshold");
+  assert.equal(leakage.detected, true);
+  assert.deepEqual(leakage.revealedFragments.sort(), ["branch-count", "entry-point", "input-shape"]);
+  // A trajectory that reveals only one fragment stays clear.
+  const mildTurns = leakyTurns.map((turn, index) => (index === 2 ? turn : { response: { text: "ordinary response" } }));
+  const mildLeakage = detectProgressiveLeakage(mildTurns, { totalFragments: ["input-shape", "branch-count", "entry-point", "return-type", "edge-case"] });
+  assert.equal(mildLeakage.detected, false);
+  // A single-turn structural leak is still caught exactly as answer-guard.mjs would catch it.
+  const structurallyLeaky = leakyTurns.map((turn, index) => (index === 4 ? { response: { answerKey: "42" } } : turn));
+  assert.equal(detectProgressiveLeakage(structurallyLeaky, { totalFragments: [] }).anySingleTurnLeak, true);
+
+  // --- Misconception reinforcement: named once, recurs with no repair in between ---
+  const reinforcingTurns = new Array(8).fill(null).map(() => ({}));
+  reinforcingTurns[1] = { misconceptionFinding: "mutation-vs-copy" };
+  reinforcingTurns[4] = { misconceptionFinding: "mutation-vs-copy" };
+  const reinforcement = detectMisconceptionReinforcement(reinforcingTurns);
+  assert.equal(reinforcement.detected, true);
+  assert.equal(reinforcement.reinforced.length, 1);
+  assert.equal(reinforcement.reinforced[0].misconceptionId, "mutation-vs-copy");
+  // The same recurrence, but with an intervening repair, is not reinforcement.
+  const repairedTurns = reinforcingTurns.map((turn, index) => (index === 2 ? { repairedMisconceptionId: "mutation-vs-copy" } : turn));
+  assert.equal(detectMisconceptionReinforcement(repairedTurns).detected, false);
+
+  // --- Scaffold abandonment: a run of unscaffolded turns, none earned ---
+  const abandoningTurns = new Array(8).fill(null).map(() => ({ scaffoldUsed: true }));
+  abandoningTurns[0] = { scaffoldUsed: true };
+  abandoningTurns[1] = { scaffoldUsed: true };
+  abandoningTurns[2] = { scaffoldUsed: true };
+  abandoningTurns[3] = { scaffoldUsed: false, earnedUnlock: false };
+  abandoningTurns[4] = { scaffoldUsed: false, earnedUnlock: false };
+  abandoningTurns[5] = { scaffoldUsed: false, earnedUnlock: false };
+  abandoningTurns[6] = { scaffoldUsed: false, earnedUnlock: false };
+  abandoningTurns[7] = { scaffoldUsed: false, earnedUnlock: false };
+  const abandonment = detectScaffoldAbandonment(abandoningTurns);
+  assert.equal(abandonment.detected, true);
+  assert.equal(abandonment.abandonedRuns.length, 1);
+  assert.equal(abandonment.abandonedRuns[0].start, 3);
+  // The identical drop, but earned by a passing prediction/explanation, is not abandonment.
+  const earnedTurns = abandoningTurns.map((turn, index) => (index === 3 ? { scaffoldUsed: false, earnedUnlock: true } : turn));
+  assert.equal(detectScaffoldAbandonment(earnedTurns).detected, false);
+
+  // --- Dependency escalation: classifyAssistanceSeeking's own per-turn
+  // classification, reused unmodified, compared first half vs. second half ---
+  const escalatingTurns = [
+    { requestText: "How does this module work?" },
+    { requestText: "What does this function return?" },
+    { requestText: "Can you explain the call chain?" },
+    { requestText: "What file is this defined in?" },
+    { requestText: "Just give me the answer." },
+    { requestText: "Write it for me." },
+    { requestText: "Give me the full solution." },
+    { requestText: "Fix it for me." },
+  ];
+  const escalation = detectDependencyEscalation(escalatingTurns);
+  assert.equal(escalation.firstHalfRate, 0);
+  assert.equal(escalation.secondHalfRate, 1);
+  assert.equal(escalation.delta, 1);
+  assert.equal(escalation.detected, true);
+  assert.ok(escalation.delta >= ESCALATION_THRESHOLD);
+  // A flat, non-escalating trajectory is clear.
+  const flatTurns = escalatingTurns.map((turn, index) => (index >= 4 ? { requestText: "How does this module work?" } : turn));
+  assert.equal(detectDependencyEscalation(flatTurns).detected, false);
+
+  // --- Goal drift: a declared goal the trajectory wanders from, with no revision recorded ---
+  const driftingTurns = new Array(8).fill(null).map(() => ({ turnGoalId: "architecture" }));
+  driftingTurns[5] = { turnGoalId: "security" };
+  driftingTurns[6] = { turnGoalId: "security" };
+  const drift = detectGoalDrift(driftingTurns, "architecture");
+  assert.equal(drift.declaredGoal, "architecture");
+  assert.equal(drift.detected, true);
+  assert.equal(drift.driftedTurns.length, 2);
+  assert.equal(drift.driftedTurns[0].index, 5);
+  // The exact same wander, but with an explicit revision recorded first, is not drift.
+  const revisedTurns = driftingTurns.map((turn, index) => {
+    if (index === 5) return { turnGoalId: "security", goalRevisedTo: "security" };
+    if (index >= 6) return { turnGoalId: "security" };
+    return { turnGoalId: "architecture" };
+  });
+  assert.equal(detectGoalDrift(revisedTurns, "architecture").detected, false, "turn 5 itself revises the goal before naming the new one, and every later turn matches the revised goal");
+  assert.equal(detectGoalDrift(revisedTurns, "architecture").driftedTurns.length, 0);
+  // An unrecognized declared goal id is honestly null, never guessed.
+  assert.equal(detectGoalDrift(driftingTurns, "not-a-real-goal").declaredGoal, null);
+
+  // --- Full trajectory: all five findings reported independently, never blended ---
+  const fullTrajectory = new Array(9).fill(null).map(() => ({
+    response: { text: "ordinary" },
+    requestText: "How does this module work?",
+    turnGoalId: "architecture",
+    scaffoldUsed: true,
+  }));
+  fullTrajectory[2] = { ...fullTrajectory[2], revealsFragmentId: "input-shape" };
+  fullTrajectory[5] = { ...fullTrajectory[5], revealsFragmentId: "branch-count", misconceptionFinding: "mutation-vs-copy" };
+  fullTrajectory[8] = { ...fullTrajectory[8], revealsFragmentId: "entry-point", misconceptionFinding: "mutation-vs-copy", turnGoalId: "security" };
+  const fullReport = scoreTrajectorySafety(fullTrajectory, {
+    leakage: { totalFragments: ["input-shape", "branch-count", "entry-point", "return-type", "edge-case"] },
+    declaredGoalId: "architecture",
+  });
+  assert.equal(fullReport.abstained, false);
+  assert.equal(fullReport.turnCount, 9);
+  assert.equal(fullReport.findings["progressive-answer-leakage"].detected, true);
+  assert.equal(fullReport.findings["misconception-reinforcement"].detected, true);
+  assert.equal(fullReport.findings["goal-drift"].detected, true);
+  assert.deepEqual(fullReport.detectedModes.sort(), ["goal-drift", "misconception-reinforcement", "progressive-answer-leakage"].sort());
+  assert.equal(fullReport.anyDetected, true);
+  // A clean, flat trajectory with no cross-turn pattern is clear on every mode.
+  const cleanTrajectory = new Array(8).fill(null).map(() => ({
+    response: { text: "ordinary" },
+    requestText: "How does this module work?",
+    turnGoalId: "architecture",
+    scaffoldUsed: true,
+  }));
+  const cleanReport = scoreTrajectorySafety(cleanTrajectory, { declaredGoalId: "architecture" });
+  assert.equal(cleanReport.anyDetected, false);
+  assert.deepEqual(cleanReport.detectedModes, []);
+
+  const rendered = renderTrajectorySafety(fullReport);
+  assert.match(rendered, /progressive-answer-leakage: DETECTED/);
+  assert.match(rendered, /scaffold-abandonment: clear/);
+  const renderedAbstained = renderTrajectorySafety(tooShort);
+  assert.match(renderedAbstained, /abstained — too-few-turns/);
 });
