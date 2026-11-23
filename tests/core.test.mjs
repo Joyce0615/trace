@@ -64,6 +64,7 @@ import { DEFAULT_COGNITIVE_BUDGET, PROGRESSIVE_DISCOVERY_VERSION, initializeDisc
 import { COUNTEREXAMPLE_LAB_VERSION, applyCounterexampleResolution, buildCounterexampleLab, gradeCounterexamplePrediction, listCounterexampleLabs, publicCounterexampleLab, recordCounterexampleAttempt, runCounterexampleLab } from "../electron/counterexample-lab.mjs";
 import { MISCONCEPTION_REPAIR_GATE_VERSION, buildGatedMasteryEvidence, diagnoseClaimBeforePersistence, evaluateRepairCycle, gateClaimForPersistence, renderRepairGateDecision } from "../electron/misconception-repair-gate.mjs";
 import { HELP_POLICY_EVALUATION_VERSION, LOAD_STATES, REQUEST_CATEGORIES, RESPONSE_STYLES, classifyLoadState, classifyRequestCategory, evaluateHelpPolicies, helpPolicyCellKey, renderHelpPolicyReport, sanitizeHelpPolicyObservation, scoreHelpPolicyCell } from "../electron/help-policy-evaluation.mjs";
+import { ABSOLUTE_COLLAPSE_FLOOR, ASSISTANCE_CHANNELS, INDEPENDENT_DIMENSIONS, RELATIVE_COLLAPSE_DROP, SCAFFOLD_FADING_PROBE_VERSION, decideMasteryWithholding, evaluateScaffoldFadingProbe, renderScaffoldFadingReport, scoreDebuggingDimension, scoreIndependentDimension, verifyAssistanceWithdrawn } from "../electron/scaffold-fading-probe.mjs";
 import { ALGORITHM_TRACING_TASK_KIND, ALGORITHM_TRACING_TUTOR_VERSION, algorithmTracingPassRate, buildAlgorithmTracingTask, combineAlgorithmTracingGrades, gradeHiddenTestStage, gradeRetrievalStage, gradeStateStage, measureAlgorithmTransfer, nextAlgorithmHint, publicAlgorithmTracingTask, recordAlgorithmTracingAttempt } from "../electron/algorithm-tracing-tutor.mjs";
 import { MODEL_ADVISORY_SUBJECT, MODEL_ADVISORY_VERSION, buildModelAdvisory, classifyModelLicense, evaluateModelForQuarantine, signModelAdvisory, verifyModelAdvisory } from "../electron/model-advisory.mjs";
 import { SEQUENTIAL_CAUSAL_EXPERIMENT_VERSION, analyzeSubgroups, preregisterSequentialExperiment, runSequentialLooks, sequentialAttritionSensitivity, sequentialCriticalValue, verifyAgainstPreregistration } from "../electron/sequential-causal-experiments.mjs";
@@ -14348,4 +14349,157 @@ test("help-policy evaluation scores verification/stepwise/socratic/direct-answer
   const rendered = renderHelpPolicyReport(full);
   assert.match(rendered, /verification:debugging:high: 75% \(n=4\)/);
   assert.match(rendered, /socratic:conceptual:low: 100% \(n=3\)/);
+});
+
+test("scaffold-fading probe withdraws hints/retrieval/tool execution after success, scores planning/debugging/explanation independently, and withholds mastery when any dimension collapses without assistance", () => {
+  assert.equal(SCAFFOLD_FADING_PROBE_VERSION, 1);
+  assert.deepEqual(ASSISTANCE_CHANNELS, ["hints", "retrieval", "toolExecution"]);
+  assert.deepEqual(INDEPENDENT_DIMENSIONS, ["planning", "debugging", "explanation"]);
+  assert.equal(ABSOLUTE_COLLAPSE_FLOOR, 0.4);
+  assert.equal(RELATIVE_COLLAPSE_DROP, 0.2);
+
+  // --- verifyAssistanceWithdrawn: checked against real usage counts, never
+  // a caller-trusted boolean -------------------------------------------
+  const clean = verifyAssistanceWithdrawn({ hints: 0, retrieval: 0, toolExecution: 0 });
+  assert.equal(clean.withdrawn, true);
+  assert.deepEqual(clean.stillPresent, []);
+
+  const stillHinted = verifyAssistanceWithdrawn({ hints: 2, retrieval: 0, toolExecution: 0 });
+  assert.equal(stillHinted.withdrawn, false);
+  assert.deepEqual(stillHinted.stillPresent, ["hints"]);
+
+  const stillUsingTwo = verifyAssistanceWithdrawn({ hints: 0, retrieval: 1, toolExecution: 1 });
+  assert.equal(stillUsingTwo.withdrawn, false);
+  assert.deepEqual(stillUsingTwo.stillPresent, ["retrieval", "toolExecution"]);
+
+  // --- scoreIndependentDimension: absolute floor and relative drop, each a
+  // distinct, named collapse reason --------------------------------------
+  const missing = scoreIndependentDimension("planning", null, 0.8);
+  assert.equal(missing.available, false);
+
+  const belowFloor = scoreIndependentDimension("planning", 0.3, 0.9);
+  assert.equal(belowFloor.available, true);
+  assert.equal(belowFloor.collapsed, true);
+  assert.equal(belowFloor.collapseReason, "below-floor");
+
+  const largeDrop = scoreIndependentDimension("planning", 0.55, 0.9);
+  assert.equal(largeDrop.available, true);
+  assert.equal(largeDrop.collapsed, true);
+  assert.equal(largeDrop.collapseReason, "large-drop-from-assisted");
+
+  const steady = scoreIndependentDimension("planning", 0.75, 0.85);
+  assert.equal(steady.available, true);
+  assert.equal(steady.collapsed, false);
+  assert.equal(steady.collapseReason, null);
+
+  // No assisted score supplied: only the absolute floor applies.
+  const noBaselineOk = scoreIndependentDimension("planning", 0.5, null);
+  assert.equal(noBaselineOk.collapsed, false);
+  const noBaselineCollapsed = scoreIndependentDimension("planning", 0.2, null);
+  assert.equal(noBaselineCollapsed.collapsed, true);
+  assert.equal(noBaselineCollapsed.collapseReason, "below-floor");
+
+  // --- scoreDebuggingDimension: reuses process-trace-assessment.mjs's own
+  // scoreDebuggingStep unmodified, fed real misconception.mjs-shaped grades
+  const assistedProbeGrade = { correct: true, misconception: null };
+  const unassistedProbeGradeOk = { correct: true, misconception: null };
+  const debuggingOk = scoreDebuggingDimension(unassistedProbeGradeOk, assistedProbeGrade);
+  assert.equal(debuggingOk.available, true);
+  assert.equal(debuggingOk.probeScore, 1);
+  assert.equal(debuggingOk.collapsed, false);
+
+  const unassistedProbeGradeWrong = { correct: false, misconception: { id: "execution-order", title: "Execution order", remediation: "Trace calls, not source order." } };
+  const debuggingCollapsed = scoreDebuggingDimension(unassistedProbeGradeWrong, assistedProbeGrade);
+  assert.equal(debuggingCollapsed.available, true);
+  assert.equal(debuggingCollapsed.probeScore, 0);
+  assert.equal(debuggingCollapsed.collapsed, true);
+
+  // --- evaluateScaffoldFadingProbe: only probes after success, and
+  // withdrawal/planning/debugging/explanation are never averaged into one
+  // "independence score" ---------------------------------------------------
+  const notYetSucceeded = evaluateScaffoldFadingProbe({ assistedSucceeded: false });
+  assert.equal(notYetSucceeded.available, false);
+
+  const allIndependentNoCollapse = evaluateScaffoldFadingProbe({
+    assistedSucceeded: true,
+    assistanceUsed: { hints: 0, retrieval: 0, toolExecution: 0 },
+    planningScore: 0.8,
+    assistedPlanningScore: 0.85,
+    debuggingProbeGrade: { correct: true, misconception: null },
+    assistedDebuggingProbeGrade: { correct: true, misconception: null },
+    explanationScore: 0.7,
+    assistedExplanationScore: 0.75,
+  });
+  assert.equal(allIndependentNoCollapse.available, true);
+  assert.equal(allIndependentNoCollapse.withdrawal.withdrawn, true);
+  assert.equal(allIndependentNoCollapse.dimensions.length, 3);
+  assert.deepEqual(allIndependentNoCollapse.collapsedDimensions, []);
+  assert.equal(allIndependentNoCollapse.collapsed, false);
+  assert.equal("independenceScore" in allIndependentNoCollapse, false);
+  assert.equal("averageScore" in allIndependentNoCollapse, false);
+
+  // One dimension (explanation) collapses while planning/debugging stay
+  // fine -- the point is each is reported on its own, not blended.
+  const oneDimensionCollapsed = evaluateScaffoldFadingProbe({
+    assistedSucceeded: true,
+    assistanceUsed: { hints: 0, retrieval: 0, toolExecution: 0 },
+    planningScore: 0.8,
+    assistedPlanningScore: 0.85,
+    debuggingProbeGrade: { correct: true, misconception: null },
+    assistedDebuggingProbeGrade: { correct: true, misconception: null },
+    explanationScore: 0.1,
+    assistedExplanationScore: 0.75,
+  });
+  assert.equal(oneDimensionCollapsed.collapsed, true);
+  assert.deepEqual(oneDimensionCollapsed.collapsedDimensions, ["explanation"]);
+  const planningEntry = oneDimensionCollapsed.dimensions.find((entry) => entry.dimension === "planning");
+  assert.equal(planningEntry.collapsed, false);
+
+  // Assistance still present -- the probe itself does not prove independence,
+  // regardless of scores.
+  const notWithdrawnYet = evaluateScaffoldFadingProbe({
+    assistedSucceeded: true,
+    assistanceUsed: { hints: 1, retrieval: 0, toolExecution: 0 },
+    planningScore: 0.9,
+    debuggingProbeGrade: { correct: true, misconception: null },
+    explanationScore: 0.9,
+  });
+  assert.equal(notWithdrawnYet.withdrawal.withdrawn, false);
+
+  // Missing evidence for one dimension -- reported separately from collapse.
+  const missingEvidence = evaluateScaffoldFadingProbe({
+    assistedSucceeded: true,
+    assistanceUsed: { hints: 0, retrieval: 0, toolExecution: 0 },
+    planningScore: 0.9,
+    debuggingProbeGrade: { correct: true, misconception: null },
+    explanationScore: null,
+  });
+  assert.deepEqual(missingEvidence.unprovenDimensions, ["explanation"]);
+
+  // --- decideMasteryWithholding: each reason distinct and named ----------
+  assert.equal(decideMasteryWithholding(notYetSucceeded).withhold, true);
+  assert.match(decideMasteryWithholding(notYetSucceeded).reason, /did not succeed/);
+
+  assert.equal(decideMasteryWithholding(notWithdrawnYet).withhold, true);
+  assert.match(decideMasteryWithholding(notWithdrawnYet).reason, /not actually withdrawn/);
+
+  assert.equal(decideMasteryWithholding(missingEvidence).withhold, true);
+  assert.match(decideMasteryWithholding(missingEvidence).reason, /Insufficient evidence/);
+
+  assert.equal(decideMasteryWithholding(oneDimensionCollapsed).withhold, true);
+  assert.match(decideMasteryWithholding(oneDimensionCollapsed).reason, /collapsed without assistance.*explanation/);
+
+  const allowDecision = decideMasteryWithholding(allIndependentNoCollapse);
+  assert.equal(allowDecision.withhold, false);
+  assert.equal(allowDecision.reason, null);
+
+  // --- Rendering -----------------------------------------------------------
+  const rendered = renderScaffoldFadingReport(allIndependentNoCollapse, allowDecision);
+  assert.match(rendered, /Assistance withdrawn: yes/);
+  assert.match(rendered, /planning: probe=0\.8 assisted=0\.85 ok/);
+  assert.match(rendered, /Mastery withheld: no/);
+
+  const renderedCollapsed = renderScaffoldFadingReport(oneDimensionCollapsed, decideMasteryWithholding(oneDimensionCollapsed));
+  assert.match(renderedCollapsed, /explanation: probe=0\.1 assisted=0\.75 COLLAPSED \(below-floor\)/);
+  assert.match(renderedCollapsed, /Mastery withheld: Performance collapsed/);
 });
