@@ -62,6 +62,7 @@ import { COGNITIVE_OFFLOAD_GUARD_VERSION, DEFAULT_MASTERY_FLOOR, EXPLANATION_GAT
 import { DISAGREEMENT_THRESHOLD, PROCESS_TRACE_ASSESSMENT_VERSION, assessProcessTrace, scoreDebuggingStep, scoreEvidenceSelectionStep, scoreNavigationStep, scoreRevisionStep, scoreTracingStep, validateRubricAgreement } from "../electron/process-trace-assessment.mjs";
 import { DEFAULT_COGNITIVE_BUDGET, PROGRESSIVE_DISCOVERY_VERSION, initializeDiscovery, measureComprehensionImpact, revealNext } from "../electron/progressive-discovery.mjs";
 import { COUNTEREXAMPLE_LAB_VERSION, applyCounterexampleResolution, buildCounterexampleLab, gradeCounterexamplePrediction, listCounterexampleLabs, publicCounterexampleLab, recordCounterexampleAttempt, runCounterexampleLab } from "../electron/counterexample-lab.mjs";
+import { MISCONCEPTION_REPAIR_GATE_VERSION, buildGatedMasteryEvidence, diagnoseClaimBeforePersistence, evaluateRepairCycle, gateClaimForPersistence, renderRepairGateDecision } from "../electron/misconception-repair-gate.mjs";
 import { ALGORITHM_TRACING_TASK_KIND, ALGORITHM_TRACING_TUTOR_VERSION, algorithmTracingPassRate, buildAlgorithmTracingTask, combineAlgorithmTracingGrades, gradeHiddenTestStage, gradeRetrievalStage, gradeStateStage, measureAlgorithmTransfer, nextAlgorithmHint, publicAlgorithmTracingTask, recordAlgorithmTracingAttempt } from "../electron/algorithm-tracing-tutor.mjs";
 import { MODEL_ADVISORY_SUBJECT, MODEL_ADVISORY_VERSION, buildModelAdvisory, classifyModelLicense, evaluateModelForQuarantine, signModelAdvisory, verifyModelAdvisory } from "../electron/model-advisory.mjs";
 import { SEQUENTIAL_CAUSAL_EXPERIMENT_VERSION, analyzeSubgroups, preregisterSequentialExperiment, runSequentialLooks, sequentialAttritionSensitivity, sequentialCriticalValue, verifyAgainstPreregistration } from "../electron/sequential-causal-experiments.mjs";
@@ -14151,4 +14152,100 @@ test("reward-hacking guard flags engagement proxies that rise without corroborat
   const rendered = renderRewardHackingReport(allProxies, noLearningGain, hackedResult);
   assert.match(rendered, /REWARD HACKING DETECTED/);
   assert.match(rendered, /dialogue-length/);
+});
+
+test("the misconception repair gate blocks persistence of an unverified misconception and only releases it after a genuine predict-observe-reassess cycle completes", () => {
+  assert.equal(MISCONCEPTION_REPAIR_GATE_VERSION, 1);
+
+  // --- Diagnosis before persistence reuses misconception.mjs's own
+  // detectMisconceptions unmodified ---------------------------------------
+  const cleanClaim = diagnoseClaimBeforePersistence("I ran it and saw the real output change in place.");
+  assert.equal(cleanClaim.clean, true);
+  assert.deepEqual(cleanClaim.findings, []);
+
+  const misconceivedClaim = diagnoseClaimBeforePersistence("There is only one caller for this function so it is safe to change.");
+  assert.equal(misconceivedClaim.clean, false);
+  assert.equal(misconceivedClaim.findings[0].id, "single-caller");
+
+  // --- A completely unknown misconception id never produces a "repaired"
+  // verdict, named distinctly from every other failure ---------------------
+  const unknownCycle = evaluateRepairCycle("not-a-real-misconception", {});
+  assert.equal(unknownCycle.repaired, false);
+  assert.equal(unknownCycle.reason, "unknown-misconception");
+  assert.equal(unknownCycle.stages, null);
+
+  const lab = buildCounterexampleLab("single-caller");
+  assert.ok(lab);
+
+  // --- Stage 1 fails: a prediction exists but for a different lab run —
+  // not accepted as "predicted before this run" ----------------------------
+  const realPrediction = gradeCounterexamplePrediction(lab, "model-correct", 0.8);
+  const unrelatedRun = { available: true, labId: "counterexample-some-other-misconception", misconceptionId: "single-caller", status: "ok", observed: "2", resolved: true };
+  const noPredictionCycle = evaluateRepairCycle("single-caller", { predictionGrade: realPrediction, run: unrelatedRun, reassessmentText: "I now see every caller matters." });
+  assert.equal(noPredictionCycle.repaired, false);
+  assert.equal(noPredictionCycle.stages.predicted, false);
+  assert.match(noPredictionCycle.reason, /No prediction was committed/);
+
+  // --- Stage 2 fails: a matched prediction, but the run itself did not
+  // resolve the misconception ----------------------------------------------
+  const unresolvedRun = { available: true, labId: lab.id, misconceptionId: "single-caller", status: "ok", observed: "1", resolved: false };
+  const noObservationCycle = evaluateRepairCycle("single-caller", { predictionGrade: realPrediction, run: unresolvedRun, reassessmentText: "I now see every caller matters." });
+  assert.equal(noObservationCycle.repaired, false);
+  assert.equal(noObservationCycle.stages.predicted, true);
+  assert.equal(noObservationCycle.stages.observed, false);
+  assert.match(noObservationCycle.reason, /did not resolve/);
+
+  // --- Stage 3 fails: prediction and observation both hold, but the
+  // learner's own post-observation restatement still names the same
+  // misconception — the lab resolved, but the learner did not -------------
+  const resolvedRun = { available: true, labId: lab.id, misconceptionId: "single-caller", status: "ok", observed: "2", resolved: true };
+  const stillHeldCycle = evaluateRepairCycle("single-caller", { predictionGrade: realPrediction, run: resolvedRun, reassessmentText: "OK but there is still only one caller for this." });
+  assert.equal(stillHeldCycle.repaired, false);
+  assert.equal(stillHeldCycle.stages.predicted, true);
+  assert.equal(stillHeldCycle.stages.observed, true);
+  assert.equal(stillHeldCycle.stages.reassessed, false);
+  assert.match(stillHeldCycle.reason, /reassessment still names/);
+
+  // --- A full cycle: matched prediction, resolved run, and a reassessment
+  // that no longer triggers the detector -----------------------------------
+  const repairedCycle = evaluateRepairCycle("single-caller", { predictionGrade: realPrediction, run: resolvedRun, reassessmentText: "I see now that two different functions both call record(), so result changed on the second call." });
+  assert.equal(repairedCycle.repaired, true);
+  assert.equal(repairedCycle.reason, null);
+  assert.deepEqual(repairedCycle.stages, { predicted: true, observed: true, reassessed: true });
+
+  // --- The actual persistence gate: a clean claim is never blocked --------
+  const cleanGate = gateClaimForPersistence("I ran it and saw the real output change in place.", {});
+  assert.equal(cleanGate.allowed, true);
+  assert.deepEqual(cleanGate.blockedMisconceptions, []);
+
+  // A misconceived claim with no repair cycle on record is blocked.
+  const blockedGate = gateClaimForPersistence("There is only one caller for this function so it is safe to change.", {});
+  assert.equal(blockedGate.allowed, false);
+  assert.deepEqual(blockedGate.blockedMisconceptions, ["single-caller"]);
+  assert.match(blockedGate.reason, /unverified misconception/);
+
+  // The same claim is allowed once its repair cycle is on record as repaired.
+  const releasedGate = gateClaimForPersistence("There is only one caller for this function so it is safe to change.", { "single-caller": repairedCycle });
+  assert.equal(releasedGate.allowed, true);
+  assert.deepEqual(releasedGate.blockedMisconceptions, []);
+
+  // A repair cycle on record but not yet actually repaired still blocks.
+  const stillBlockedGate = gateClaimForPersistence("There is only one caller for this function so it is safe to change.", { "single-caller": stillHeldCycle });
+  assert.equal(stillBlockedGate.allowed, false);
+
+  // --- Mastery evidence is never built on trust: only a confirmed repair
+  // cycle releases evidence through counterexample-lab.mjs's own
+  // buildMasteryEvidence, unmodified ----------------------------------------
+  const blockedEvidence = buildGatedMasteryEvidence("single-caller", { predictionGrade: realPrediction, run: unresolvedRun, reassessmentText: "still only one caller" });
+  assert.equal(blockedEvidence.evidence, null);
+  assert.equal(blockedEvidence.cycle.repaired, false);
+
+  const releasedEvidence = buildGatedMasteryEvidence("single-caller", { predictionGrade: realPrediction, run: resolvedRun, reassessmentText: "I see now that two different functions both call record(), so result changed on the second call." });
+  assert.ok(releasedEvidence.evidence);
+  assert.equal(releasedEvidence.evidence.kind, "diagnostic");
+  assert.equal(releasedEvidence.cycle.repaired, true);
+
+  // --- Rendering -----------------------------------------------------------
+  assert.match(renderRepairGateDecision(blockedGate), /PERSISTENCE BLOCKED/);
+  assert.match(renderRepairGateDecision(cleanGate), /PERSISTENCE ALLOWED/);
 });
