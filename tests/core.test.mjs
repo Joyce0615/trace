@@ -99,6 +99,7 @@ import { ASSISTANCE_OBSERVATION_FIELDS, ASSISTANCE_TYPES, CONTROL_ASSISTANCE_TYP
 import { ROLLBACK_DRILL_KINDS, ROLLBACK_DRILL_VERSION, drillBadLesson, drillFailedMigration, drillRubricDrift, drillStaleIndex, drillUnsafeLocalModel, renderRollbackDrillSuite, runRollbackDrillSuite } from "../electron/curriculum-rollback-drills.mjs";
 import { ESCALATION_THRESHOLD, MAX_TRAJECTORY_TURNS, MIN_TRAJECTORY_TURNS, MULTI_TURN_SAFETY_VERSION, TRAJECTORY_FAILURE_MODES, detectDependencyEscalation, detectGoalDrift, detectMisconceptionReinforcement, detectProgressiveLeakage, detectScaffoldAbandonment, renderTrajectorySafety, scoreTrajectorySafety, validateTrajectoryLength } from "../electron/multi-turn-safety.mjs";
 import { ENGAGEMENT_PROXIES, PROXY_RISE_THRESHOLD, REWARD_HACKING_GUARD_VERSION, SATISFACTION_STRENGTH_FLOOR, detectRewardHacking, guardPromotionAgainstRewardHacking, measureDialogueLengthProxy, measureEngagementProxies, measureGenuineLearningSignals, measureImmediatePassRateProxy, measureRequestVolumeProxy, measureSatisfactionProxy, renderRewardHackingReport } from "../electron/reward-hacking-guard.mjs";
+import { EQUITY_GAP_THRESHOLD, HINT_BURDEN_THRESHOLD, OUTCOME_AXES, SUBGROUP_CALIBRATION_GATE_VERSION, SUBGROUP_DIMENSIONS, computeLearnerOutcomes, evaluateSubgroupCalibration, evaluateSubgroupCell, groupBySubgroupValue, learnerFalseMasteryOutcome, learnerHintBurdenOutcome, renderSubgroupCalibrationReport } from "../electron/subgroup-calibration-gate.mjs";
 import { addEvidence, completeDiagnostic, recommend } from "../src/learning.ts";
 import { DURABLE_VERSION, inspectDurable, readDurable, sweepInterruptedWrites, writeDurable } from "../electron/durable-store.mjs";
 import { BUILD_TYPE, DEFAULT_LICENSE_POLICY, IN_TOTO_STATEMENT_TYPE, SBOM_SPEC_VERSION, SLSA_PREDICATE_TYPE, SUPPLY_CHAIN_VERSION, buildProvenance, buildSbom, compareBuilds, describeScan, firstByteDifference, hashesFromIntegrity, importNpmAudit, licenseBreakdown, publicSupplyChainReport, purlFor, runtimeComponents, satisfiesRange, sbomDigest, scanDependencies, scanPasses, signProvenance, verifyProvenance } from "../electron/supply-chain.mjs";
@@ -14617,4 +14618,131 @@ test("epistemic vigilance gate requires located evidence, a before-you-look fail
   assert.match(rendered, /failure-mode-prediction: predicted=diverges actual=diverges correct/);
   assert.match(rendered, /falsifying-test: actual=diverges falsified the patch/);
   assert.match(rendered, /Verification process: complete/);
+});
+
+test("subgroup calibration gates false mastery, hint burden, retention, and transfer by prior experience, language, accessibility mode, and assistance history, abstaining below the cohort floor rather than overstating small-sample fairness", () => {
+  const base = Date.parse("2026-08-01T09:00:00.000Z");
+  const at = (minutes) => new Date(base + minutes * 60_000).toISOString();
+
+  assert.equal(SUBGROUP_CALIBRATION_GATE_VERSION, 1);
+  assert.deepEqual(OUTCOME_AXES, ["false-mastery", "hint-burden", "retention", "transfer"]);
+  assert.deepEqual(SUBGROUP_DIMENSIONS, ["prior-experience", "language", "accessibility-mode", "assistance-history"]);
+  assert.equal(EQUITY_GAP_THRESHOLD, 0.2);
+  assert.equal(HINT_BURDEN_THRESHOLD, 0.5);
+
+  // --- False mastery: a status: "mastered" skill whose fresh posterior
+  // (misconception.mjs's own calibrateSkill, unmodified) disagrees --------
+  const overconfidentState = {
+    mastery: {
+      "skill-a": {
+        skillId: "skill-a",
+        status: "mastered",
+        evidence: [
+          { kind: "self-report", strength: 0.95, createdAt: at(0) },
+          { kind: "quiz", strength: 0.2, createdAt: at(1) },
+          { kind: "quiz", strength: 0.15, createdAt: at(2) },
+          { kind: "practice", strength: 0.1, createdAt: at(3) },
+        ],
+      },
+    },
+  };
+  assert.equal(learnerFalseMasteryOutcome(overconfidentState), 1);
+
+  const calibratedState = {
+    mastery: {
+      "skill-b": {
+        skillId: "skill-b",
+        status: "mastered",
+        evidence: [
+          { kind: "self-report", strength: 0.9, createdAt: at(0) },
+          { kind: "quiz", strength: 0.9, createdAt: at(1) },
+          { kind: "quiz", strength: 0.85, createdAt: at(2) },
+          { kind: "practice", strength: 0.95, createdAt: at(3) },
+        ],
+      },
+    },
+  };
+  assert.equal(learnerFalseMasteryOutcome(calibratedState), 0);
+
+  const noMasteredState = { mastery: { "skill-c": { skillId: "skill-c", status: "available", evidence: [] } } };
+  assert.equal(learnerFalseMasteryOutcome(noMasteredState), null, "no mastered skill is insufficient-evidence, never a guessed clean 0");
+
+  // --- Hint burden: hintAnalytics's own hintedShare, reused unmodified --
+  const highHintEvents = [0, 1, 2, 3, 4].map((i) => ({ at: at(i), kind: "explanation", correct: true, hints: 2 }));
+  assert.equal(learnerHintBurdenOutcome(highHintEvents), 1);
+  const lowHintEvents = [0, 1, 2, 3, 4].map((i) => ({ at: at(i), kind: "explanation", correct: true, hints: 0 }));
+  assert.equal(learnerHintBurdenOutcome(lowHintEvents), 0);
+  assert.equal(learnerHintBurdenOutcome([]), null);
+
+  // --- computeLearnerOutcomes: all four axes, never blended --------------
+  const outcomes = computeLearnerOutcomes({ learnerState: overconfidentState, events: highHintEvents });
+  assert.deepEqual(Object.keys(outcomes).sort(), ["false-mastery", "hint-burden", "retention", "transfer"]);
+  assert.equal(outcomes["false-mastery"], 1);
+  assert.equal(outcomes["hint-burden"], 1);
+
+  // --- groupBySubgroupValue: an undeclared learner is excluded, not
+  // guessed into a default bucket -----------------------------------------
+  const grouping = groupBySubgroupValue([
+    { subgroups: { "prior-experience": "novice" } },
+    { subgroups: {} },
+    { subgroups: { "prior-experience": "expert" } },
+  ], "prior-experience");
+  assert.equal(grouping.groups.size, 2);
+  assert.equal(grouping.unlabeled, 1);
+
+  // --- A real equity comparison across a declared subgroup dimension -----
+  function makeLearner(subgroupValue, { hintBurden, retentionGood }) {
+    const events = [
+      ...(hintBurden ? highHintEvents : lowHintEvents),
+      ...(retentionGood
+        ? [0, 1, 2, 3].map((i) => ({ at: at(i + 10), kind: "review", correct: true, elapsedDays: 2 }))
+        : [0, 1, 2, 3].map((i) => ({ at: at(i + 10), kind: "review", correct: false, elapsedDays: 2 }))),
+    ];
+    return { subgroups: { "prior-experience": subgroupValue }, learnerState: calibratedState, events, skillGraph: null, studiedPaths: [] };
+  }
+
+  // Six "novice" learners with a hint burden and poor retention; six
+  // "expert" learners with neither — a real gap that clears
+  // MIN_COHORT_SIZE on both qualifying groups.
+  const novices = Array.from({ length: 6 }, () => makeLearner("novice", { hintBurden: true, retentionGood: false }));
+  const experts = Array.from({ length: 6 }, () => makeLearner("expert", { hintBurden: false, retentionGood: true }));
+  const learners = [...novices, ...experts];
+
+  const hintCell = evaluateSubgroupCell(learners, "prior-experience", "hint-burden");
+  assert.equal(hintCell.verdict, "gap-detected", JSON.stringify(hintCell));
+  assert.ok(hintCell.gap > EQUITY_GAP_THRESHOLD);
+
+  const retentionCell = evaluateSubgroupCell(learners, "prior-experience", "retention");
+  assert.equal(retentionCell.verdict, "gap-detected", JSON.stringify(retentionCell));
+
+  // --- Below the cohort floor: fewer than two qualifying groups abstains,
+  // never overstates a small-sample fairness claim -------------------------
+  const tinyLearners = [makeLearner("novice", { hintBurden: true, retentionGood: false })];
+  const tinyCell = evaluateSubgroupCell(tinyLearners, "prior-experience", "hint-burden");
+  assert.equal(tinyCell.verdict, "insufficient-evidence");
+  assert.match(tinyCell.reason, /Fewer than two/);
+
+  // --- No gap: both qualifying subgroups behave identically --------------
+  const identicalLearners = [
+    ...Array.from({ length: 6 }, () => makeLearner("novice", { hintBurden: false, retentionGood: true })),
+    ...Array.from({ length: 6 }, () => makeLearner("expert", { hintBurden: false, retentionGood: true })),
+  ];
+  const noGapCell = evaluateSubgroupCell(identicalLearners, "prior-experience", "hint-burden");
+  assert.equal(noGapCell.verdict, "no-gap-detected");
+  assert.equal(noGapCell.gap, 0);
+
+  // --- Full report: every (dimension x axis) cell independently scored,
+  // never blended into one fairness score ----------------------------------
+  const fullReport = evaluateSubgroupCalibration(learners);
+  assert.equal(fullReport.cells.length, SUBGROUP_DIMENSIONS.length * OUTCOME_AXES.length);
+  assert.ok(fullReport.gapsDetected.some((entry) => entry.dimension === "prior-experience" && entry.axis === "hint-burden"));
+  // Dimensions this fixture never declares (language, accessibility-mode,
+  // assistance-history) honestly abstain rather than guessing a gap.
+  const languageCells = fullReport.cells.filter((cell) => cell.dimension === "language");
+  assert.ok(languageCells.every((cell) => cell.verdict === "insufficient-evidence"));
+
+  // --- Rendering -----------------------------------------------------------
+  const rendered = renderSubgroupCalibrationReport(fullReport);
+  assert.match(rendered, /GAPS DETECTED/);
+  assert.match(rendered, /prior-experience \/ hint-burden/);
 });
