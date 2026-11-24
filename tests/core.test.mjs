@@ -103,6 +103,7 @@ import { EQUITY_GAP_THRESHOLD, HINT_BURDEN_THRESHOLD, OUTCOME_AXES, SUBGROUP_CAL
 import { GOVERNANCE_RECORD_FACETS, LEARNING_GOVERNANCE_RECORD_FORMAT, LEARNING_GOVERNANCE_RECORD_SUBJECT, LEARNING_GOVERNANCE_RECORD_VERSION, buildGovernanceRecord, buildGovernanceRecordContent, decideDeprecation, governanceAdjudications, governanceEfficacySafetyAccessibility, governanceEvaluatorCalibration, governanceRecordDigest, governanceSubjectRegistered, loadGovernanceChain, openGovernancePrivacyBudget, persistGovernanceRecord, renderGovernanceRecord, spendGovernancePrivacyBudget, verifyGovernanceChain, verifyGovernanceRecord } from "../electron/learning-governance-record.mjs";
 import { MULTILINGUAL_EQUIVALENCE_GATE_VERSION, SEMANTIC_AXES, containsAnswerToken, evaluateMultilingualEquivalence, renderMultilingualEquivalenceReport, verifyAbstentionEquivalence, verifyDifficultyEquivalence, verifyEvidenceEquivalence, verifyHintRungEquivalence, verifyMisconceptionEquivalence, verifyTranslatedScaffoldLeakage } from "../electron/multilingual-equivalence-gate.mjs";
 import { EXPERTISE_REVERSAL_VERSION, HARM_KINDS, PRIOR_KNOWLEDGE_PROFILES, buildScaffoldIntensityComparison, classifyExpertiseReversalHarm, evaluateExpertiseReversal, renderExpertiseReversalReport, verifyFixedAssessment } from "../electron/expertise-reversal.mjs";
+import { BENCHMARK_CONTAMINATION_VERSION, ContaminationKind, DEFAULT_NEAR_DUPLICATE_THRESHOLD, DEFAULT_REPOSITORY_OVERLAP_THRESHOLD, classifyBodyContamination, classifyTaskContamination, detectCanaryMentions, exactBodyDigest, findOverlappingRepositories, isIdentifierRenamedClone, nearDuplicateSimilarity, normalizeIdentifiers, renderContaminationReport, repositorySymbolOverlap, separateMemorizedFromTransferred } from "../electron/benchmark-contamination.mjs";
 import { addEvidence, completeDiagnostic, recommend } from "../src/learning.ts";
 import { DURABLE_VERSION, inspectDurable, readDurable, sweepInterruptedWrites, writeDurable } from "../electron/durable-store.mjs";
 import { BUILD_TYPE, DEFAULT_LICENSE_POLICY, IN_TOTO_STATEMENT_TYPE, SBOM_SPEC_VERSION, SLSA_PREDICATE_TYPE, SUPPLY_CHAIN_VERSION, buildProvenance, buildSbom, compareBuilds, describeScan, firstByteDifference, hashesFromIntegrity, importNpmAudit, licenseBreakdown, publicSupplyChainReport, purlFor, runtimeComponents, satisfiesRange, sbomDigest, scanDependencies, scanPasses, signProvenance, verifyProvenance } from "../electron/supply-chain.mjs";
@@ -15237,4 +15238,116 @@ test("prior-knowledge and expertise-reversal testing keeps evidence targets and 
   assert.match(renderedFull, /advanced: control-better — HARM: redundant-load/);
   assert.match(renderedFull, /intermediate: no-difference$/m);
   assert.match(renderedFull, /Harms detected: (advanced\/redundant-load, novice\/under-guidance|novice\/under-guidance, advanced\/redundant-load)/);
+});
+
+test("benchmark contamination and memorization control detects exact and near duplicates, identifier-renamed clones, canary symbols, and repository overlap, and separates memorized performance from grounded transfer on paraphrased unseen variants", () => {
+  assert.equal(BENCHMARK_CONTAMINATION_VERSION, 1);
+  assert.deepEqual(ContaminationKind, {
+    EXACT_DUPLICATE: "exact-duplicate",
+    NEAR_DUPLICATE: "near-duplicate",
+    IDENTIFIER_RENAMED_CLONE: "identifier-renamed-clone",
+    CANARY_LEAKED: "canary-leaked",
+    CLEAN: "clean",
+  });
+
+  const original = "function computeAverage(values) {\n  let total = 0;\n  for (let index = 0; index < values.length; index += 1) {\n    total += values[index];\n  }\n  return total / values.length;\n}";
+  const identifierRenamed = "function computeAverage(items) {\n  let sum = 0;\n  for (let position = 0; position < items.length; position += 1) {\n    sum += items[position];\n  }\n  return sum / items.length;\n}";
+  const lightlyEdited = "function computeAverage(values) {\n  let total = 0;\n  for (let index = 0; index < values.length; index += 1) {\n    total += values[index];\n  }\n  const count = values.length;\n  return total / count;\n}";
+  const structurallyDifferent = "function computeMax(values) {\n  let max = -Infinity;\n  for (let index = 0; index < values.length; index += 1) {\n    if (values[index] > max) max = values[index];\n  }\n  return max;\n}";
+  const unrelatedTiny = "x";
+
+  // --- normalizeIdentifiers: the one genuinely new check, live-verified ---
+  assert.deepEqual(normalizeIdentifiers(["add", "(", "x", ",", "y", ")"]), ["ID0", "(", "ID1", ",", "ID2", ")"]);
+  assert.deepEqual(normalizeIdentifiers(["return", "x", "+", "y"]), ["return", "ID0", "+", "ID1"], "keywords/operators are never renamed");
+
+  // --- isIdentifierRenamedClone: renamed pair matches, structurally different pair does not ---
+  assert.equal(isIdentifierRenamedClone(original, identifierRenamed), true);
+  assert.equal(isIdentifierRenamedClone(original, structurallyDifferent), false);
+  assert.equal(isIdentifierRenamedClone(original, ""), false, "an empty body never counts as a match");
+
+  // --- exactBodyDigest: reuses offline-archive.mjs's own digestOfText ---
+  assert.equal(exactBodyDigest(original), exactBodyDigest(original));
+  assert.notEqual(exactBodyDigest(original), exactBodyDigest(identifierRenamed));
+
+  // --- nearDuplicateSimilarity: reuses course-migration.mjs's own shingles/jaccard pipeline ---
+  const highSimilarity = nearDuplicateSimilarity(original, lightlyEdited);
+  assert.ok(highSimilarity > DEFAULT_NEAR_DUPLICATE_THRESHOLD, `expected lightly-edited similarity above threshold, got ${highSimilarity}`);
+  const lowSimilarity = nearDuplicateSimilarity(original, structurallyDifferent);
+  assert.ok(lowSimilarity < DEFAULT_NEAR_DUPLICATE_THRESHOLD, `expected structurally-different similarity below threshold, got ${lowSimilarity}`);
+  assert.equal(nearDuplicateSimilarity(original, ""), null, "null, not 0, when one side has no usable body");
+
+  // --- classifyBodyContamination: fixed check order, exact before renamed before near, first match reported ---
+  assert.deepEqual(classifyBodyContamination(original, [original]).kind, ContaminationKind.EXACT_DUPLICATE);
+  assert.deepEqual(classifyBodyContamination(identifierRenamed, [original]).kind, ContaminationKind.IDENTIFIER_RENAMED_CLONE);
+  assert.deepEqual(classifyBodyContamination(lightlyEdited, [original]).kind, ContaminationKind.NEAR_DUPLICATE);
+  assert.deepEqual(classifyBodyContamination(structurallyDifferent, [original]).kind, ContaminationKind.CLEAN);
+  assert.deepEqual(classifyBodyContamination(unrelatedTiny, [original]).kind, ContaminationKind.CLEAN);
+
+  // --- detectCanaryMentions: reuses explanation-grader.mjs's own mentionedSymbols ---
+  const canaries = ["zz_canary_marker_7f3a"];
+  assert.deepEqual(detectCanaryMentions("The function `zz_canary_marker_7f3a` handles this case.", canaries), canaries);
+  assert.deepEqual(detectCanaryMentions("Nothing special happens here.", canaries), []);
+
+  // --- repositorySymbolOverlap / findOverlappingRepositories: reuses course-migration.mjs's own jaccard over symbol-name sets ---
+  const repoA = { id: "repo-a", symbols: [{ name: "parseInput" }, { name: "validate" }, { name: "render" }] };
+  const repoB = { id: "repo-b", symbols: [{ name: "parseInput" }, { name: "validate" }, { name: "export" }] };
+  const repoC = { id: "repo-c", symbols: [{ name: "totallyUnrelatedThing" }, { name: "anotherOne" }] };
+  const overlapAB = repositorySymbolOverlap(repoA, repoB);
+  assert.ok(overlapAB >= DEFAULT_REPOSITORY_OVERLAP_THRESHOLD, `expected high overlap, got ${overlapAB}`);
+  const overlapAC = repositorySymbolOverlap(repoA, repoC);
+  assert.equal(overlapAC, 0);
+  const found = findOverlappingRepositories(repoA, [repoB, repoC]);
+  assert.deepEqual(found.map((item) => item.repositoryId), ["repo-b"]);
+
+  // --- classifyTaskContamination: canary leakage takes priority over a body-level verdict ---
+  const canaryTask = { body: structurallyDifferent, answerText: "Uses `zz_canary_marker_7f3a` as shown." };
+  const canaryResult = classifyTaskContamination(canaryTask, [original], canaries);
+  assert.equal(canaryResult.kind, ContaminationKind.CANARY_LEAKED);
+  assert.deepEqual(canaryResult.canaryLeaked, canaries);
+  const cleanTask = { body: structurallyDifferent, answerText: "No canary mentioned at all." };
+  assert.equal(classifyTaskContamination(cleanTask, [original], canaries).kind, ContaminationKind.CLEAN);
+
+  // --- separateMemorizedFromTransferred: headline rate computed only from clean tasks ---
+  const scoredTasks = [
+    { id: "t1", body: original, score: 0.95, answerText: "" },
+    { id: "t2", body: identifierRenamed, score: 0.9, answerText: "" },
+    { id: "t3", body: lightlyEdited, score: 0.92, answerText: "" },
+    { id: "t4", body: structurallyDifferent, score: 0.6, answerText: "" },
+    { id: "t5", body: "function entirelyDistinctThing() { return 42; }", score: 0.7, answerText: "" },
+    { id: "t6", body: "function alsoUnrelated() { return 1; }", score: 0.55, answerText: "Mentions `zz_canary_marker_7f3a` directly." },
+  ];
+  const corpusBodies = [original];
+  const separated = separateMemorizedFromTransferred(scoredTasks, corpusBodies, canaries);
+  assert.equal(separated.totalTasks, 6);
+  assert.equal(separated.contaminatedTaskCount, 4, "t1 exact, t2 renamed, t3 near-dup, t6 canary-leaked");
+  assert.equal(separated.cleanTaskCount, 2, "t4 and t5 are structurally unrelated and mention no canary");
+  assert.equal(separated.groundedTransferRateComputedFrom, 2);
+  assert.equal(separated.groundedTransferRate, Number(((0.6 + 0.7) / 2).toFixed(4)), "the headline rate excludes every contaminated task's score");
+  assert.deepEqual(separated.breakdown, {
+    "exact-duplicate": 1,
+    "near-duplicate": 1,
+    "identifier-renamed-clone": 1,
+    "canary-leaked": 1,
+    clean: 2,
+  });
+
+  // A fully-contaminated task set abstains honestly rather than reporting a rate computed from zero tasks.
+  const allContaminated = separateMemorizedFromTransferred(
+    [{ id: "t1", body: original, score: 1, answerText: "" }],
+    corpusBodies,
+    canaries,
+  );
+  assert.equal(allContaminated.groundedTransferRate, null);
+  assert.equal(allContaminated.groundedTransferRateComputedFrom, 0);
+
+  const rendered = renderContaminationReport(separated);
+  assert.match(rendered, /4\/6 task\(s\) contaminated/);
+  assert.match(rendered, /Grounded transfer rate \(clean tasks only, n=2\): 0\.65/);
+  assert.match(rendered, /exact-duplicate: 1/);
+  assert.match(rendered, /near-duplicate: 1/);
+  assert.match(rendered, /identifier-renamed-clone: 1/);
+  assert.match(rendered, /canary-leaked: 1/);
+  assert.match(rendered, /clean: 2/);
+  const renderedAbstain = renderContaminationReport(allContaminated);
+  assert.match(renderedAbstain, /insufficient-evidence/);
 });
