@@ -62,10 +62,6 @@ import { COGNITIVE_OFFLOAD_GUARD_VERSION, DEFAULT_MASTERY_FLOOR, EXPLANATION_GAT
 import { DISAGREEMENT_THRESHOLD, PROCESS_TRACE_ASSESSMENT_VERSION, assessProcessTrace, scoreDebuggingStep, scoreEvidenceSelectionStep, scoreNavigationStep, scoreRevisionStep, scoreTracingStep, validateRubricAgreement } from "../electron/process-trace-assessment.mjs";
 import { DEFAULT_COGNITIVE_BUDGET, PROGRESSIVE_DISCOVERY_VERSION, initializeDiscovery, measureComprehensionImpact, revealNext } from "../electron/progressive-discovery.mjs";
 import { COUNTEREXAMPLE_LAB_VERSION, applyCounterexampleResolution, buildCounterexampleLab, gradeCounterexamplePrediction, listCounterexampleLabs, publicCounterexampleLab, recordCounterexampleAttempt, runCounterexampleLab } from "../electron/counterexample-lab.mjs";
-import { MISCONCEPTION_REPAIR_GATE_VERSION, buildGatedMasteryEvidence, diagnoseClaimBeforePersistence, evaluateRepairCycle, gateClaimForPersistence, renderRepairGateDecision } from "../electron/misconception-repair-gate.mjs";
-import { HELP_POLICY_EVALUATION_VERSION, LOAD_STATES, REQUEST_CATEGORIES, RESPONSE_STYLES, classifyLoadState, classifyRequestCategory, evaluateHelpPolicies, helpPolicyCellKey, renderHelpPolicyReport, sanitizeHelpPolicyObservation, scoreHelpPolicyCell } from "../electron/help-policy-evaluation.mjs";
-import { ABSOLUTE_COLLAPSE_FLOOR, ASSISTANCE_CHANNELS, INDEPENDENT_DIMENSIONS, RELATIVE_COLLAPSE_DROP, SCAFFOLD_FADING_PROBE_VERSION, decideMasteryWithholding, evaluateScaffoldFadingProbe, renderScaffoldFadingReport, scoreDebuggingDimension, scoreIndependentDimension, verifyAssistanceWithdrawn } from "../electron/scaffold-fading-probe.mjs";
-import { EPISTEMIC_VIGILANCE_GATE_VERSION, FAILURE_MODE_CATEGORIES, VERIFICATION_STAGES, evaluateVerificationProcess, gatePatchAdoptionOnVerification, renderVerificationProcessReport, runFalsifyingTestStage, scoreEvidenceLocationStage, scoreFailureModePredictionStage } from "../electron/epistemic-vigilance-gate.mjs";
 import { ALGORITHM_TRACING_TASK_KIND, ALGORITHM_TRACING_TUTOR_VERSION, algorithmTracingPassRate, buildAlgorithmTracingTask, combineAlgorithmTracingGrades, gradeHiddenTestStage, gradeRetrievalStage, gradeStateStage, measureAlgorithmTransfer, nextAlgorithmHint, publicAlgorithmTracingTask, recordAlgorithmTracingAttempt } from "../electron/algorithm-tracing-tutor.mjs";
 import { MODEL_ADVISORY_SUBJECT, MODEL_ADVISORY_VERSION, buildModelAdvisory, classifyModelLicense, evaluateModelForQuarantine, signModelAdvisory, verifyModelAdvisory } from "../electron/model-advisory.mjs";
 import { SEQUENTIAL_CAUSAL_EXPERIMENT_VERSION, analyzeSubgroups, preregisterSequentialExperiment, runSequentialLooks, sequentialAttritionSensitivity, sequentialCriticalValue, verifyAgainstPreregistration } from "../electron/sequential-causal-experiments.mjs";
@@ -97,9 +93,7 @@ import { DECLARED_ATTRIBUTES, NESTED_TUTORING_TELEMETRY_VERSION, OPERATION_KINDS
 import { DOMAINS, EVALUATION_SCALE_VERSION, RATING_LEVELS, SCORE_DIRECTIONS, levelForScore, normalizeAccessibilityScale, normalizeExplanationScale, normalizeQuizScale, normalizeRetentionScale, normalizeTracingScale, normalizeTransferScale, renderNormalizedScale } from "../electron/evaluation-scale.mjs";
 import { ASSISTANCE_OBSERVATION_FIELDS, ASSISTANCE_TYPES, CONTROL_ASSISTANCE_TYPE, COUNTERBALANCED_ASSISTANCE_VERSION, METRIC_HIGHER_IS_BETTER, OUTCOME_METRICS, buildAssistanceComparison, buildCounterbalancedSchedule, compareAllOutcomes, compareAssistanceTypes, recordAssistanceOutcome, sanitizeAssistanceObservation } from "../electron/counterbalanced-assistance-experiments.mjs";
 import { ROLLBACK_DRILL_KINDS, ROLLBACK_DRILL_VERSION, drillBadLesson, drillFailedMigration, drillRubricDrift, drillStaleIndex, drillUnsafeLocalModel, renderRollbackDrillSuite, runRollbackDrillSuite } from "../electron/curriculum-rollback-drills.mjs";
-import { ESCALATION_THRESHOLD, MAX_TRAJECTORY_TURNS, MIN_TRAJECTORY_TURNS, MULTI_TURN_SAFETY_VERSION, TRAJECTORY_FAILURE_MODES, detectDependencyEscalation, detectGoalDrift, detectMisconceptionReinforcement, detectProgressiveLeakage, detectScaffoldAbandonment, renderTrajectorySafety, scoreTrajectorySafety, validateTrajectoryLength } from "../electron/multi-turn-safety.mjs";
-import { ENGAGEMENT_PROXIES, PROXY_RISE_THRESHOLD, REWARD_HACKING_GUARD_VERSION, SATISFACTION_STRENGTH_FLOOR, detectRewardHacking, guardPromotionAgainstRewardHacking, measureDialogueLengthProxy, measureEngagementProxies, measureGenuineLearningSignals, measureImmediatePassRateProxy, measureRequestVolumeProxy, measureSatisfactionProxy, renderRewardHackingReport } from "../electron/reward-hacking-guard.mjs";
-import { EQUITY_GAP_THRESHOLD, HINT_BURDEN_THRESHOLD, OUTCOME_AXES, SUBGROUP_CALIBRATION_GATE_VERSION, SUBGROUP_DIMENSIONS, computeLearnerOutcomes, evaluateSubgroupCalibration, evaluateSubgroupCell, groupBySubgroupValue, learnerFalseMasteryOutcome, learnerHintBurdenOutcome, renderSubgroupCalibrationReport } from "../electron/subgroup-calibration-gate.mjs";
+import { GOVERNANCE_RECORD_FACETS, LEARNING_GOVERNANCE_RECORD_FORMAT, LEARNING_GOVERNANCE_RECORD_SUBJECT, LEARNING_GOVERNANCE_RECORD_VERSION, buildGovernanceRecord, buildGovernanceRecordContent, decideDeprecation, governanceAdjudications, governanceEfficacySafetyAccessibility, governanceEvaluatorCalibration, governanceRecordDigest, governanceSubjectRegistered, loadGovernanceChain, openGovernancePrivacyBudget, persistGovernanceRecord, renderGovernanceRecord, spendGovernancePrivacyBudget, verifyGovernanceChain, verifyGovernanceRecord } from "../electron/learning-governance-record.mjs";
 import { addEvidence, completeDiagnostic, recommend } from "../src/learning.ts";
 import { DURABLE_VERSION, inspectDurable, readDurable, sweepInterruptedWrites, writeDurable } from "../electron/durable-store.mjs";
 import { BUILD_TYPE, DEFAULT_LICENSE_POLICY, IN_TOTO_STATEMENT_TYPE, SBOM_SPEC_VERSION, SLSA_PREDICATE_TYPE, SUPPLY_CHAIN_VERSION, buildProvenance, buildSbom, compareBuilds, describeScan, firstByteDifference, hashesFromIntegrity, importNpmAudit, licenseBreakdown, publicSupplyChainReport, purlFor, runtimeComponents, satisfiesRange, sbomDigest, scanDependencies, scanPasses, signProvenance, verifyProvenance } from "../electron/supply-chain.mjs";
@@ -13838,911 +13832,255 @@ test("curriculum and model rollback drills detect an injected bad lesson, unsafe
   assert.match(renderedPartial, /Missed: bad-lesson/);
 });
 
-test("cumulative pedagogical safety scores 8-12-turn trajectories for progressive answer leakage, misconception reinforcement, scaffold abandonment, dependency escalation, and goal drift even when every single turn looks locally safe", () => {
-  assert.equal(MULTI_TURN_SAFETY_VERSION, 1);
-  assert.deepEqual([...TRAJECTORY_FAILURE_MODES], [
-    "progressive-answer-leakage",
-    "misconception-reinforcement",
-    "scaffold-abandonment",
-    "dependency-escalation",
-    "goal-drift",
+test("longitudinal learning-governance records chain consent, curriculum/model versions, calibration, interventions, adjudications, privacy budgets, efficacy, safety, accessibility, and a deprecation decision into one signed, tamper-evident series", async (context) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "governance-record-"));
+  context.after(() => rm(directory, { recursive: true, force: true }));
+
+  assert.equal(governanceSubjectRegistered(), true);
+  assert.equal(SIGNABLE_SUBJECTS.includes(LEARNING_GOVERNANCE_RECORD_SUBJECT), true);
+  assert.equal(GOVERNANCE_RECORD_FACETS.length, 10);
+  assert.deepEqual(GOVERNANCE_RECORD_FACETS, [
+    "consent", "curriculumVersion", "modelVersion", "evaluatorCalibration", "interventions",
+    "adjudications", "privacyBudget", "efficacy", "safety", "accessibility",
   ]);
-  assert.equal(MIN_TRAJECTORY_TURNS, 8);
-  assert.equal(MAX_TRAJECTORY_TURNS, 12);
 
-  // --- Length abstention: this item's own stated bounds are enforced honestly ---
-  assert.equal(validateTrajectoryLength(new Array(7).fill({})).ok, false);
-  assert.equal(validateTrajectoryLength(new Array(7).fill({})).reason, "too-few-turns");
-  assert.equal(validateTrajectoryLength(new Array(13).fill({})).ok, false);
-  assert.equal(validateTrajectoryLength(new Array(13).fill({})).reason, "too-many-turns");
-  assert.equal(validateTrajectoryLength(new Array(10).fill({})).ok, true);
-  const tooShort = scoreTrajectorySafety(new Array(5).fill({}));
-  assert.equal(tooShort.abstained, true);
-  assert.equal(tooShort.reason, "too-few-turns");
-  assert.equal(tooShort.findings, null);
-
-  // --- Progressive answer leakage: no single turn leaks, but three declared
-  // fragments across the trajectory add up to the whole withheld answer ---
-  const leakyTurns = new Array(9).fill(null).map(() => ({ response: { text: "ordinary response" } }));
-  leakyTurns[2] = { response: { text: "takes one argument" }, revealsFragmentId: "input-shape" };
-  leakyTurns[5] = { response: { text: "branches twice" }, revealsFragmentId: "branch-count" };
-  leakyTurns[8] = { response: { text: "starts at main()" }, revealsFragmentId: "entry-point" };
-  const leakage = detectProgressiveLeakage(leakyTurns, { totalFragments: ["input-shape", "branch-count", "entry-point", "return-type", "edge-case"] });
-  assert.equal(leakage.anySingleTurnLeak, false, "no single turn trips answer-guard.mjs's own per-response check");
-  assert.equal(leakage.cumulativeLeak, true, "three of five fragments is >= the 60% default threshold");
-  assert.equal(leakage.detected, true);
-  assert.deepEqual(leakage.revealedFragments.sort(), ["branch-count", "entry-point", "input-shape"]);
-  // A trajectory that reveals only one fragment stays clear.
-  const mildTurns = leakyTurns.map((turn, index) => (index === 2 ? turn : { response: { text: "ordinary response" } }));
-  const mildLeakage = detectProgressiveLeakage(mildTurns, { totalFragments: ["input-shape", "branch-count", "entry-point", "return-type", "edge-case"] });
-  assert.equal(mildLeakage.detected, false);
-  // A single-turn structural leak is still caught exactly as answer-guard.mjs would catch it.
-  const structurallyLeaky = leakyTurns.map((turn, index) => (index === 4 ? { response: { answerKey: "42" } } : turn));
-  assert.equal(detectProgressiveLeakage(structurallyLeaky, { totalFragments: [] }).anySingleTurnLeak, true);
-
-  // --- Misconception reinforcement: named once, recurs with no repair in between ---
-  const reinforcingTurns = new Array(8).fill(null).map(() => ({}));
-  reinforcingTurns[1] = { misconceptionFinding: "mutation-vs-copy" };
-  reinforcingTurns[4] = { misconceptionFinding: "mutation-vs-copy" };
-  const reinforcement = detectMisconceptionReinforcement(reinforcingTurns);
-  assert.equal(reinforcement.detected, true);
-  assert.equal(reinforcement.reinforced.length, 1);
-  assert.equal(reinforcement.reinforced[0].misconceptionId, "mutation-vs-copy");
-  // The same recurrence, but with an intervening repair, is not reinforcement.
-  const repairedTurns = reinforcingTurns.map((turn, index) => (index === 2 ? { repairedMisconceptionId: "mutation-vs-copy" } : turn));
-  assert.equal(detectMisconceptionReinforcement(repairedTurns).detected, false);
-
-  // --- Scaffold abandonment: a run of unscaffolded turns, none earned ---
-  const abandoningTurns = new Array(8).fill(null).map(() => ({ scaffoldUsed: true }));
-  abandoningTurns[0] = { scaffoldUsed: true };
-  abandoningTurns[1] = { scaffoldUsed: true };
-  abandoningTurns[2] = { scaffoldUsed: true };
-  abandoningTurns[3] = { scaffoldUsed: false, earnedUnlock: false };
-  abandoningTurns[4] = { scaffoldUsed: false, earnedUnlock: false };
-  abandoningTurns[5] = { scaffoldUsed: false, earnedUnlock: false };
-  abandoningTurns[6] = { scaffoldUsed: false, earnedUnlock: false };
-  abandoningTurns[7] = { scaffoldUsed: false, earnedUnlock: false };
-  const abandonment = detectScaffoldAbandonment(abandoningTurns);
-  assert.equal(abandonment.detected, true);
-  assert.equal(abandonment.abandonedRuns.length, 1);
-  assert.equal(abandonment.abandonedRuns[0].start, 3);
-  // The identical drop, but earned by a passing prediction/explanation, is not abandonment.
-  const earnedTurns = abandoningTurns.map((turn, index) => (index === 3 ? { scaffoldUsed: false, earnedUnlock: true } : turn));
-  assert.equal(detectScaffoldAbandonment(earnedTurns).detected, false);
-
-  // --- Dependency escalation: classifyAssistanceSeeking's own per-turn
-  // classification, reused unmodified, compared first half vs. second half ---
-  const escalatingTurns = [
-    { requestText: "How does this module work?" },
-    { requestText: "What does this function return?" },
-    { requestText: "Can you explain the call chain?" },
-    { requestText: "What file is this defined in?" },
-    { requestText: "Just give me the answer." },
-    { requestText: "Write it for me." },
-    { requestText: "Give me the full solution." },
-    { requestText: "Fix it for me." },
+  // --- governanceEvaluatorCalibration: process-trace-assessment.mjs's own
+  // validateRubricAgreement, reused unmodified under this record's facet name.
+  const agreeingPairs = [
+    { id: "a", automatedScore: 0.8, automatedPassed: true, instructorScore: 0.81, instructorPassed: true },
+    { id: "b", automatedScore: 0.5, automatedPassed: false, instructorScore: 0.52, instructorPassed: false },
+    { id: "c", automatedScore: 0.9, automatedPassed: true, instructorScore: 0.89, instructorPassed: true },
   ];
-  const escalation = detectDependencyEscalation(escalatingTurns);
-  assert.equal(escalation.firstHalfRate, 0);
-  assert.equal(escalation.secondHalfRate, 1);
-  assert.equal(escalation.delta, 1);
-  assert.equal(escalation.detected, true);
-  assert.ok(escalation.delta >= ESCALATION_THRESHOLD);
-  // A flat, non-escalating trajectory is clear.
-  const flatTurns = escalatingTurns.map((turn, index) => (index >= 4 ? { requestText: "How does this module work?" } : turn));
-  assert.equal(detectDependencyEscalation(flatTurns).detected, false);
+  const drivenCalibration = governanceEvaluatorCalibration(agreeingPairs);
+  assert.equal(drivenCalibration.verdict, "rubric-agrees");
 
-  // --- Goal drift: a declared goal the trajectory wanders from, with no revision recorded ---
-  const driftingTurns = new Array(8).fill(null).map(() => ({ turnGoalId: "architecture" }));
-  driftingTurns[5] = { turnGoalId: "security" };
-  driftingTurns[6] = { turnGoalId: "security" };
-  const drift = detectGoalDrift(driftingTurns, "architecture");
-  assert.equal(drift.declaredGoal, "architecture");
-  assert.equal(drift.detected, true);
-  assert.equal(drift.driftedTurns.length, 2);
-  assert.equal(drift.driftedTurns[0].index, 5);
-  // The exact same wander, but with an explicit revision recorded first, is not drift.
-  const revisedTurns = driftingTurns.map((turn, index) => {
-    if (index === 5) return { turnGoalId: "security", goalRevisedTo: "security" };
-    if (index >= 6) return { turnGoalId: "security" };
-    return { turnGoalId: "architecture" };
+  // --- governanceAdjudications: curriculum-review.mjs's own measureOverrideRate,
+  // reused unmodified under this record's facet name.
+  const adjudicationEvents = [
+    { kind: "curriculum-review", classification: "confirmation", reviewKind: "unsafe-hint" },
+    { kind: "curriculum-review", classification: "confirmation", reviewKind: "unsafe-hint" },
+    { kind: "curriculum-review", classification: "override", reviewKind: "unsafe-hint" },
+  ];
+  const adjudicationFacet = governanceAdjudications(adjudicationEvents, "unsafe-hint");
+  assert.equal(adjudicationFacet.overrides, 1);
+  assert.equal(adjudicationFacet.confirmations, 2);
+
+  // --- decideDeprecation: exactly one of two named reasons whenever
+  // deprecate is true; never a bare true with no evidence attached ---------
+  const noReason = decideDeprecation({ curriculumDecision: { promote: true }, modelQuarantine: { quarantined: false, reasons: [] } });
+  assert.equal(noReason.deprecate, false);
+  assert.deepEqual(noReason.reasons, []);
+
+  const unpromotable = decideDeprecation({ curriculumDecision: { promote: false, reason: "2 gate(s) failed: privacy, provenance." }, modelQuarantine: null });
+  assert.equal(unpromotable.deprecate, true);
+  assert.deepEqual(unpromotable.reasons, [{ reason: "curriculum-not-promotable", detail: "2 gate(s) failed: privacy, provenance." }]);
+
+  const quarantinedModel = decideDeprecation({
+    curriculumDecision: { promote: true },
+    modelQuarantine: { quarantined: true, reasons: [{ gate: "license", detail: "Licensed GPL-3.0, which the policy denies." }] },
   });
-  assert.equal(detectGoalDrift(revisedTurns, "architecture").detected, false, "turn 5 itself revises the goal before naming the new one, and every later turn matches the revised goal");
-  assert.equal(detectGoalDrift(revisedTurns, "architecture").driftedTurns.length, 0);
-  // An unrecognized declared goal id is honestly null, never guessed.
-  assert.equal(detectGoalDrift(driftingTurns, "not-a-real-goal").declaredGoal, null);
+  assert.equal(quarantinedModel.deprecate, true);
+  assert.deepEqual(quarantinedModel.reasons, [{ reason: "model-quarantined", detail: "Licensed GPL-3.0, which the policy denies." }]);
 
-  // --- Full trajectory: all five findings reported independently, never blended ---
-  const fullTrajectory = new Array(9).fill(null).map(() => ({
-    response: { text: "ordinary" },
-    requestText: "How does this module work?",
-    turnGoalId: "architecture",
-    scaffoldUsed: true,
-  }));
-  fullTrajectory[2] = { ...fullTrajectory[2], revealsFragmentId: "input-shape" };
-  fullTrajectory[5] = { ...fullTrajectory[5], revealsFragmentId: "branch-count", misconceptionFinding: "mutation-vs-copy" };
-  fullTrajectory[8] = { ...fullTrajectory[8], revealsFragmentId: "entry-point", misconceptionFinding: "mutation-vs-copy", turnGoalId: "security" };
-  const fullReport = scoreTrajectorySafety(fullTrajectory, {
-    leakage: { totalFragments: ["input-shape", "branch-count", "entry-point", "return-type", "edge-case"] },
-    declaredGoalId: "architecture",
+  const bothReasons = decideDeprecation({
+    curriculumDecision: { promote: false, reason: "answer-leakage failed." },
+    modelQuarantine: { quarantined: true, reasons: [{ gate: "artifact-integrity", detail: "tampered artifact." }] },
   });
-  assert.equal(fullReport.abstained, false);
-  assert.equal(fullReport.turnCount, 9);
-  assert.equal(fullReport.findings["progressive-answer-leakage"].detected, true);
-  assert.equal(fullReport.findings["misconception-reinforcement"].detected, true);
-  assert.equal(fullReport.findings["goal-drift"].detected, true);
-  assert.deepEqual(fullReport.detectedModes.sort(), ["goal-drift", "misconception-reinforcement", "progressive-answer-leakage"].sort());
-  assert.equal(fullReport.anyDetected, true);
-  // A clean, flat trajectory with no cross-turn pattern is clear on every mode.
-  const cleanTrajectory = new Array(8).fill(null).map(() => ({
-    response: { text: "ordinary" },
-    requestText: "How does this module work?",
-    turnGoalId: "architecture",
-    scaffoldUsed: true,
-  }));
-  const cleanReport = scoreTrajectorySafety(cleanTrajectory, { declaredGoalId: "architecture" });
-  assert.equal(cleanReport.anyDetected, false);
-  assert.deepEqual(cleanReport.detectedModes, []);
+  assert.equal(bothReasons.deprecate, true);
+  assert.equal(bothReasons.reasons.length, 2);
 
-  const rendered = renderTrajectorySafety(fullReport);
-  assert.match(rendered, /progressive-answer-leakage: DETECTED/);
-  assert.match(rendered, /scaffold-abandonment: clear/);
-  const renderedAbstained = renderTrajectorySafety(tooShort);
-  assert.match(renderedAbstained, /abstained — too-few-turns/);
-});
-
-test("reward-hacking guard flags engagement proxies that rise without corroborating retention/transfer gains, and forbids promotion when any proxy is hacked", () => {
-  const base = Date.parse("2026-08-01T09:00:00.000Z");
-  const at = (minutes) => new Date(base + minutes * 60_000).toISOString();
-
-  assert.equal(REWARD_HACKING_GUARD_VERSION, 1);
-  assert.deepEqual(ENGAGEMENT_PROXIES, ["dialogue-length", "request-volume", "satisfaction", "immediate-pass-rate"]);
-  assert.equal(PROXY_RISE_THRESHOLD, 0.2);
-  assert.equal(SATISFACTION_STRENGTH_FLOOR, 0.7);
-
-  // --- Below the sample floor: a proxy honestly abstains, never guesses --
-  const tooFew = measureDialogueLengthProxy([{ at: at(0), kind: "explanation", correct: true }]);
-  assert.equal(tooFew.reason, "insufficient-evidence");
-  assert.equal(tooFew.rise, null);
-
-  // --- dialogue-length proxy: turns per task rises from early to late ----
-  const dialogueEvents = [
-    { at: at(0), kind: "explanation", correct: true, turns: 2 },
-    { at: at(1), kind: "explanation", correct: true, turns: 2 },
-    { at: at(2), kind: "explanation", correct: true, turns: 2 },
-    { at: at(3), kind: "explanation", correct: true, turns: 2 },
-    { at: at(4), kind: "explanation", correct: true, turns: 6 },
-    { at: at(5), kind: "explanation", correct: true, turns: 6 },
-    { at: at(6), kind: "explanation", correct: true, turns: 6 },
-    { at: at(7), kind: "explanation", correct: true, turns: 6 },
-  ];
-  const dialogueProxy = measureDialogueLengthProxy(dialogueEvents);
-  assert.equal(dialogueProxy.early, 2);
-  assert.equal(dialogueProxy.late, 6);
-  assert.equal(dialogueProxy.rise, 2);
-  assert.equal(dialogueProxy.reason, null);
-
-  // --- request-volume proxy: requestCount rises; an event that never
-  // declared one is excluded entirely, not treated as zero requests ------
-  const requestEvents = [
-    { at: at(0), kind: "explanation", correct: true, requestCount: 1 },
-    { at: at(1), kind: "explanation", correct: true, requestCount: 1 },
-    { at: at(2), kind: "explanation", correct: true, requestCount: 1 },
-    { at: at(3), kind: "explanation", correct: true },
-    { at: at(4), kind: "explanation", correct: true, requestCount: 5 },
-    { at: at(5), kind: "explanation", correct: true, requestCount: 5 },
-    { at: at(6), kind: "explanation", correct: true, requestCount: 5 },
-  ];
-  const requestProxy = measureRequestVolumeProxy(requestEvents);
-  assert.equal(requestProxy.samples, 6, "the event with no declared requestCount must not be counted");
-  assert.equal(requestProxy.early, 1);
-  assert.equal(requestProxy.late, 5);
-  assert.equal(requestProxy.rise, 4);
-
-  // --- satisfaction proxy: self-report strength rises from early to late,
-  // read from the exact evidence shape misconception.mjs already reads ---
-  const learnerState = {
-    mastery: {
-      "skill-a": {
-        evidence: [
-          { kind: "self-report", strength: 0.4, createdAt: at(0) },
-          { kind: "self-report", strength: 0.4, createdAt: at(1) },
-          { kind: "self-report", strength: 0.4, createdAt: at(2) },
-          { kind: "self-report", strength: 0.9, createdAt: at(3) },
-          { kind: "self-report", strength: 0.9, createdAt: at(4) },
-          { kind: "self-report", strength: 0.9, createdAt: at(5) },
-        ],
-      },
-    },
-  };
-  const satisfactionProxy = measureSatisfactionProxy(learnerState);
-  assert.equal(satisfactionProxy.early, 0);
-  assert.equal(satisfactionProxy.late, 1);
-  assert.equal(satisfactionProxy.rise, 1);
-
-  // --- immediate-pass-rate proxy: correctness rises from early to late ---
-  const passRateEvents = [
-    { at: at(0), kind: "explanation", correct: false },
-    { at: at(1), kind: "explanation", correct: false },
-    { at: at(2), kind: "explanation", correct: false },
-    { at: at(3), kind: "explanation", correct: false },
-    { at: at(4), kind: "explanation", correct: true },
-    { at: at(5), kind: "explanation", correct: true },
-    { at: at(6), kind: "explanation", correct: true },
-    { at: at(7), kind: "explanation", correct: true },
-  ];
-  const passRateProxy = measureImmediatePassRateProxy(passRateEvents);
-  assert.equal(passRateProxy.early, 0);
-  assert.equal(passRateProxy.late, 1);
-  assert.equal(passRateProxy.rise, 1);
-
-  // --- measureEngagementProxies: all four, reported independently --------
-  const allProxies = measureEngagementProxies({ events: passRateEvents, learnerState });
-  assert.deepEqual(Object.keys(allProxies).sort(), ["dialogue-length", "immediate-pass-rate", "request-volume", "satisfaction"]);
-
-  // --- Uncorroborated: every rising proxy is flagged hacked --------------
-  const noLearningGain = measureGenuineLearningSignals({ events: [], learnerState: null, skillGraph: null });
-  assert.equal(noLearningGain.retention.available, false);
-  assert.equal(noLearningGain.transfer.available, false);
-  const risingProxies = {
-    "dialogue-length": dialogueProxy,
-    "request-volume": requestProxy,
-    satisfaction: satisfactionProxy,
-    "immediate-pass-rate": passRateProxy,
-  };
-  const hackedResult = detectRewardHacking(risingProxies, noLearningGain);
-  assert.equal(hackedResult.anyHacked, true);
-  assert.deepEqual(hackedResult.hackedProxies.slice().sort(), ENGAGEMENT_PROXIES.slice().sort());
-  assert.equal(hackedResult.corroborated, false);
-  for (const finding of hackedResult.findings) {
-    assert.match(finding.reason, /without a corroborating rise in retention or transfer/);
-  }
-
-  // --- Corroborated: the same rising proxies are not reward hacking when
-  // a real transfer gain backs them up -------------------------------------
-  const transferEvents = [
-    { at: at(0), kind: "prediction", path: "src/a.py", correct: true },
-    { at: at(1), kind: "prediction", path: "src/a.py", correct: true },
-    { at: at(2), kind: "prediction", path: "src/a.py", correct: true },
-    { at: at(3), kind: "prediction", path: "src/b.py", correct: true },
-    { at: at(4), kind: "prediction", path: "src/c.py", correct: false },
-    { at: at(5), kind: "prediction", path: "src/d.py", correct: false },
-  ];
-  const corroboratingSignals = measureGenuineLearningSignals({ events: transferEvents, learnerState: null, skillGraph: null, studiedPaths: ["src/a.py"] });
-  assert.equal(corroboratingSignals.transfer.available, true);
-  assert.ok(corroboratingSignals.transfer.gap > 0, JSON.stringify(corroboratingSignals.transfer));
-  const notHackedResult = detectRewardHacking(risingProxies, corroboratingSignals);
-  assert.equal(notHackedResult.anyHacked, false);
-  assert.equal(notHackedResult.corroborated, true);
-  assert.deepEqual(notHackedResult.hackedProxies, []);
-
-  // --- A proxy that does not rise is never flagged, corroborated or not --
-  const steadyProxy = measureImmediatePassRateProxy([
-    { at: at(0), kind: "explanation", correct: true },
-    { at: at(1), kind: "explanation", correct: true },
-    { at: at(2), kind: "explanation", correct: true },
-    { at: at(3), kind: "explanation", correct: true },
-    { at: at(4), kind: "explanation", correct: true },
-    { at: at(5), kind: "explanation", correct: true },
-  ]);
-  assert.equal(steadyProxy.rise, 0);
-  const steadyResult = detectRewardHacking({ ...risingProxies, "immediate-pass-rate": steadyProxy }, noLearningGain);
-  assert.equal(steadyResult.findings.find((finding) => finding.proxy === "immediate-pass-rate").hacked, false);
-
-  // --- guardPromotionAgainstRewardHacking: adds exactly one more named
-  // gate to curriculum-portfolio.mjs's own evaluatePromotionGates, and
-  // forbids promotion when a proxy is hacked -------------------------------
-  const baseContent = {
-    effectiveness: { retention: { modelVerdict: "not-enough-reviews" }, transfer: { verdict: "insufficient-evidence" } },
-    calibration: { assessed: 0 },
-    accessibility: [],
-    privacy: null,
-    provenance: null,
+  // --- governanceEfficacySafetyAccessibility: reads efficacy/safety/accessibility
+  // straight out of curriculum-portfolio.mjs's own six gates, never re-derived --
+  const minimalPortfolioContent = {
+    effectiveness: { retention: { modelVerdict: "model-matches-learner" }, transfer: { verdict: "genuine-transfer" } },
+    calibration: { assessed: 3, meanBrier: 0.1 },
+    accessibility: [{ ok: true, path: "keyboard-only", equivalence: { verdict: "equivalent" } }],
+    privacy: { staticOfflineModeSafe: true, dynamicVerdict: { offlineAtRuntime: true }, agree: true },
+    provenance: { accepted: true },
     leakage: { clean: true, found: [] },
   };
-  const hackedGuard = guardPromotionAgainstRewardHacking(baseContent, { events: passRateEvents, learnerState });
-  assert.equal(hackedGuard.gates.length, 7, "six portfolio gates plus exactly one new reward-hacking gate");
-  assert.deepEqual(hackedGuard.gates.map((gate) => gate.gate).sort(), ["accessibility", "answer-leakage", "calibration", "effectiveness", "privacy", "provenance", "reward-hacking"]);
-  const rewardGate = hackedGuard.gates.find((gate) => gate.gate === "reward-hacking");
-  assert.equal(rewardGate.verdict, "fail");
-  assert.ok(rewardGate.detail.hackedProxies.length > 0);
-
-  // A clean, non-rising proxy set passes the new gate.
-  const cleanGuard = guardPromotionAgainstRewardHacking(baseContent, { events: [], learnerState: null });
-  const cleanGate = cleanGuard.gates.find((gate) => gate.gate === "reward-hacking");
-  assert.equal(cleanGate.verdict, "pass");
-
-  // --- Rendering -----------------------------------------------------------
-  const rendered = renderRewardHackingReport(allProxies, noLearningGain, hackedResult);
-  assert.match(rendered, /REWARD HACKING DETECTED/);
-  assert.match(rendered, /dialogue-length/);
-});
-
-test("the misconception repair gate blocks persistence of an unverified misconception and only releases it after a genuine predict-observe-reassess cycle completes", () => {
-  assert.equal(MISCONCEPTION_REPAIR_GATE_VERSION, 1);
-
-  // --- Diagnosis before persistence reuses misconception.mjs's own
-  // detectMisconceptions unmodified ---------------------------------------
-  const cleanClaim = diagnoseClaimBeforePersistence("I ran it and saw the real output change in place.");
-  assert.equal(cleanClaim.clean, true);
-  assert.deepEqual(cleanClaim.findings, []);
-
-  const misconceivedClaim = diagnoseClaimBeforePersistence("There is only one caller for this function so it is safe to change.");
-  assert.equal(misconceivedClaim.clean, false);
-  assert.equal(misconceivedClaim.findings[0].id, "single-caller");
-
-  // --- A completely unknown misconception id never produces a "repaired"
-  // verdict, named distinctly from every other failure ---------------------
-  const unknownCycle = evaluateRepairCycle("not-a-real-misconception", {});
-  assert.equal(unknownCycle.repaired, false);
-  assert.equal(unknownCycle.reason, "unknown-misconception");
-  assert.equal(unknownCycle.stages, null);
-
-  const lab = buildCounterexampleLab("single-caller");
-  assert.ok(lab);
-
-  // --- Stage 1 fails: a prediction exists but for a different lab run —
-  // not accepted as "predicted before this run" ----------------------------
-  const realPrediction = gradeCounterexamplePrediction(lab, "model-correct", 0.8);
-  const unrelatedRun = { available: true, labId: "counterexample-some-other-misconception", misconceptionId: "single-caller", status: "ok", observed: "2", resolved: true };
-  const noPredictionCycle = evaluateRepairCycle("single-caller", { predictionGrade: realPrediction, run: unrelatedRun, reassessmentText: "I now see every caller matters." });
-  assert.equal(noPredictionCycle.repaired, false);
-  assert.equal(noPredictionCycle.stages.predicted, false);
-  assert.match(noPredictionCycle.reason, /No prediction was committed/);
-
-  // --- Stage 2 fails: a matched prediction, but the run itself did not
-  // resolve the misconception ----------------------------------------------
-  const unresolvedRun = { available: true, labId: lab.id, misconceptionId: "single-caller", status: "ok", observed: "1", resolved: false };
-  const noObservationCycle = evaluateRepairCycle("single-caller", { predictionGrade: realPrediction, run: unresolvedRun, reassessmentText: "I now see every caller matters." });
-  assert.equal(noObservationCycle.repaired, false);
-  assert.equal(noObservationCycle.stages.predicted, true);
-  assert.equal(noObservationCycle.stages.observed, false);
-  assert.match(noObservationCycle.reason, /did not resolve/);
-
-  // --- Stage 3 fails: prediction and observation both hold, but the
-  // learner's own post-observation restatement still names the same
-  // misconception — the lab resolved, but the learner did not -------------
-  const resolvedRun = { available: true, labId: lab.id, misconceptionId: "single-caller", status: "ok", observed: "2", resolved: true };
-  const stillHeldCycle = evaluateRepairCycle("single-caller", { predictionGrade: realPrediction, run: resolvedRun, reassessmentText: "OK but there is still only one caller for this." });
-  assert.equal(stillHeldCycle.repaired, false);
-  assert.equal(stillHeldCycle.stages.predicted, true);
-  assert.equal(stillHeldCycle.stages.observed, true);
-  assert.equal(stillHeldCycle.stages.reassessed, false);
-  assert.match(stillHeldCycle.reason, /reassessment still names/);
-
-  // --- A full cycle: matched prediction, resolved run, and a reassessment
-  // that no longer triggers the detector -----------------------------------
-  const repairedCycle = evaluateRepairCycle("single-caller", { predictionGrade: realPrediction, run: resolvedRun, reassessmentText: "I see now that two different functions both call record(), so result changed on the second call." });
-  assert.equal(repairedCycle.repaired, true);
-  assert.equal(repairedCycle.reason, null);
-  assert.deepEqual(repairedCycle.stages, { predicted: true, observed: true, reassessed: true });
-
-  // --- The actual persistence gate: a clean claim is never blocked --------
-  const cleanGate = gateClaimForPersistence("I ran it and saw the real output change in place.", {});
-  assert.equal(cleanGate.allowed, true);
-  assert.deepEqual(cleanGate.blockedMisconceptions, []);
-
-  // A misconceived claim with no repair cycle on record is blocked.
-  const blockedGate = gateClaimForPersistence("There is only one caller for this function so it is safe to change.", {});
-  assert.equal(blockedGate.allowed, false);
-  assert.deepEqual(blockedGate.blockedMisconceptions, ["single-caller"]);
-  assert.match(blockedGate.reason, /unverified misconception/);
-
-  // The same claim is allowed once its repair cycle is on record as repaired.
-  const releasedGate = gateClaimForPersistence("There is only one caller for this function so it is safe to change.", { "single-caller": repairedCycle });
-  assert.equal(releasedGate.allowed, true);
-  assert.deepEqual(releasedGate.blockedMisconceptions, []);
-
-  // A repair cycle on record but not yet actually repaired still blocks.
-  const stillBlockedGate = gateClaimForPersistence("There is only one caller for this function so it is safe to change.", { "single-caller": stillHeldCycle });
-  assert.equal(stillBlockedGate.allowed, false);
-
-  // --- Mastery evidence is never built on trust: only a confirmed repair
-  // cycle releases evidence through counterexample-lab.mjs's own
-  // buildMasteryEvidence, unmodified ----------------------------------------
-  const blockedEvidence = buildGatedMasteryEvidence("single-caller", { predictionGrade: realPrediction, run: unresolvedRun, reassessmentText: "still only one caller" });
-  assert.equal(blockedEvidence.evidence, null);
-  assert.equal(blockedEvidence.cycle.repaired, false);
-
-  const releasedEvidence = buildGatedMasteryEvidence("single-caller", { predictionGrade: realPrediction, run: resolvedRun, reassessmentText: "I see now that two different functions both call record(), so result changed on the second call." });
-  assert.ok(releasedEvidence.evidence);
-  assert.equal(releasedEvidence.evidence.kind, "diagnostic");
-  assert.equal(releasedEvidence.cycle.repaired, true);
-
-  // --- Rendering -----------------------------------------------------------
-  assert.match(renderRepairGateDecision(blockedGate), /PERSISTENCE BLOCKED/);
-  assert.match(renderRepairGateDecision(cleanGate), /PERSISTENCE ALLOWED/);
-});
-
-test("help-policy evaluation scores verification/stepwise/socratic/direct-answer responses separately across request category and confusion/load state, never averaging into one global style", () => {
-  assert.equal(HELP_POLICY_EVALUATION_VERSION, 1);
-  assert.deepEqual(RESPONSE_STYLES, ["verification", "stepwise", "socratic", "direct-answer"]);
-  assert.deepEqual(REQUEST_CATEGORIES, ["conceptual", "debugging", "implementation"]);
-  assert.deepEqual(LOAD_STATES, ["low", "high"]);
-
-  // --- Request category reuses cognitive-offload-guard.mjs's own
-  // classifyRequestObjective and maps onto this item's three buckets -------
-  assert.equal(classifyRequestCategory("why is this throwing an exception when I trace the flow"), "debugging");
-  assert.equal(classifyRequestCategory("what is the module boundary design here"), "implementation");
-  assert.equal(classifyRequestCategory("how do I improve the throughput and cache performance"), "implementation");
-  assert.equal(classifyRequestCategory("give me an overview of the structure and entry point"), "conceptual");
-  assert.equal(classifyRequestCategory("is this input properly validated and sanitized"), "conceptual");
-  assert.equal(classifyRequestCategory("hello there"), "conceptual");
-
-  // --- Load state reuses cognitive-load-regulation.mjs's own thresholds,
-  // and a middle value is honestly null, not forced to a side ------------
-  assert.equal(classifyLoadState(0.9), "high");
-  assert.equal(classifyLoadState(0.1), "low");
-  assert.equal(classifyLoadState(0.45), null);
-  assert.equal(classifyLoadState(null), null);
-  assert.equal(classifyLoadState(undefined), null);
-
-  // --- Observation sanitizing rebuilds from an allowlist ------------------
-  assert.deepEqual(sanitizeHelpPolicyObservation({ responseStyle: "not-a-style", category: "debugging", loadState: "low", success: true }), { ok: false, reason: "unknown-response-style" });
-  assert.deepEqual(sanitizeHelpPolicyObservation({ responseStyle: "socratic", category: "not-a-category", loadState: "low", success: true }), { ok: false, reason: "unknown-category" });
-  assert.deepEqual(sanitizeHelpPolicyObservation({ responseStyle: "socratic", category: "debugging", loadState: "medium", success: true }), { ok: false, reason: "unknown-load-state" });
-  assert.deepEqual(sanitizeHelpPolicyObservation({ responseStyle: "socratic", category: "debugging", loadState: "low" }), { ok: false, reason: "missing-success" });
-  const sanitized = sanitizeHelpPolicyObservation({ responseStyle: "socratic", category: "debugging", loadState: "low", success: true, extraField: "dropped" });
-  assert.equal(sanitized.ok, true);
-  assert.deepEqual(Object.keys(sanitized.observation).sort(), ["at", "category", "loadState", "responseStyle", "success"]);
-
-  // --- A cell below MIN_SAMPLE honestly abstains --------------------------
-  const tooFewObservations = [
-    { responseStyle: "socratic", category: "debugging", loadState: "high", success: true },
-    { responseStyle: "socratic", category: "debugging", loadState: "high", success: false },
-  ];
-  const tooFewCell = scoreHelpPolicyCell("socratic", "debugging", "high", tooFewObservations);
-  assert.equal(tooFewCell.value, null);
-  assert.equal(tooFewCell.reason, "insufficient-evidence");
-  assert.equal(tooFewCell.cell, helpPolicyCellKey("socratic", "debugging", "high"));
-
-  // --- Verification-first helps debugging under high load; direct-answer
-  // does not -- and the same verification style, under low load for a
-  // conceptual request, performs quite differently. Every cell independent,
-  // never pooled or averaged -------------------------------------------------
-  const observations = [
-    // verification/debugging/high: strong
-    { responseStyle: "verification", category: "debugging", loadState: "high", success: true },
-    { responseStyle: "verification", category: "debugging", loadState: "high", success: true },
-    { responseStyle: "verification", category: "debugging", loadState: "high", success: true },
-    { responseStyle: "verification", category: "debugging", loadState: "high", success: false },
-    // direct-answer/debugging/high: weak
-    { responseStyle: "direct-answer", category: "debugging", loadState: "high", success: false },
-    { responseStyle: "direct-answer", category: "debugging", loadState: "high", success: false },
-    { responseStyle: "direct-answer", category: "debugging", loadState: "high", success: true },
-    { responseStyle: "direct-answer", category: "debugging", loadState: "high", success: false },
-    // verification/conceptual/low: weak -- the same style that helped above
-    // does not automatically help here
-    { responseStyle: "verification", category: "conceptual", loadState: "low", success: false },
-    { responseStyle: "verification", category: "conceptual", loadState: "low", success: false },
-    { responseStyle: "verification", category: "conceptual", loadState: "low", success: true },
-    { responseStyle: "verification", category: "conceptual", loadState: "low", success: false },
-    // socratic/conceptual/low: strong
-    { responseStyle: "socratic", category: "conceptual", loadState: "low", success: true },
-    { responseStyle: "socratic", category: "conceptual", loadState: "low", success: true },
-    { responseStyle: "socratic", category: "conceptual", loadState: "low", success: true },
-  ];
-
-  const verificationDebuggingHigh = scoreHelpPolicyCell("verification", "debugging", "high", observations);
-  const directAnswerDebuggingHigh = scoreHelpPolicyCell("direct-answer", "debugging", "high", observations);
-  assert.equal(verificationDebuggingHigh.value, 0.75);
-  assert.equal(directAnswerDebuggingHigh.value, 0.25);
-  assert.ok(verificationDebuggingHigh.value > directAnswerDebuggingHigh.value);
-
-  const verificationConceptualLow = scoreHelpPolicyCell("verification", "conceptual", "low", observations);
-  const socraticConceptualLow = scoreHelpPolicyCell("socratic", "conceptual", "low", observations);
-  assert.equal(verificationConceptualLow.value, 0.25);
-  assert.equal(socraticConceptualLow.value, 1);
-  // The same response style (verification) scores very differently across
-  // cells -- confirming per-cell scoring is not secretly a single number.
-  assert.notEqual(verificationDebuggingHigh.value, verificationConceptualLow.value);
-
-  // --- The full cross-tab is every style x category x load combination,
-  // with no averaging/ranking function anywhere -------------------------
-  const full = evaluateHelpPolicies(observations);
-  assert.equal(full.cells.length, RESPONSE_STYLES.length * REQUEST_CATEGORIES.length * LOAD_STATES.length);
-  assert.equal("overallBest" in full, false);
-  assert.equal("ranking" in full, false);
-  assert.equal("score" in full, false);
-  const foundVerificationDebuggingHigh = full.cells.find((cell) => cell.cell === helpPolicyCellKey("verification", "debugging", "high"));
-  assert.equal(foundVerificationDebuggingHigh.value, 0.75);
-
-  // --- Rendering -----------------------------------------------------------
-  const rendered = renderHelpPolicyReport(full);
-  assert.match(rendered, /verification:debugging:high: 75% \(n=4\)/);
-  assert.match(rendered, /socratic:conceptual:low: 100% \(n=3\)/);
-});
-
-test("scaffold-fading probe withdraws hints/retrieval/tool execution after success, scores planning/debugging/explanation independently, and withholds mastery when any dimension collapses without assistance", () => {
-  assert.equal(SCAFFOLD_FADING_PROBE_VERSION, 1);
-  assert.deepEqual(ASSISTANCE_CHANNELS, ["hints", "retrieval", "toolExecution"]);
-  assert.deepEqual(INDEPENDENT_DIMENSIONS, ["planning", "debugging", "explanation"]);
-  assert.equal(ABSOLUTE_COLLAPSE_FLOOR, 0.4);
-  assert.equal(RELATIVE_COLLAPSE_DROP, 0.2);
-
-  // --- verifyAssistanceWithdrawn: checked against real usage counts, never
-  // a caller-trusted boolean -------------------------------------------
-  const clean = verifyAssistanceWithdrawn({ hints: 0, retrieval: 0, toolExecution: 0 });
-  assert.equal(clean.withdrawn, true);
-  assert.deepEqual(clean.stillPresent, []);
-
-  const stillHinted = verifyAssistanceWithdrawn({ hints: 2, retrieval: 0, toolExecution: 0 });
-  assert.equal(stillHinted.withdrawn, false);
-  assert.deepEqual(stillHinted.stillPresent, ["hints"]);
-
-  const stillUsingTwo = verifyAssistanceWithdrawn({ hints: 0, retrieval: 1, toolExecution: 1 });
-  assert.equal(stillUsingTwo.withdrawn, false);
-  assert.deepEqual(stillUsingTwo.stillPresent, ["retrieval", "toolExecution"]);
-
-  // --- scoreIndependentDimension: absolute floor and relative drop, each a
-  // distinct, named collapse reason --------------------------------------
-  const missing = scoreIndependentDimension("planning", null, 0.8);
-  assert.equal(missing.available, false);
-
-  const belowFloor = scoreIndependentDimension("planning", 0.3, 0.9);
-  assert.equal(belowFloor.available, true);
-  assert.equal(belowFloor.collapsed, true);
-  assert.equal(belowFloor.collapseReason, "below-floor");
-
-  const largeDrop = scoreIndependentDimension("planning", 0.55, 0.9);
-  assert.equal(largeDrop.available, true);
-  assert.equal(largeDrop.collapsed, true);
-  assert.equal(largeDrop.collapseReason, "large-drop-from-assisted");
-
-  const steady = scoreIndependentDimension("planning", 0.75, 0.85);
-  assert.equal(steady.available, true);
-  assert.equal(steady.collapsed, false);
-  assert.equal(steady.collapseReason, null);
-
-  // No assisted score supplied: only the absolute floor applies.
-  const noBaselineOk = scoreIndependentDimension("planning", 0.5, null);
-  assert.equal(noBaselineOk.collapsed, false);
-  const noBaselineCollapsed = scoreIndependentDimension("planning", 0.2, null);
-  assert.equal(noBaselineCollapsed.collapsed, true);
-  assert.equal(noBaselineCollapsed.collapseReason, "below-floor");
-
-  // --- scoreDebuggingDimension: reuses process-trace-assessment.mjs's own
-  // scoreDebuggingStep unmodified, fed real misconception.mjs-shaped grades
-  const assistedProbeGrade = { correct: true, misconception: null };
-  const unassistedProbeGradeOk = { correct: true, misconception: null };
-  const debuggingOk = scoreDebuggingDimension(unassistedProbeGradeOk, assistedProbeGrade);
-  assert.equal(debuggingOk.available, true);
-  assert.equal(debuggingOk.probeScore, 1);
-  assert.equal(debuggingOk.collapsed, false);
-
-  const unassistedProbeGradeWrong = { correct: false, misconception: { id: "execution-order", title: "Execution order", remediation: "Trace calls, not source order." } };
-  const debuggingCollapsed = scoreDebuggingDimension(unassistedProbeGradeWrong, assistedProbeGrade);
-  assert.equal(debuggingCollapsed.available, true);
-  assert.equal(debuggingCollapsed.probeScore, 0);
-  assert.equal(debuggingCollapsed.collapsed, true);
-
-  // --- evaluateScaffoldFadingProbe: only probes after success, and
-  // withdrawal/planning/debugging/explanation are never averaged into one
-  // "independence score" ---------------------------------------------------
-  const notYetSucceeded = evaluateScaffoldFadingProbe({ assistedSucceeded: false });
-  assert.equal(notYetSucceeded.available, false);
-
-  const allIndependentNoCollapse = evaluateScaffoldFadingProbe({
-    assistedSucceeded: true,
-    assistanceUsed: { hints: 0, retrieval: 0, toolExecution: 0 },
-    planningScore: 0.8,
-    assistedPlanningScore: 0.85,
-    debuggingProbeGrade: { correct: true, misconception: null },
-    assistedDebuggingProbeGrade: { correct: true, misconception: null },
-    explanationScore: 0.7,
-    assistedExplanationScore: 0.75,
-  });
-  assert.equal(allIndependentNoCollapse.available, true);
-  assert.equal(allIndependentNoCollapse.withdrawal.withdrawn, true);
-  assert.equal(allIndependentNoCollapse.dimensions.length, 3);
-  assert.deepEqual(allIndependentNoCollapse.collapsedDimensions, []);
-  assert.equal(allIndependentNoCollapse.collapsed, false);
-  assert.equal("independenceScore" in allIndependentNoCollapse, false);
-  assert.equal("averageScore" in allIndependentNoCollapse, false);
-
-  // One dimension (explanation) collapses while planning/debugging stay
-  // fine -- the point is each is reported on its own, not blended.
-  const oneDimensionCollapsed = evaluateScaffoldFadingProbe({
-    assistedSucceeded: true,
-    assistanceUsed: { hints: 0, retrieval: 0, toolExecution: 0 },
-    planningScore: 0.8,
-    assistedPlanningScore: 0.85,
-    debuggingProbeGrade: { correct: true, misconception: null },
-    assistedDebuggingProbeGrade: { correct: true, misconception: null },
-    explanationScore: 0.1,
-    assistedExplanationScore: 0.75,
-  });
-  assert.equal(oneDimensionCollapsed.collapsed, true);
-  assert.deepEqual(oneDimensionCollapsed.collapsedDimensions, ["explanation"]);
-  const planningEntry = oneDimensionCollapsed.dimensions.find((entry) => entry.dimension === "planning");
-  assert.equal(planningEntry.collapsed, false);
-
-  // Assistance still present -- the probe itself does not prove independence,
-  // regardless of scores.
-  const notWithdrawnYet = evaluateScaffoldFadingProbe({
-    assistedSucceeded: true,
-    assistanceUsed: { hints: 1, retrieval: 0, toolExecution: 0 },
-    planningScore: 0.9,
-    debuggingProbeGrade: { correct: true, misconception: null },
-    explanationScore: 0.9,
-  });
-  assert.equal(notWithdrawnYet.withdrawal.withdrawn, false);
-
-  // Missing evidence for one dimension -- reported separately from collapse.
-  const missingEvidence = evaluateScaffoldFadingProbe({
-    assistedSucceeded: true,
-    assistanceUsed: { hints: 0, retrieval: 0, toolExecution: 0 },
-    planningScore: 0.9,
-    debuggingProbeGrade: { correct: true, misconception: null },
-    explanationScore: null,
-  });
-  assert.deepEqual(missingEvidence.unprovenDimensions, ["explanation"]);
-
-  // --- decideMasteryWithholding: each reason distinct and named ----------
-  assert.equal(decideMasteryWithholding(notYetSucceeded).withhold, true);
-  assert.match(decideMasteryWithholding(notYetSucceeded).reason, /did not succeed/);
-
-  assert.equal(decideMasteryWithholding(notWithdrawnYet).withhold, true);
-  assert.match(decideMasteryWithholding(notWithdrawnYet).reason, /not actually withdrawn/);
-
-  assert.equal(decideMasteryWithholding(missingEvidence).withhold, true);
-  assert.match(decideMasteryWithholding(missingEvidence).reason, /Insufficient evidence/);
-
-  assert.equal(decideMasteryWithholding(oneDimensionCollapsed).withhold, true);
-  assert.match(decideMasteryWithholding(oneDimensionCollapsed).reason, /collapsed without assistance.*explanation/);
-
-  const allowDecision = decideMasteryWithholding(allIndependentNoCollapse);
-  assert.equal(allowDecision.withhold, false);
-  assert.equal(allowDecision.reason, null);
-
-  // --- Rendering -----------------------------------------------------------
-  const rendered = renderScaffoldFadingReport(allIndependentNoCollapse, allowDecision);
-  assert.match(rendered, /Assistance withdrawn: yes/);
-  assert.match(rendered, /planning: probe=0\.8 assisted=0\.85 ok/);
-  assert.match(rendered, /Mastery withheld: no/);
-
-  const renderedCollapsed = renderScaffoldFadingReport(oneDimensionCollapsed, decideMasteryWithholding(oneDimensionCollapsed));
-  assert.match(renderedCollapsed, /explanation: probe=0\.1 assisted=0\.75 COLLAPSED \(below-floor\)/);
-  assert.match(renderedCollapsed, /Mastery withheld: Performance collapsed/);
-});
-
-test("epistemic vigilance gate requires located evidence, a before-you-look failure-mode prediction, and a real falsifying test before a tutor patch is verified, and never reads whether the learner agreed with the tutor", async (context) => {
-  const runtimes = await detectRuntimes();
-  if (!runtimes.python?.available) {
-    context.skip("No python runtime is installed, so the epistemic vigilance gate's falsifying-test stage cannot be verified here.");
-    return;
-  }
-
-  assert.equal(EPISTEMIC_VIGILANCE_GATE_VERSION, 1);
-  assert.deepEqual(VERIFICATION_STAGES, ["evidence-location", "failure-mode-prediction", "falsifying-test"]);
-  assert.deepEqual(FAILURE_MODE_CATEGORIES, ["raises", "diverges", "matches"]);
-
-  const repository = { files: [{ path: "app/core.py" }, { path: "app/runner.py" }] };
-
-  // --- Stage 1: evidence location, reusing explanation-grader.mjs's own
-  // checkCitations unmodified ---------------------------------------------
-  const noEvidence = scoreEvidenceLocationStage("This patch looks fine to me.", repository);
-  assert.equal(noEvidence.available, false);
-
-  const mixedEvidence = scoreEvidenceLocationStage("See app/core.py:12 and app/missing.py:3 for the bug.", repository);
-  assert.equal(mixedEvidence.available, true);
-  assert.equal(mixedEvidence.totalCount, 2);
-  assert.equal(mixedEvidence.validCount, 1);
-  assert.equal(mixedEvidence.score, 0.5);
-
-  const goodEvidence = scoreEvidenceLocationStage("See app/core.py:12 and app/runner.py:4 for the bug.", repository);
-  assert.equal(goodEvidence.score, 1);
-
-  // --- Stage 3: falsifying-test design, run for real inside
-  // executable-quiz.mjs's own sandbox --------------------------------------
-  const correctPatch = { moduleSource: "def add(a, b):\n    return a + b\n", entry: "add", args: [1, 2], expectedIfCorrect: "3" };
-  const buggyPatch = { moduleSource: "def add(a, b):\n    return a - b\n", entry: "add", args: [1, 2], expectedIfCorrect: "3" };
-  const raisingPatch = { moduleSource: "def add(a, b):\n    return a / 0\n", entry: "add", args: [1, 2], expectedIfCorrect: "3" };
-  const brokenCallPatch = { moduleSource: "value = 1\n", entry: "add", args: [1, 2], expectedIfCorrect: "3" };
-
-  const matchesResult = await runFalsifyingTestStage(correctPatch);
-  assert.equal(matchesResult.available, true);
-  assert.equal(matchesResult.actualCategory, "matches");
-  assert.equal(matchesResult.falsified, false);
-
-  const divergesResult = await runFalsifyingTestStage(buggyPatch);
-  assert.equal(divergesResult.available, true);
-  assert.equal(divergesResult.actualCategory, "diverges");
-  assert.equal(divergesResult.falsified, true);
-
-  const raisesResult = await runFalsifyingTestStage(raisingPatch);
-  assert.equal(raisesResult.available, true);
-  assert.equal(raisesResult.actualCategory, "raises");
-  assert.equal(raisesResult.falsified, true);
-
-  const noEntryResult = await runFalsifyingTestStage(brokenCallPatch);
-  assert.equal(noEntryResult.available, false);
-
-  // --- Stage 2: failure-mode prediction, scored only against the real
-  // executed outcome, with a confidence-weighted Brier score --------------
-  const correctConfidentPrediction = scoreFailureModePredictionStage("matches", 0.9, "matches");
-  assert.equal(correctConfidentPrediction.correct, true);
-  assert.equal(correctConfidentPrediction.calibration, "confident-and-right");
-  assert.equal(correctConfidentPrediction.brier, 0.01);
-
-  const wrongConfidentPrediction = scoreFailureModePredictionStage("matches", 0.9, "diverges");
-  assert.equal(wrongConfidentPrediction.correct, false);
-  assert.equal(wrongConfidentPrediction.calibration, "overconfident");
-  assert.equal(wrongConfidentPrediction.brier, 0.81);
-
-  const unknownCategory = scoreFailureModePredictionStage("explodes", 0.9, "matches");
-  assert.equal(unknownCategory.available, false);
-
-  // --- The full process: each stage reported on its own, no averaging ----
-  const completeProcess = await evaluateVerificationProcess({
-    evidenceText: "See app/core.py:12 for the current implementation.",
-    repository,
-    predictedCategory: "diverges",
-    statedConfidence: 0.8,
-    patch: buggyPatch,
-  });
-  assert.equal(completeProcess.stages.evidenceLocation.available, true);
-  assert.equal(completeProcess.stages.falsifyingTest.actualCategory, "diverges");
-  assert.equal(completeProcess.stages.failureModePrediction.correct, true);
-  assert.deepEqual(completeProcess.unprovenStages, []);
-  assert.equal(completeProcess.falsified, true);
-  assert.equal("score" in completeProcess, false);
-  assert.equal("overallScore" in completeProcess, false);
-
-  const incompleteProcess = await evaluateVerificationProcess({
-    evidenceText: "No citation given.",
-    repository,
-    predictedCategory: "matches",
-    statedConfidence: 0.6,
-    patch: correctPatch,
-  });
-  assert.deepEqual(incompleteProcess.unprovenStages, ["evidence-location"]);
-
-  // --- The core invariant: the gate never reads whether the learner
-  // agreed with the tutor ---------------------------------------------------
-  const verifiedButDisagreed = gatePatchAdoptionOnVerification(completeProcess, { adopted: false });
-  assert.equal(verifiedButDisagreed.verified, true);
-  const verifiedAndAgreed = gatePatchAdoptionOnVerification(completeProcess, { adopted: true });
-  assert.equal(verifiedAndAgreed.verified, true);
-  // Identical verification outcome regardless of the adoption decision --
-  // agreement with the tutor is not part of this gate at all.
-  assert.deepEqual(verifiedButDisagreed, verifiedAndAgreed);
-
-  const unverified = gatePatchAdoptionOnVerification(incompleteProcess, { adopted: true });
-  assert.equal(unverified.verified, false);
-  assert.match(unverified.reason, /evidence-location/);
-
-  // --- Rendering -----------------------------------------------------------
-  const rendered = renderVerificationProcessReport(completeProcess, verifiedAndAgreed);
-  assert.match(rendered, /evidence-location: 1\/1 citation\(s\) valid/);
-  assert.match(rendered, /failure-mode-prediction: predicted=diverges actual=diverges correct/);
-  assert.match(rendered, /falsifying-test: actual=diverges falsified the patch/);
-  assert.match(rendered, /Verification process: complete/);
-});
-
-test("subgroup calibration gates false mastery, hint burden, retention, and transfer by prior experience, language, accessibility mode, and assistance history, abstaining below the cohort floor rather than overstating small-sample fairness", () => {
-  const base = Date.parse("2026-08-01T09:00:00.000Z");
-  const at = (minutes) => new Date(base + minutes * 60_000).toISOString();
-
-  assert.equal(SUBGROUP_CALIBRATION_GATE_VERSION, 1);
-  assert.deepEqual(OUTCOME_AXES, ["false-mastery", "hint-burden", "retention", "transfer"]);
-  assert.deepEqual(SUBGROUP_DIMENSIONS, ["prior-experience", "language", "accessibility-mode", "assistance-history"]);
-  assert.equal(EQUITY_GAP_THRESHOLD, 0.2);
-  assert.equal(HINT_BURDEN_THRESHOLD, 0.5);
-
-  // --- False mastery: a status: "mastered" skill whose fresh posterior
-  // (misconception.mjs's own calibrateSkill, unmodified) disagrees --------
-  const overconfidentState = {
-    mastery: {
-      "skill-a": {
-        skillId: "skill-a",
-        status: "mastered",
-        evidence: [
-          { kind: "self-report", strength: 0.95, createdAt: at(0) },
-          { kind: "quiz", strength: 0.2, createdAt: at(1) },
-          { kind: "quiz", strength: 0.15, createdAt: at(2) },
-          { kind: "practice", strength: 0.1, createdAt: at(3) },
-        ],
-      },
-    },
+  const facets = governanceEfficacySafetyAccessibility(minimalPortfolioContent);
+  assert.equal(facets.efficacy.effectiveness.verdict, "pass");
+  assert.equal(facets.efficacy.calibration.verdict, "pass");
+  assert.equal(facets.safety.provenance.verdict, "pass");
+  assert.equal(facets.safety.answerLeakage.verdict, "pass");
+  assert.equal(facets.accessibility.verdict, "pass");
+  assert.equal(facets.decision.promote, true);
+
+  // --- buildGovernanceRecordContent: deterministic, no wall-clock field inside,
+  // and every one of the ten named facets is present even with no evidence ---
+  const continuityRecord = { consent: { granted: true, grantedAt: "2026-01-01T00:00:00.000Z", revokedAt: null } };
+  const baseInput = {
+    repositoryId: "repo-1",
+    previousDigest: null,
+    continuityRecord,
+    curriculumVersion: "1.0.0",
+    modelVersion: "model-a@1",
+    rubricPairs: agreeingPairs,
+    adjudicationEvents,
+    reviewKind: "unsafe-hint",
+    interventions: { kind: "cognitive-load-regulation", verdict: "overloaded", reason: "extraneous-load-high" },
+    privacyBudget: { totalEpsilon: 2, spent: 0.5 },
+    portfolioContent: minimalPortfolioContent,
   };
-  assert.equal(learnerFalseMasteryOutcome(overconfidentState), 1);
+  const contentA = buildGovernanceRecordContent({ ...baseInput, now: "2026-01-02T00:00:00.000Z" });
+  const contentB = buildGovernanceRecordContent({ ...baseInput, now: "2026-01-09T00:00:00.000Z" });
+  assert.deepEqual(contentA, contentB, "identical inputs (differing only in now, which is not part of content) must produce identical content");
+  assert.equal("generatedAt" in contentA, false, "the digested content must carry no wall-clock field");
+  assert.equal(governanceRecordDigest(contentA), governanceRecordDigest(contentB));
+  assert.deepEqual(Object.keys(contentA).filter((key) => GOVERNANCE_RECORD_FACETS.includes(key)).sort(), [...GOVERNANCE_RECORD_FACETS].sort());
 
-  const calibratedState = {
-    mastery: {
-      "skill-b": {
-        skillId: "skill-b",
-        status: "mastered",
-        evidence: [
-          { kind: "self-report", strength: 0.9, createdAt: at(0) },
-          { kind: "quiz", strength: 0.9, createdAt: at(1) },
-          { kind: "quiz", strength: 0.85, createdAt: at(2) },
-          { kind: "practice", strength: 0.95, createdAt: at(3) },
-        ],
-      },
-    },
-  };
-  assert.equal(learnerFalseMasteryOutcome(calibratedState), 0);
-
-  const noMasteredState = { mastery: { "skill-c": { skillId: "skill-c", status: "available", evidence: [] } } };
-  assert.equal(learnerFalseMasteryOutcome(noMasteredState), null, "no mastered skill is insufficient-evidence, never a guessed clean 0");
-
-  // --- Hint burden: hintAnalytics's own hintedShare, reused unmodified --
-  const highHintEvents = [0, 1, 2, 3, 4].map((i) => ({ at: at(i), kind: "explanation", correct: true, hints: 2 }));
-  assert.equal(learnerHintBurdenOutcome(highHintEvents), 1);
-  const lowHintEvents = [0, 1, 2, 3, 4].map((i) => ({ at: at(i), kind: "explanation", correct: true, hints: 0 }));
-  assert.equal(learnerHintBurdenOutcome(lowHintEvents), 0);
-  assert.equal(learnerHintBurdenOutcome([]), null);
-
-  // --- computeLearnerOutcomes: all four axes, never blended --------------
-  const outcomes = computeLearnerOutcomes({ learnerState: overconfidentState, events: highHintEvents });
-  assert.deepEqual(Object.keys(outcomes).sort(), ["false-mastery", "hint-burden", "retention", "transfer"]);
-  assert.equal(outcomes["false-mastery"], 1);
-  assert.equal(outcomes["hint-burden"], 1);
-
-  // --- groupBySubgroupValue: an undeclared learner is excluded, not
-  // guessed into a default bucket -----------------------------------------
-  const grouping = groupBySubgroupValue([
-    { subgroups: { "prior-experience": "novice" } },
-    { subgroups: {} },
-    { subgroups: { "prior-experience": "expert" } },
-  ], "prior-experience");
-  assert.equal(grouping.groups.size, 2);
-  assert.equal(grouping.unlabeled, 1);
-
-  // --- A real equity comparison across a declared subgroup dimension -----
-  function makeLearner(subgroupValue, { hintBurden, retentionGood }) {
-    const events = [
-      ...(hintBurden ? highHintEvents : lowHintEvents),
-      ...(retentionGood
-        ? [0, 1, 2, 3].map((i) => ({ at: at(i + 10), kind: "review", correct: true, elapsedDays: 2 }))
-        : [0, 1, 2, 3].map((i) => ({ at: at(i + 10), kind: "review", correct: false, elapsedDays: 2 }))),
-    ];
-    return { subgroups: { "prior-experience": subgroupValue }, learnerState: calibratedState, events, skillGraph: null, studiedPaths: [] };
+  // A record with no evidence supplied at all still states every facet,
+  // each honestly null rather than omitted.
+  const emptyContent = buildGovernanceRecordContent({ repositoryId: "repo-1", previousDigest: null });
+  for (const facet of GOVERNANCE_RECORD_FACETS) {
+    assert.equal(facet in emptyContent, true, `facet ${facet} must be present even with no evidence`);
   }
+  assert.equal(emptyContent.consent.granted, false);
+  assert.equal(emptyContent.deprecation.deprecate, false);
 
-  // Six "novice" learners with a hint burden and poor retention; six
-  // "expert" learners with neither — a real gap that clears
-  // MIN_COHORT_SIZE on both qualifying groups.
-  const novices = Array.from({ length: 6 }, () => makeLearner("novice", { hintBurden: true, retentionGood: false }));
-  const experts = Array.from({ length: 6 }, () => makeLearner("expert", { hintBurden: false, retentionGood: true }));
-  const learners = [...novices, ...experts];
+  // --- buildGovernanceRecord / verifyGovernanceRecord: signed and sealed
+  // exactly the way curriculum-portfolio.mjs's own build/verify pair already is --
+  const keyPair = createKeyPair();
+  const record1 = buildGovernanceRecord({ ...baseInput, keyPair, now: "2026-01-02T00:00:00.000Z" });
+  assert.equal(record1.version, LEARNING_GOVERNANCE_RECORD_VERSION);
+  assert.equal(record1.format, LEARNING_GOVERNANCE_RECORD_FORMAT);
+  assert.equal(record1.previousDigest, null);
+  assert.ok(record1.digest);
+  assert.ok(record1.generatedAt);
+  assert.equal(record1.signature.subject, LEARNING_GOVERNANCE_RECORD_SUBJECT);
 
-  const hintCell = evaluateSubgroupCell(learners, "prior-experience", "hint-burden");
-  assert.equal(hintCell.verdict, "gap-detected", JSON.stringify(hintCell));
-  assert.ok(hintCell.gap > EQUITY_GAP_THRESHOLD);
+  const verified1 = verifyGovernanceRecord(record1, { trustedKeyIds: [keyPair.keyId] });
+  assert.equal(verified1.digestOk, true);
+  assert.equal(verified1.reproducible, true);
+  assert.equal(verified1.seal.verified, true);
+  assert.equal(verified1.seal.trust, "trusted");
+  assert.equal(verified1.verdict, "verified");
 
-  const retentionCell = evaluateSubgroupCell(learners, "prior-experience", "retention");
-  assert.equal(retentionCell.verdict, "gap-detected", JSON.stringify(retentionCell));
+  const untrusted1 = verifyGovernanceRecord(record1, {});
+  assert.equal(untrusted1.seal.trust, "untrusted");
+  assert.equal(untrusted1.verdict, "untrusted-signer");
 
-  // --- Below the cohort floor: fewer than two qualifying groups abstains,
-  // never overstates a small-sample fairness claim -------------------------
-  const tinyLearners = [makeLearner("novice", { hintBurden: true, retentionGood: false })];
-  const tinyCell = evaluateSubgroupCell(tinyLearners, "prior-experience", "hint-burden");
-  assert.equal(tinyCell.verdict, "insufficient-evidence");
-  assert.match(tinyCell.reason, /Fewer than two/);
+  const unsigned1 = buildGovernanceRecord(baseInput);
+  assert.equal(unsigned1.signature, null);
+  const unsignedVerdict1 = verifyGovernanceRecord(unsigned1, {});
+  assert.equal(unsignedVerdict1.digestOk, true);
+  assert.equal(unsignedVerdict1.seal.reason, "not-signed");
+  assert.equal(unsignedVerdict1.verdict, "unsigned-or-unverifiable");
 
-  // --- No gap: both qualifying subgroups behave identically --------------
-  const identicalLearners = [
-    ...Array.from({ length: 6 }, () => makeLearner("novice", { hintBurden: false, retentionGood: true })),
-    ...Array.from({ length: 6 }, () => makeLearner("expert", { hintBurden: false, retentionGood: true })),
-  ];
-  const noGapCell = evaluateSubgroupCell(identicalLearners, "prior-experience", "hint-burden");
-  assert.equal(noGapCell.verdict, "no-gap-detected");
-  assert.equal(noGapCell.gap, 0);
+  const tamperedRecord1 = { ...record1, curriculumVersion: "9.9.9" };
+  const tamperedVerdict1 = verifyGovernanceRecord(tamperedRecord1, { trustedKeyIds: [keyPair.keyId] });
+  assert.equal(tamperedVerdict1.digestOk, false);
+  assert.equal(tamperedVerdict1.verdict, "altered");
 
-  // --- Full report: every (dimension x axis) cell independently scored,
-  // never blended into one fairness score ----------------------------------
-  const fullReport = evaluateSubgroupCalibration(learners);
-  assert.equal(fullReport.cells.length, SUBGROUP_DIMENSIONS.length * OUTCOME_AXES.length);
-  assert.ok(fullReport.gapsDetected.some((entry) => entry.dimension === "prior-experience" && entry.axis === "hint-burden"));
-  // Dimensions this fixture never declares (language, accessibility-mode,
-  // assistance-history) honestly abstain rather than guessing a gap.
-  const languageCells = fullReport.cells.filter((cell) => cell.dimension === "language");
-  assert.ok(languageCells.every((cell) => cell.verdict === "insufficient-evidence"));
+  // --- Hash chain: the second record's previousDigest must equal the
+  // first record's own digest, and verifyGovernanceChain names the exact
+  // index where a link breaks rather than one pass/fail for the series ----
+  const record2 = buildGovernanceRecord({
+    ...baseInput,
+    previousDigest: record1.digest,
+    curriculumVersion: "1.0.1",
+    keyPair,
+    now: "2026-01-03T00:00:00.000Z",
+  });
+  assert.equal(record2.previousDigest, record1.digest);
 
-  // --- Rendering -----------------------------------------------------------
-  const rendered = renderSubgroupCalibrationReport(fullReport);
-  assert.match(rendered, /GAPS DETECTED/);
-  assert.match(rendered, /prior-experience \/ hint-burden/);
+  const record3 = buildGovernanceRecord({
+    ...baseInput,
+    previousDigest: record2.digest,
+    curriculumVersion: "1.0.2",
+    keyPair,
+    now: "2026-01-04T00:00:00.000Z",
+  });
+
+  const intactChain = verifyGovernanceChain([record1, record2, record3]);
+  assert.equal(intactChain.intact, true);
+  assert.equal(intactChain.length, 3);
+  assert.deepEqual(intactChain.breaks, []);
+
+  // Reordering the middle entry breaks the chain at every index whose
+  // expected predecessor no longer matches -- index 1 (record3 now follows
+  // record1, not record2) and index 2 (record2 now follows record3, not
+  // record1), both named explicitly rather than reported as one blended
+  // "somewhere" failure.
+  const reordered = [record1, record3, record2];
+  const brokenChain = verifyGovernanceChain(reordered);
+  assert.equal(brokenChain.intact, false);
+  assert.equal(brokenChain.breaks.length, 2);
+  assert.equal(brokenChain.breaks[0].index, 1);
+  assert.equal(brokenChain.breaks[0].expectedPrevious, record1.digest);
+  assert.equal(brokenChain.breaks[0].actualPrevious, record2.digest);
+  assert.equal(brokenChain.breaks[1].index, 2);
+  assert.equal(brokenChain.breaks[1].expectedPrevious, record3.digest);
+  assert.equal(brokenChain.breaks[1].actualPrevious, record1.digest);
+
+  // A deleted middle entry also breaks the chain, at the index that now
+  // points at the wrong predecessor.
+  const withDeletion = [record1, record3];
+  const deletionChain = verifyGovernanceChain(withDeletion);
+  assert.equal(deletionChain.intact, false);
+  assert.equal(deletionChain.breaks[0].index, 1);
+  assert.equal(deletionChain.breaks[0].expectedPrevious, record1.digest);
+  assert.equal(deletionChain.breaks[0].actualPrevious, record2.digest);
+
+  // --- Persistence through activity-log.mjs's own appendEvent/readEvents,
+  // reused unmodified -------------------------------------------------------
+  await persistGovernanceRecord(directory, "repo-1", record1);
+  await persistGovernanceRecord(directory, "repo-1", record2);
+  await persistGovernanceRecord(directory, "repo-1", record3);
+  const loaded = await loadGovernanceChain(directory, "repo-1");
+  assert.equal(loaded.length, 3);
+  assert.deepEqual(loaded.map((record) => record.digest), [record1.digest, record2.digest, record3.digest]);
+  const loadedChain = verifyGovernanceChain(loaded);
+  assert.equal(loadedChain.intact, true);
+
+  // A different repository's log is untouched.
+  const otherRepositoryChain = await loadGovernanceChain(directory, "repo-2");
+  assert.deepEqual(otherRepositoryChain, []);
+
+  // --- Privacy budget pass-throughs: private-cohort-analytics.mjs's own
+  // openPrivacyBudget/spendEpsilon, reused unmodified under governance-named
+  // wrappers -----------------------------------------------------------------
+  const opened = openGovernancePrivacyBudget(2, { seed: "governance-budget" });
+  assert.equal(opened.ok, true);
+  const spent = spendGovernancePrivacyBudget(opened.budget, 1, "retention-query");
+  assert.equal(spent.ok, true);
+  assert.equal(spent.remaining, 1);
+  const overspent = spendGovernancePrivacyBudget(spent.budget, 5, "too-much");
+  assert.equal(overspent.ok, false);
+  assert.equal(overspent.reason, "budget-exhausted");
+
+  // --- A deprecation-recommending record states its reason plainly --------
+  const quarantinedAdvisory = {
+    compatibility: { compatible: true, reasons: [] },
+    license: { bucket: "denied", license: "GPL-3.0" },
+    artifactFingerprint: "fingerprint-a",
+  };
+  const deprecatingRecord = buildGovernanceRecord({
+    ...baseInput,
+    modelAdvisory: quarantinedAdvisory,
+    currentArtifactBytes: Buffer.from("model bytes"),
+    keyPair,
+    now: "2026-01-05T00:00:00.000Z",
+  });
+  assert.equal(deprecatingRecord.deprecation.deprecate, true);
+  assert.deepEqual(deprecatingRecord.deprecation.reasons.map((entry) => entry.reason), ["model-quarantined"]);
+  assert.equal(deprecatingRecord.safety.modelQuarantine.quarantined, true);
+
+  // --- renderGovernanceRecord: a human-readable rendering names every
+  // facet, including the deprecation decision -------------------------------
+  const rendered = renderGovernanceRecord(record1);
+  assert.match(rendered, /Consent: granted/);
+  assert.match(rendered, /Curriculum version: 1\.0\.0/);
+  assert.match(rendered, /Model version: model-a@1/);
+  assert.match(rendered, /Evaluator calibration: rubric-agrees/);
+  assert.match(rendered, /Adjudications: 1\/3 overridden/);
+  assert.match(rendered, /Efficacy: effectiveness=pass, calibration=pass/);
+  assert.match(rendered, /Safety: provenance=pass, answer-leakage=pass/);
+  assert.match(rendered, /Accessibility: pass/);
+  assert.match(rendered, /Deprecation: not recommended/);
+
+  const renderedDeprecating = renderGovernanceRecord(deprecatingRecord);
+  assert.match(renderedDeprecating, /Deprecation: recommended \(model-quarantined\)/);
 });
+
