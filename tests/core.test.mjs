@@ -101,6 +101,7 @@ import { ESCALATION_THRESHOLD, MAX_TRAJECTORY_TURNS, MIN_TRAJECTORY_TURNS, MULTI
 import { ENGAGEMENT_PROXIES, PROXY_RISE_THRESHOLD, REWARD_HACKING_GUARD_VERSION, SATISFACTION_STRENGTH_FLOOR, detectRewardHacking, guardPromotionAgainstRewardHacking, measureDialogueLengthProxy, measureEngagementProxies, measureGenuineLearningSignals, measureImmediatePassRateProxy, measureRequestVolumeProxy, measureSatisfactionProxy, renderRewardHackingReport } from "../electron/reward-hacking-guard.mjs";
 import { EQUITY_GAP_THRESHOLD, HINT_BURDEN_THRESHOLD, OUTCOME_AXES, SUBGROUP_CALIBRATION_GATE_VERSION, SUBGROUP_DIMENSIONS, computeLearnerOutcomes, evaluateSubgroupCalibration, evaluateSubgroupCell, groupBySubgroupValue, learnerFalseMasteryOutcome, learnerHintBurdenOutcome, renderSubgroupCalibrationReport } from "../electron/subgroup-calibration-gate.mjs";
 import { GOVERNANCE_RECORD_FACETS, LEARNING_GOVERNANCE_RECORD_FORMAT, LEARNING_GOVERNANCE_RECORD_SUBJECT, LEARNING_GOVERNANCE_RECORD_VERSION, buildGovernanceRecord, buildGovernanceRecordContent, decideDeprecation, governanceAdjudications, governanceEfficacySafetyAccessibility, governanceEvaluatorCalibration, governanceRecordDigest, governanceSubjectRegistered, loadGovernanceChain, openGovernancePrivacyBudget, persistGovernanceRecord, renderGovernanceRecord, spendGovernancePrivacyBudget, verifyGovernanceChain, verifyGovernanceRecord } from "../electron/learning-governance-record.mjs";
+import { MULTILINGUAL_EQUIVALENCE_GATE_VERSION, SEMANTIC_AXES, containsAnswerToken, evaluateMultilingualEquivalence, renderMultilingualEquivalenceReport, verifyAbstentionEquivalence, verifyDifficultyEquivalence, verifyEvidenceEquivalence, verifyHintRungEquivalence, verifyMisconceptionEquivalence, verifyTranslatedScaffoldLeakage } from "../electron/multilingual-equivalence-gate.mjs";
 import { addEvidence, completeDiagnostic, recommend } from "../src/learning.ts";
 import { DURABLE_VERSION, inspectDurable, readDurable, sweepInterruptedWrites, writeDurable } from "../electron/durable-store.mjs";
 import { BUILD_TYPE, DEFAULT_LICENSE_POLICY, IN_TOTO_STATEMENT_TYPE, SBOM_SPEC_VERSION, SLSA_PREDICATE_TYPE, SUPPLY_CHAIN_VERSION, buildProvenance, buildSbom, compareBuilds, describeScan, firstByteDifference, hashesFromIntegrity, importNpmAudit, licenseBreakdown, publicSupplyChainReport, purlFor, runtimeComponents, satisfiesRange, sbomDigest, scanDependencies, scanPasses, signProvenance, verifyProvenance } from "../electron/supply-chain.mjs";
@@ -14998,4 +14999,152 @@ test("longitudinal learning-governance records chain consent, curriculum/model v
 
   const renderedDeprecating = renderGovernanceRecord(deprecatingRecord);
   assert.match(renderedDeprecating, /Deprecation: recommended \(model-quarantined\)/);
+});
+
+test("multilingual pedagogical equivalence gates evidence, misconception, hint rung, difficulty, leakage, and abstention semantics across languages so translation cannot silently reveal more of the answer than the English original ever did", () => {
+  assert.equal(MULTILINGUAL_EQUIVALENCE_GATE_VERSION, 1);
+  assert.deepEqual([...SEMANTIC_AXES], ["evidence", "misconception", "hint-rung", "difficulty", "leakage", "abstention"]);
+
+  // --- The gap this item exists to close: answer-guard.mjs's own leak regex
+  // is ASCII/case-sensitive and misses two renderings a real translator
+  // produces. containsAnswerToken repairs both, live-demonstrated here. ---
+  assert.equal(containsAnswerToken("Bubble_sort est la fonction appelée ici.", "bubble_sort"), true, "title-case sentence boundary must be caught");
+  assert.equal(containsAnswerToken("次に呼ばれるのは\uFF42ubble_sort です", "bubble_sort"), true, "fullwidth Latin letter must be caught");
+  assert.equal(containsAnswerToken("次に呼ばれるのはquick_sortです", "bubble_sort"), false, "an unrelated translated sentence is not a leak");
+  assert.equal(containsAnswerToken("", "bubble_sort"), false);
+  assert.equal(containsAnswerToken("bubble_sort", "b"), false, "a one-character answer is never scanned, same floor as answer-guard.mjs");
+
+  // --- verifyTranslatedScaffoldLeakage: safe, leaky, and partial-translation rungs ---
+  const scaffold = buildScaffold("executable-quiz", { answer: "bubble_sort", parameters: "one" });
+  assert.equal(scaffold.available, true);
+  const safeTranslation = Object.fromEntries(scaffold.rungs.map((rung) => [rung.id, `(fr) ${rung.text}`]));
+  const safeCheck = verifyTranslatedScaffoldLeakage(scaffold, safeTranslation, "bubble_sort");
+  assert.equal(safeCheck.ok, true);
+  assert.deepEqual(safeCheck.leakingRungs, []);
+
+  const leakyTranslation = { ...safeTranslation, [scaffold.rungs[0].id]: "La réponse est Bubble_sort, bien sûr." };
+  const leakyCheck = verifyTranslatedScaffoldLeakage(scaffold, leakyTranslation, "bubble_sort");
+  assert.equal(leakyCheck.ok, false);
+  assert.deepEqual(leakyCheck.leakingRungs, [scaffold.rungs[0].id]);
+
+  // An untranslated rung falls back to the original (already-approved)
+  // English text rather than being silently skipped.
+  const partialTranslation = { [scaffold.rungs[1].id]: safeTranslation[scaffold.rungs[1].id] };
+  const partialCheck = verifyTranslatedScaffoldLeakage(scaffold, partialTranslation, "bubble_sort");
+  assert.equal(partialCheck.ok, true);
+  assert.equal(partialCheck.findings.find((item) => item.id === scaffold.rungs[0].id).rendered, scaffold.rungs[0].text);
+
+  // --- verifyHintRungEquivalence: match, reordered, repriced ---
+  const identicalScaffold = JSON.parse(JSON.stringify(scaffold));
+  assert.deepEqual(verifyHintRungEquivalence(scaffold, identicalScaffold), { ok: true });
+  const reorderedScaffold = { ...scaffold, rungs: [scaffold.rungs[1], scaffold.rungs[0], scaffold.rungs[2]] };
+  const reorderedResult = verifyHintRungEquivalence(scaffold, reorderedScaffold);
+  assert.equal(reorderedResult.ok, false);
+  assert.equal(reorderedResult.reason, "rung-reordered");
+  const repricedScaffold = { ...scaffold, rungs: scaffold.rungs.map((rung, index) => (index === 0 ? { ...rung, price: 999 } : rung)) };
+  const repricedResult = verifyHintRungEquivalence(scaffold, repricedScaffold);
+  assert.equal(repricedResult.ok, false);
+  assert.equal(repricedResult.reason, "rung-repriced");
+  const missingRung = { ...scaffold, rungs: scaffold.rungs.slice(0, 2) };
+  assert.equal(verifyHintRungEquivalence(scaffold, missingRung).ok, false);
+  assert.equal(verifyHintRungEquivalence(scaffold, missingRung).reason, "rung-count-mismatch");
+
+  // --- verifyDifficultyEquivalence: match, mismatch, missing ---
+  assert.deepEqual(verifyDifficultyEquivalence({ difficulty: "medium" }, { difficulty: "medium" }), { ok: true, difficulty: "medium" });
+  const difficultyMismatch = verifyDifficultyEquivalence({ difficulty: "medium" }, { difficulty: "hard" });
+  assert.equal(difficultyMismatch.ok, false);
+  assert.equal(difficultyMismatch.reason, "difficulty-mismatch");
+  const difficultyMissing = verifyDifficultyEquivalence({ difficulty: "medium" }, {});
+  assert.equal(difficultyMissing.ok, false);
+  assert.equal(difficultyMissing.reason, "difficulty-missing-on-one-side");
+  assert.deepEqual(verifyDifficultyEquivalence({}, {}), { ok: true, difficulty: null });
+
+  // --- verifyEvidenceEquivalence: reuses explanation-grader.mjs's own checkCitations ---
+  const repository = { files: [{ path: "src/sort.py" }] };
+  const originalExplanation = "The loop lives in src/sort.py:12 and nowhere else.";
+  const preservedTranslation = "(fr) La boucle vit dans src/sort.py:12 et nulle part ailleurs.";
+  const preservedEvidence = verifyEvidenceEquivalence(originalExplanation, preservedTranslation, repository);
+  assert.equal(preservedEvidence.ok, true);
+  assert.deepEqual(preservedEvidence.dropped, []);
+  assert.deepEqual(preservedEvidence.added, []);
+  const droppedTranslation = "(fr) La boucle vit dans le fichier de tri.";
+  const droppedEvidence = verifyEvidenceEquivalence(originalExplanation, droppedTranslation, repository);
+  assert.equal(droppedEvidence.ok, false);
+  assert.deepEqual(droppedEvidence.dropped, ["src/sort.py:12"]);
+
+  // --- verifyMisconceptionEquivalence: match, drifted-id, empty-remediation, both-null, one-sided ---
+  const [finding] = detectMisconceptions("the function passes a copy so the caller is never modified");
+  assert.ok(finding, "fixture text must trigger a real misconception.mjs finding");
+  const translatedFinding = { ...finding, remediation: `(fr) ${finding.remediation}` };
+  assert.deepEqual(verifyMisconceptionEquivalence(finding, translatedFinding), { ok: true, finding: finding.id });
+  const driftedIdFinding = { ...translatedFinding, id: "some-other-id" };
+  const driftedResult = verifyMisconceptionEquivalence(finding, driftedIdFinding);
+  assert.equal(driftedResult.ok, false);
+  assert.equal(driftedResult.reason, "finding-id-drifted");
+  const emptyRemediationFinding = { ...translatedFinding, remediation: "   " };
+  const emptyResult = verifyMisconceptionEquivalence(finding, emptyRemediationFinding);
+  assert.equal(emptyResult.ok, false);
+  assert.equal(emptyResult.reason, "remediation-empty-in-translation");
+  assert.deepEqual(verifyMisconceptionEquivalence(null, null), { ok: true, finding: null });
+  const oneSided = verifyMisconceptionEquivalence(finding, null);
+  assert.equal(oneSided.ok, false);
+  assert.equal(oneSided.reason, "finding-present-on-one-side-only");
+
+  // --- verifyAbstentionEquivalence: reuses faithfulness-guard.mjs's own Verdict ---
+  assert.deepEqual(verifyAbstentionEquivalence(Verdict.FAITHFUL, Verdict.FAITHFUL), { ok: true, verdict: Verdict.FAITHFUL });
+  const abstentionDrift = verifyAbstentionEquivalence(Verdict.FAITHFUL, Verdict.ABSTAIN);
+  assert.equal(abstentionDrift.ok, false);
+  assert.equal(abstentionDrift.reason, "verdict-drifted");
+  const abstentionMissing = verifyAbstentionEquivalence(Verdict.FAITHFUL, null);
+  assert.equal(abstentionMissing.ok, false);
+  assert.equal(abstentionMissing.reason, "verdict-missing");
+
+  // --- Full report: fully-equivalent rendering ---
+  const equivalentReport = evaluateMultilingualEquivalence({
+    originalExplanationText: originalExplanation,
+    translatedExplanationText: preservedTranslation,
+    repository,
+    originalFinding: finding,
+    translatedFinding,
+    originalScaffold: scaffold,
+    translatedScaffold: identicalScaffold,
+    originalLesson: { difficulty: "medium" },
+    translatedLesson: { difficulty: "medium" },
+    translatedRungText: safeTranslation,
+    answer: "bubble_sort",
+    originalVerdict: Verdict.FAITHFUL,
+    translatedVerdict: Verdict.FAITHFUL,
+  });
+  assert.equal(equivalentReport.ok, true);
+  assert.deepEqual(equivalentReport.failingAxes, []);
+  assert.match(renderMultilingualEquivalenceReport(equivalentReport), /EQUIVALENT/);
+
+  // --- Full report: a rendering that fails difficulty and leakage but keeps
+  // the other four axes independently ok, never blended into one score ---
+  const leakyReport = evaluateMultilingualEquivalence({
+    originalExplanationText: originalExplanation,
+    translatedExplanationText: preservedTranslation,
+    repository,
+    originalFinding: finding,
+    translatedFinding,
+    originalScaffold: scaffold,
+    translatedScaffold: identicalScaffold,
+    originalLesson: { difficulty: "medium" },
+    translatedLesson: { difficulty: "hard" },
+    translatedRungText: leakyTranslation,
+    answer: "bubble_sort",
+    originalVerdict: Verdict.FAITHFUL,
+    translatedVerdict: Verdict.FAITHFUL,
+  });
+  assert.equal(leakyReport.ok, false);
+  assert.deepEqual(leakyReport.failingAxes.sort(), ["difficulty", "leakage"]);
+  assert.equal(leakyReport.results.evidence.ok, true);
+  assert.equal(leakyReport.results.misconception.ok, true);
+  assert.equal(leakyReport.results["hint-rung"].ok, true);
+  assert.equal(leakyReport.results.abstention.ok, true);
+  const renderedLeaky = renderMultilingualEquivalenceReport(leakyReport);
+  assert.match(renderedLeaky, /GAPS DETECTED on (difficulty, leakage|leakage, difficulty)/);
+  assert.match(renderedLeaky, /difficulty: fail \(difficulty-mismatch\)/);
+  assert.match(renderedLeaky, /leakage: fail \(leak\)/);
+  assert.match(renderedLeaky, /evidence: ok/);
 });
