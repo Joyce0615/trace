@@ -102,6 +102,7 @@ import { ENGAGEMENT_PROXIES, PROXY_RISE_THRESHOLD, REWARD_HACKING_GUARD_VERSION,
 import { EQUITY_GAP_THRESHOLD, HINT_BURDEN_THRESHOLD, OUTCOME_AXES, SUBGROUP_CALIBRATION_GATE_VERSION, SUBGROUP_DIMENSIONS, computeLearnerOutcomes, evaluateSubgroupCalibration, evaluateSubgroupCell, groupBySubgroupValue, learnerFalseMasteryOutcome, learnerHintBurdenOutcome, renderSubgroupCalibrationReport } from "../electron/subgroup-calibration-gate.mjs";
 import { GOVERNANCE_RECORD_FACETS, LEARNING_GOVERNANCE_RECORD_FORMAT, LEARNING_GOVERNANCE_RECORD_SUBJECT, LEARNING_GOVERNANCE_RECORD_VERSION, buildGovernanceRecord, buildGovernanceRecordContent, decideDeprecation, governanceAdjudications, governanceEfficacySafetyAccessibility, governanceEvaluatorCalibration, governanceRecordDigest, governanceSubjectRegistered, loadGovernanceChain, openGovernancePrivacyBudget, persistGovernanceRecord, renderGovernanceRecord, spendGovernancePrivacyBudget, verifyGovernanceChain, verifyGovernanceRecord } from "../electron/learning-governance-record.mjs";
 import { MULTILINGUAL_EQUIVALENCE_GATE_VERSION, SEMANTIC_AXES, containsAnswerToken, evaluateMultilingualEquivalence, renderMultilingualEquivalenceReport, verifyAbstentionEquivalence, verifyDifficultyEquivalence, verifyEvidenceEquivalence, verifyHintRungEquivalence, verifyMisconceptionEquivalence, verifyTranslatedScaffoldLeakage } from "../electron/multilingual-equivalence-gate.mjs";
+import { EXPERTISE_REVERSAL_VERSION, HARM_KINDS, PRIOR_KNOWLEDGE_PROFILES, buildScaffoldIntensityComparison, classifyExpertiseReversalHarm, evaluateExpertiseReversal, renderExpertiseReversalReport, verifyFixedAssessment } from "../electron/expertise-reversal.mjs";
 import { addEvidence, completeDiagnostic, recommend } from "../src/learning.ts";
 import { DURABLE_VERSION, inspectDurable, readDurable, sweepInterruptedWrites, writeDurable } from "../electron/durable-store.mjs";
 import { BUILD_TYPE, DEFAULT_LICENSE_POLICY, IN_TOTO_STATEMENT_TYPE, SBOM_SPEC_VERSION, SLSA_PREDICATE_TYPE, SUPPLY_CHAIN_VERSION, buildProvenance, buildSbom, compareBuilds, describeScan, firstByteDifference, hashesFromIntegrity, importNpmAudit, licenseBreakdown, publicSupplyChainReport, purlFor, runtimeComponents, satisfiesRange, sbomDigest, scanDependencies, scanPasses, signProvenance, verifyProvenance } from "../electron/supply-chain.mjs";
@@ -15147,4 +15148,93 @@ test("multilingual pedagogical equivalence gates evidence, misconception, hint r
   assert.match(renderedLeaky, /difficulty: fail \(difficulty-mismatch\)/);
   assert.match(renderedLeaky, /leakage: fail \(leak\)/);
   assert.match(renderedLeaky, /evidence: ok/);
+});
+
+test("prior-knowledge and expertise-reversal testing keeps evidence targets and assessment difficulty fixed while scaling scaffolds across novice, intermediate, and advanced profiles, and detects both under-guidance and redundant-load harm asymmetrically by profile", () => {
+  assert.equal(EXPERTISE_REVERSAL_VERSION, 1);
+  assert.deepEqual([...PRIOR_KNOWLEDGE_PROFILES], ["novice", "intermediate", "advanced"]);
+  assert.deepEqual(HARM_KINDS, { UNDER_GUIDANCE: "under-guidance", REDUNDANT_LOAD: "redundant-load" });
+
+  // --- verifyFixedAssessment: refuses a drifting evidence target or difficulty, and fewer than two declared profiles ---
+  const fixedEvidenceTarget = ["loop-invariant", "termination-condition"];
+  const matchedFixtures = {
+    novice: { evidenceTarget: fixedEvidenceTarget, difficulty: "medium", lowScaffoldScores: [0.3, 0.32, 0.28, 0.31, 0.29], highScaffoldScores: [0.7, 0.72, 0.68, 0.71, 0.69] },
+    advanced: { evidenceTarget: fixedEvidenceTarget, difficulty: "medium", lowScaffoldScores: [0.85, 0.87, 0.83, 0.86, 0.84], highScaffoldScores: [0.6, 0.62, 0.58, 0.61, 0.59] },
+    intermediate: { evidenceTarget: fixedEvidenceTarget, difficulty: "medium", lowScaffoldScores: [0.6, 0.58, 0.62, 0.59, 0.61], highScaffoldScores: [0.6, 0.61, 0.59, 0.62, 0.58] },
+  };
+  const okAssessment = verifyFixedAssessment(matchedFixtures);
+  assert.equal(okAssessment.ok, true);
+  assert.deepEqual([...okAssessment.evidenceTarget].sort(), [...fixedEvidenceTarget].sort());
+  assert.equal(okAssessment.difficulty, "medium");
+
+  const driftedDifficulty = { ...matchedFixtures, advanced: { ...matchedFixtures.advanced, difficulty: "hard" } };
+  const difficultyRefusal = verifyFixedAssessment(driftedDifficulty);
+  assert.equal(difficultyRefusal.ok, false);
+  assert.equal(difficultyRefusal.reason, "difficulty-varies-across-profiles");
+
+  const driftedEvidenceTarget = { ...matchedFixtures, advanced: { ...matchedFixtures.advanced, evidenceTarget: ["loop-invariant"] } };
+  const evidenceRefusal = verifyFixedAssessment(driftedEvidenceTarget);
+  assert.equal(evidenceRefusal.ok, false);
+  assert.equal(evidenceRefusal.reason, "evidence-target-varies-across-profiles");
+
+  const singleProfile = { novice: matchedFixtures.novice };
+  const singleRefusal = verifyFixedAssessment(singleProfile);
+  assert.equal(singleRefusal.ok, false);
+  assert.equal(singleRefusal.reason, "insufficient-declared-profiles");
+
+  // --- buildScaffoldIntensityComparison: reuses experiments.mjs's own analyzeExperiment, unmodified ---
+  const noviceComparison = buildScaffoldIntensityComparison("novice", matchedFixtures.novice.lowScaffoldScores, matchedFixtures.novice.highScaffoldScores);
+  assert.equal(noviceComparison.powered, true);
+  assert.equal(noviceComparison.verdict, "variant-better", "high-scaffold clearly outperforms low-scaffold for novices in this fixture");
+  const advancedComparison = buildScaffoldIntensityComparison("advanced", matchedFixtures.advanced.lowScaffoldScores, matchedFixtures.advanced.highScaffoldScores);
+  assert.equal(advancedComparison.powered, true);
+  assert.equal(advancedComparison.verdict, "control-better", "low-scaffold clearly outperforms high-scaffold for advanced learners in this fixture, the expertise-reversal signature");
+  const intermediateComparison = buildScaffoldIntensityComparison("intermediate", matchedFixtures.intermediate.lowScaffoldScores, matchedFixtures.intermediate.highScaffoldScores);
+  assert.equal(intermediateComparison.verdict, "no-difference");
+
+  // --- classifyExpertiseReversalHarm: asymmetric by profile ---
+  assert.deepEqual(classifyExpertiseReversalHarm("novice", noviceComparison), { profile: "novice", verdict: "variant-better", harm: HARM_KINDS.UNDER_GUIDANCE });
+  assert.deepEqual(classifyExpertiseReversalHarm("advanced", advancedComparison), { profile: "advanced", verdict: "control-better", harm: HARM_KINDS.REDUNDANT_LOAD });
+  // The identical "variant-better" verdict for the advanced profile is NOT under-guidance harm: that label only applies to novices.
+  assert.deepEqual(classifyExpertiseReversalHarm("advanced", noviceComparison), { profile: "advanced", verdict: "variant-better", harm: null });
+  // The identical "control-better" verdict for the novice profile is NOT redundant-load harm: that label only applies to advanced learners.
+  assert.deepEqual(classifyExpertiseReversalHarm("novice", advancedComparison), { profile: "novice", verdict: "control-better", harm: null });
+  // The intermediate profile is reported but never scored for either harm kind, even when its own comparison happens to name a direction.
+  assert.deepEqual(classifyExpertiseReversalHarm("intermediate", noviceComparison), { profile: "intermediate", verdict: "variant-better", harm: null });
+  assert.deepEqual(classifyExpertiseReversalHarm("intermediate", advancedComparison), { profile: "intermediate", verdict: "control-better", harm: null });
+  // no-difference and underpowered both abstain rather than guess a direction.
+  assert.deepEqual(classifyExpertiseReversalHarm("novice", intermediateComparison), { profile: "novice", verdict: "no-difference", harm: null });
+  const underpowered = buildScaffoldIntensityComparison("novice", [0.5], [0.9]);
+  assert.equal(underpowered.powered, false);
+  assert.deepEqual(classifyExpertiseReversalHarm("novice", underpowered), { profile: "novice", verdict: "underpowered", harm: null });
+
+  // --- evaluateExpertiseReversal: the combined report, refusing when the assessment is not fixed ---
+  const refusedReport = evaluateExpertiseReversal(driftedDifficulty);
+  assert.equal(refusedReport.ok, false);
+  assert.equal(refusedReport.results, null);
+  assert.deepEqual(refusedReport.harmsDetected, []);
+  assert.match(renderExpertiseReversalReport(refusedReport), /REFUSED \(difficulty-varies-across-profiles\)/);
+
+  const fullReport = evaluateExpertiseReversal(matchedFixtures);
+  assert.equal(fullReport.ok, true);
+  assert.equal(fullReport.assessment.difficulty, "medium");
+  assert.equal(fullReport.results.novice.harm, HARM_KINDS.UNDER_GUIDANCE);
+  assert.equal(fullReport.results.advanced.harm, HARM_KINDS.REDUNDANT_LOAD);
+  assert.equal(fullReport.results.intermediate.harm, null);
+  assert.deepEqual(
+    fullReport.harmsDetected.sort((left, right) => left.profile.localeCompare(right.profile)),
+    [{ profile: "advanced", harm: HARM_KINDS.REDUNDANT_LOAD }, { profile: "novice", harm: HARM_KINDS.UNDER_GUIDANCE }],
+  );
+  // A profile never declared at all is reported as not-tested, not silently dropped from the report.
+  const partialFixtures = { novice: matchedFixtures.novice, advanced: matchedFixtures.advanced };
+  const partialReport = evaluateExpertiseReversal(partialFixtures);
+  assert.equal(partialReport.ok, true);
+  assert.deepEqual(partialReport.results.intermediate, { profile: "intermediate", verdict: "not-tested", harm: null, comparison: null });
+
+  const renderedFull = renderExpertiseReversalReport(fullReport);
+  assert.match(renderedFull, /fixed difficulty=medium/);
+  assert.match(renderedFull, /novice: variant-better — HARM: under-guidance/);
+  assert.match(renderedFull, /advanced: control-better — HARM: redundant-load/);
+  assert.match(renderedFull, /intermediate: no-difference$/m);
+  assert.match(renderedFull, /Harms detected: (advanced\/redundant-load, novice\/under-guidance|novice\/under-guidance, advanced\/redundant-load)/);
 });
