@@ -143,11 +143,6 @@ artifact to another.
   equivalence, offline privacy, build provenance, and answer-leakage, folded
   into six independently named promotion gates and one promote/do-not-promote
   decision.
-- `learning-governance-record` — one entry in an append-only, hash-chained
-  series over consent, curriculum/model versions, evaluator calibration,
-  interventions, adjudications, privacy budgets, efficacy, safety,
-  accessibility, and a deprecation decision, each named separately and
-  never blended into one score.
 
 Validity and trust are separate. An intact signature from an unknown key is
 `untrusted`, which is a warning for a course package and a **refusal** for
