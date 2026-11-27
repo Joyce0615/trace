@@ -63,6 +63,7 @@ import { DISAGREEMENT_THRESHOLD, PROCESS_TRACE_ASSESSMENT_VERSION, assessProcess
 import { DEFAULT_COGNITIVE_BUDGET, PROGRESSIVE_DISCOVERY_VERSION, initializeDiscovery, measureComprehensionImpact, revealNext } from "../electron/progressive-discovery.mjs";
 import { COUNTEREXAMPLE_LAB_VERSION, applyCounterexampleResolution, buildCounterexampleLab, gradeCounterexamplePrediction, listCounterexampleLabs, publicCounterexampleLab, recordCounterexampleAttempt, runCounterexampleLab } from "../electron/counterexample-lab.mjs";
 import { MISCONCEPTION_REPAIR_GATE_VERSION, buildGatedMasteryEvidence, diagnoseClaimBeforePersistence, evaluateRepairCycle, gateClaimForPersistence, renderRepairGateDecision } from "../electron/misconception-repair-gate.mjs";
+import { HELP_POLICY_EVALUATION_VERSION, LOAD_STATES, REQUEST_CATEGORIES, RESPONSE_STYLES, classifyLoadState, classifyRequestCategory, evaluateHelpPolicies, helpPolicyCellKey, renderHelpPolicyReport, sanitizeHelpPolicyObservation, scoreHelpPolicyCell } from "../electron/help-policy-evaluation.mjs";
 import { ALGORITHM_TRACING_TASK_KIND, ALGORITHM_TRACING_TUTOR_VERSION, algorithmTracingPassRate, buildAlgorithmTracingTask, combineAlgorithmTracingGrades, gradeHiddenTestStage, gradeRetrievalStage, gradeStateStage, measureAlgorithmTransfer, nextAlgorithmHint, publicAlgorithmTracingTask, recordAlgorithmTracingAttempt } from "../electron/algorithm-tracing-tutor.mjs";
 import { MODEL_ADVISORY_SUBJECT, MODEL_ADVISORY_VERSION, buildModelAdvisory, classifyModelLicense, evaluateModelForQuarantine, signModelAdvisory, verifyModelAdvisory } from "../electron/model-advisory.mjs";
 import { SEQUENTIAL_CAUSAL_EXPERIMENT_VERSION, analyzeSubgroups, preregisterSequentialExperiment, runSequentialLooks, sequentialAttritionSensitivity, sequentialCriticalValue, verifyAgainstPreregistration } from "../electron/sequential-causal-experiments.mjs";
@@ -14248,4 +14249,103 @@ test("the misconception repair gate blocks persistence of an unverified misconce
   // --- Rendering -----------------------------------------------------------
   assert.match(renderRepairGateDecision(blockedGate), /PERSISTENCE BLOCKED/);
   assert.match(renderRepairGateDecision(cleanGate), /PERSISTENCE ALLOWED/);
+});
+
+test("help-policy evaluation scores verification/stepwise/socratic/direct-answer responses separately across request category and confusion/load state, never averaging into one global style", () => {
+  assert.equal(HELP_POLICY_EVALUATION_VERSION, 1);
+  assert.deepEqual(RESPONSE_STYLES, ["verification", "stepwise", "socratic", "direct-answer"]);
+  assert.deepEqual(REQUEST_CATEGORIES, ["conceptual", "debugging", "implementation"]);
+  assert.deepEqual(LOAD_STATES, ["low", "high"]);
+
+  // --- Request category reuses cognitive-offload-guard.mjs's own
+  // classifyRequestObjective and maps onto this item's three buckets -------
+  assert.equal(classifyRequestCategory("why is this throwing an exception when I trace the flow"), "debugging");
+  assert.equal(classifyRequestCategory("what is the module boundary design here"), "implementation");
+  assert.equal(classifyRequestCategory("how do I improve the throughput and cache performance"), "implementation");
+  assert.equal(classifyRequestCategory("give me an overview of the structure and entry point"), "conceptual");
+  assert.equal(classifyRequestCategory("is this input properly validated and sanitized"), "conceptual");
+  assert.equal(classifyRequestCategory("hello there"), "conceptual");
+
+  // --- Load state reuses cognitive-load-regulation.mjs's own thresholds,
+  // and a middle value is honestly null, not forced to a side ------------
+  assert.equal(classifyLoadState(0.9), "high");
+  assert.equal(classifyLoadState(0.1), "low");
+  assert.equal(classifyLoadState(0.45), null);
+  assert.equal(classifyLoadState(null), null);
+  assert.equal(classifyLoadState(undefined), null);
+
+  // --- Observation sanitizing rebuilds from an allowlist ------------------
+  assert.deepEqual(sanitizeHelpPolicyObservation({ responseStyle: "not-a-style", category: "debugging", loadState: "low", success: true }), { ok: false, reason: "unknown-response-style" });
+  assert.deepEqual(sanitizeHelpPolicyObservation({ responseStyle: "socratic", category: "not-a-category", loadState: "low", success: true }), { ok: false, reason: "unknown-category" });
+  assert.deepEqual(sanitizeHelpPolicyObservation({ responseStyle: "socratic", category: "debugging", loadState: "medium", success: true }), { ok: false, reason: "unknown-load-state" });
+  assert.deepEqual(sanitizeHelpPolicyObservation({ responseStyle: "socratic", category: "debugging", loadState: "low" }), { ok: false, reason: "missing-success" });
+  const sanitized = sanitizeHelpPolicyObservation({ responseStyle: "socratic", category: "debugging", loadState: "low", success: true, extraField: "dropped" });
+  assert.equal(sanitized.ok, true);
+  assert.deepEqual(Object.keys(sanitized.observation).sort(), ["at", "category", "loadState", "responseStyle", "success"]);
+
+  // --- A cell below MIN_SAMPLE honestly abstains --------------------------
+  const tooFewObservations = [
+    { responseStyle: "socratic", category: "debugging", loadState: "high", success: true },
+    { responseStyle: "socratic", category: "debugging", loadState: "high", success: false },
+  ];
+  const tooFewCell = scoreHelpPolicyCell("socratic", "debugging", "high", tooFewObservations);
+  assert.equal(tooFewCell.value, null);
+  assert.equal(tooFewCell.reason, "insufficient-evidence");
+  assert.equal(tooFewCell.cell, helpPolicyCellKey("socratic", "debugging", "high"));
+
+  // --- Verification-first helps debugging under high load; direct-answer
+  // does not -- and the same verification style, under low load for a
+  // conceptual request, performs quite differently. Every cell independent,
+  // never pooled or averaged -------------------------------------------------
+  const observations = [
+    // verification/debugging/high: strong
+    { responseStyle: "verification", category: "debugging", loadState: "high", success: true },
+    { responseStyle: "verification", category: "debugging", loadState: "high", success: true },
+    { responseStyle: "verification", category: "debugging", loadState: "high", success: true },
+    { responseStyle: "verification", category: "debugging", loadState: "high", success: false },
+    // direct-answer/debugging/high: weak
+    { responseStyle: "direct-answer", category: "debugging", loadState: "high", success: false },
+    { responseStyle: "direct-answer", category: "debugging", loadState: "high", success: false },
+    { responseStyle: "direct-answer", category: "debugging", loadState: "high", success: true },
+    { responseStyle: "direct-answer", category: "debugging", loadState: "high", success: false },
+    // verification/conceptual/low: weak -- the same style that helped above
+    // does not automatically help here
+    { responseStyle: "verification", category: "conceptual", loadState: "low", success: false },
+    { responseStyle: "verification", category: "conceptual", loadState: "low", success: false },
+    { responseStyle: "verification", category: "conceptual", loadState: "low", success: true },
+    { responseStyle: "verification", category: "conceptual", loadState: "low", success: false },
+    // socratic/conceptual/low: strong
+    { responseStyle: "socratic", category: "conceptual", loadState: "low", success: true },
+    { responseStyle: "socratic", category: "conceptual", loadState: "low", success: true },
+    { responseStyle: "socratic", category: "conceptual", loadState: "low", success: true },
+  ];
+
+  const verificationDebuggingHigh = scoreHelpPolicyCell("verification", "debugging", "high", observations);
+  const directAnswerDebuggingHigh = scoreHelpPolicyCell("direct-answer", "debugging", "high", observations);
+  assert.equal(verificationDebuggingHigh.value, 0.75);
+  assert.equal(directAnswerDebuggingHigh.value, 0.25);
+  assert.ok(verificationDebuggingHigh.value > directAnswerDebuggingHigh.value);
+
+  const verificationConceptualLow = scoreHelpPolicyCell("verification", "conceptual", "low", observations);
+  const socraticConceptualLow = scoreHelpPolicyCell("socratic", "conceptual", "low", observations);
+  assert.equal(verificationConceptualLow.value, 0.25);
+  assert.equal(socraticConceptualLow.value, 1);
+  // The same response style (verification) scores very differently across
+  // cells -- confirming per-cell scoring is not secretly a single number.
+  assert.notEqual(verificationDebuggingHigh.value, verificationConceptualLow.value);
+
+  // --- The full cross-tab is every style x category x load combination,
+  // with no averaging/ranking function anywhere -------------------------
+  const full = evaluateHelpPolicies(observations);
+  assert.equal(full.cells.length, RESPONSE_STYLES.length * REQUEST_CATEGORIES.length * LOAD_STATES.length);
+  assert.equal("overallBest" in full, false);
+  assert.equal("ranking" in full, false);
+  assert.equal("score" in full, false);
+  const foundVerificationDebuggingHigh = full.cells.find((cell) => cell.cell === helpPolicyCellKey("verification", "debugging", "high"));
+  assert.equal(foundVerificationDebuggingHigh.value, 0.75);
+
+  // --- Rendering -----------------------------------------------------------
+  const rendered = renderHelpPolicyReport(full);
+  assert.match(rendered, /verification:debugging:high: 75% \(n=4\)/);
+  assert.match(rendered, /socratic:conceptual:low: 100% \(n=3\)/);
 });
